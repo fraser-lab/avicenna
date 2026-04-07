@@ -6,7 +6,7 @@ import subprocess
 import time
 from importlib.metadata import version, PackageNotFoundError
 sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "src"))
-from avicenna.utils.utils import PinCollector, ParamWriter, Watcher
+from avicenna.utils.utils import DataFinder, ParamWriter, Watcher
 from avicenna.pipelines.proc_pipeline import RunProcess
 
 try:
@@ -34,22 +34,65 @@ parser.add_argument("--refmtz", type=pathlib.Path, default=None, help="Path to r
 parser.add_argument("--python", action="store_true", help="Run the Python-based processing pipeline (proc_pipeline.py) instead of the bash scripts")
 parser.add_argument("-o", "--output", type=pathlib.Path, default=pathlib.Path(os.curdir), help="Path to output folder (default: current directory)")
 parser.add_argument("--watch", action="store_true", help="Whether to watch the processing progress after submission")
+parser.add_argument("--dry_run", action="store_true", help="Create pin_list.txt and xds_input_parameters.txt without submitting jobs")
 
 
 if __name__ == "__main__":
     args = parser.parse_args()
-    params = vars(args)
+    if not args.pinlist and not args.data:
+        parser.error("either -d/--data or -p/--pinlist must be provided")
 
-    # Resolve pin list: read from file or collect via PinCollector
+    if args.dry_run:
+        if args.pinlist or args.xdsparams:
+            parser.error("--dry_run is incompatible with --pinlist and --xdsparams")
+        if not args.data:
+            parser.error("--dry_run requires -d/--data")
+        for fname in ("pin_list.txt", "xds_input_parameters.txt"):
+            if os.path.isfile(fname):
+                os.rename(fname, fname + ".bak")
+                print(f"Backed up {fname} -> {fname}.bak")
+        _, _, data_path = DataFinder(paths=args.data).collect()
+        args.data = data_path
+        ParamWriter(args=args).build_parameters()
+        print("Dry run complete.")
+        sys.exit(0)
+
+    params = vars(args)
+    data_path = None
+
+    # Phase 1: Resolve pin list
     if args.pinlist and os.path.isfile(args.pinlist):
         with open(args.pinlist) as fh:
-            params["pins"] = [line.strip() for line in fh if line.strip()]
+            lines = [line.strip() for line in fh if line.strip()]
+        # Detect deprecated format (relative paths)
+        if lines and not os.path.isabs(lines[0].split(",")[0]):
+            if not args.data:
+                sys.exit(
+                    "ERROR: pin_list.txt uses deprecated relative paths. "
+                    "Provide -d/--data to reconstruct absolute paths."
+                )
+            data_path = DataFinder(paths=args.data).paths[0]
+            image_dir = os.path.dirname(str(data_path))
+            lines = [
+                f"{os.path.join(image_dir, l.split(',')[0])},{','.join(l.split(',')[1:])}"
+                for l in lines
+            ]
+            with open(args.pinlist, "w") as fh:
+                fh.write("\n".join(lines) + "\n")
+        parents = {os.path.dirname(l.split(",")[0]) for l in lines}
+        if len(parents) > 1:
+            sys.exit(
+                "ERROR: pin_list.txt entries have different parent directories:\n" +
+                "\n".join(f"  {p}" for p in sorted(parents))
+            )
+        params["image_dir"] = parents.pop()
+        params["pins"] = lines
     else:
-        pincollector = PinCollector(paths=args.data)
-        pincollector.collect_pins()
-        params["pins"] = pincollector.pin_list
+        pin_list, image_dir, data_path = DataFinder(paths=args.data).collect()
+        params["pins"] = pin_list
+        params["image_dir"] = image_dir
 
-    # Resolve XDS params: read from file and merge into params
+    # Phase 2: Resolve XDS params
     if args.xdsparams and os.path.isfile(args.xdsparams):
         with open(args.xdsparams) as fh:
             for line in fh:
@@ -62,9 +105,12 @@ if __name__ == "__main__":
             for key, value in params.items():
                 fh.write(f"{key}={value}\n")
     else:
-        args.data = args.data[0]
-        paramwriter = ParamWriter(args=args)
-        paramwriter.build_parameters()
+        if data_path is None:
+            sys.exit(
+                "ERROR: -d/--data is required when using a --pinlist but not using --xdsparams"
+            )
+        args.data = data_path
+        ParamWriter(args=args).build_parameters()
         with open("xds_input_parameters.txt") as fh:
             for line in fh:
                 line = line.strip()

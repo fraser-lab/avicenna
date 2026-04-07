@@ -888,7 +888,7 @@ class RunProcess:
 
     Intended to be importable and callable from other modules::
 
-        from avicenna.imported_scripts.proc_pipeline import RunProcess
+        from avicenna.pipelines.proc_pipeline import RunProcess
         proc = RunProcess(params)
         proc.run()
 
@@ -1122,7 +1122,7 @@ class RunProcess:
 import json, os, subprocess, sys
 from pathlib import Path
 sys.path.insert(0, {self._src_dir!r})
-from avicenna.imported_scripts.proc_pipeline import RunProcess
+from avicenna.pipelines.proc_pipeline import RunProcess
                           
 shell = os.environ.get('SHELL', '/bin/bash')
 if any(s in shell for s in ('csh', 'tcsh')):
@@ -1224,10 +1224,10 @@ RunProcess(params).{method}()
             collection  = parts[0].strip()
             dset        = parts[1].strip()
             data_range  = parts[2].strip() if len(parts) > 2 else "false"
-            collection_id = collection.replace("_transfer", "")
+            collection_id = Path(collection).name.replace("_transfer", "")
 
             for prefix in range(1, 5):
-                image_dir = self.transfer_dir / collection / dset
+                image_dir = Path(collection) / dset
                 if not (image_dir / f"{dset}_{prefix}_00100.cbf").is_file():
                     continue
 

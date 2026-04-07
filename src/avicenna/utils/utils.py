@@ -31,27 +31,49 @@ BRAVAIS_LATTICES = {
 }
 
 
-class PinCollector(object):
+class DataFinder(object):
 
     def __init__(self, paths):
-        self.paths = [os.path.abspath(str(p).rstrip('/')) for p in paths]
+        resolved = []
+        for p in paths:
+            p = str(p)
+            if os.path.isfile(p) and p.endswith('.txt'):
+                with open(p) as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if line and os.path.isdir(line):
+                            resolved.append(os.path.abspath(line))
+            elif os.path.isdir(p):
+                resolved.append(os.path.abspath(p.rstrip('/')))
+        self.paths = resolved
         self.pin_list = []
+        self.image_dir = None
 
-    def collect_pins(self):
+    def collect(self):
+        """Validate paths, collect pin codes, write pin_list.txt.
+        Returns (pin_list, image_dir, first_resolved_path).
+        """
+        if not self.paths:
+            sys.exit("ERROR: no valid data directories found in provided paths.")
+        parents = {os.path.dirname(p) for p in self.paths}
+        if len(parents) > 1:
+            sys.exit(
+                "ERROR: all data paths must share the same parent directory.\n"
+                "Conflicting parents found:\n" +
+                "\n".join(f"  {p}" for p in sorted(parents))
+            )
+        self.image_dir = parents.pop()
         for path in self.paths:
-            data_folder = path.split("/")[-1]
             for sf in sorted(os.listdir(path)):
-                pin_line = f"{data_folder},{sf}"
+                pin_line = f"{path},{sf}"
                 print(pin_line)
                 self.pin_list.append(pin_line)
-        self.write_to_file()
-
-    def write_to_file(self):
-        filepath = f"{os.path.abspath(os.curdir)}/pin_list.txt"
-        with open(filepath, 'w') as plf:
-            for ln in self.pin_list:
-                plf.write(f"{ln}\n")
+        filepath = os.path.join(os.path.abspath(os.curdir), "pin_list.txt")
+        with open(filepath, 'w') as fh:
+            for pin in self.pin_list:
+                fh.write(f"{pin}\n")
         print(filepath)
+        return self.pin_list, self.image_dir, self.paths[0]
 
 
 class ParamWriter(object):
@@ -294,7 +316,8 @@ class Watcher(object):
         with open(pin_list_path, 'r') as f:
             for line in f:
                 parts = line.split(',')
-                self.datasets[f"{parts[0].strip().replace('_transfer', '')}_{parts[1].strip()}"] = None
+                collection = os.path.basename(parts[0].strip()).replace('_transfer', '')
+                self.datasets[f"{collection}_{parts[1].strip()}"] = None
         folders = [name for name in os.listdir(self.procpath)
                    if os.path.isdir(os.path.join(self.procpath, name))]
         for pin in self.datasets:
@@ -345,7 +368,7 @@ class Watcher(object):
         in_progress   = len(processed) - finished - failed
         total         = len(all_datasets)
 
-        bar_width = 40
+        bar_width = total if total <= 40 else 40
         if total > 0:
             n_done     = round(finished    / total * bar_width)
             n_failed   = round(failed      / total * bar_width)
