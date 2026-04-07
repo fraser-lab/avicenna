@@ -1,32 +1,57 @@
 import os
 import sys
-import matplotlib.pyplot as plt
+# import matplotlib.pyplot as plt
+
+# Bravais lattice → list of (sg_number, sg_name) tuples.
+# Derived from xds_lattices.txt in the processing pipeline scripts directory.
+BRAVAIS_LATTICES = {
+    "aP": [(1,   "P1")],
+    "mP": [(3,   "P121"),   (4,   "P1211")],
+    "mC": [(5,   "C2")],
+    "mI": [(5,   "C2")],
+    "oP": [(16,  "P222"),   (17,  "P2221"),  (18,  "P21212"), (19,  "P212121")],
+    "oC": [(21,  "C222"),   (20,  "C2221")],
+    "oF": [(22,  "F222")],
+    "oI": [(23,  "I222"),   (24,  "I212121")],
+    "tP": [(75,  "P4"),     (76,  "P41"),    (77,  "P42"),    (78,  "P43"),
+           (89,  "P422"),   (90,  "P4212"),  (91,  "P4122"),  (92,  "P41212"),
+           (93,  "P4222"),  (94,  "P42212"), (95,  "P4322"),  (96,  "P43212")],
+    "tI": [(79,  "I4"),     (80,  "I41"),    (97,  "I422"),   (98,  "I4122")],
+    "hP": [(143, "P3"),     (144, "P31"),    (145, "P32"),    (149, "P312"),
+           (150, "P321"),   (151, "P3112"),  (152, "P3121"),  (153, "P3212"),
+           (154, "P3221"),  (168, "P6"),     (169, "P61"),    (170, "P65"),
+           (171, "P62"),    (172, "P64"),    (173, "P63"),    (177, "P622"),
+           (178, "P6122"),  (179, "P6522"),  (180, "P6222"),  (181, "P6422"),
+           (182, "P6322")],
+    "hR": [(146, "R3"),     (155, "R32")],
+    "cP": [(195, "P23"),    (198, "P213"),   (207, "P432"),   (208, "P4232"),
+           (212, "P4332"),  (213, "P4132")],
+    "cF": [(196, "F23"),    (209, "F432"),   (210, "F4132")],
+    "cI": [(197, "I23"),    (199, "I213"),   (211, "I432"),   (214, "I4132")],
+}
 
 
 class PinCollector(object):
-    
-    def __init__(self, dst=None):
-        dst = dst[:-1] if dst.endswith('/') else dst
-        self.main_path = os.path.abspath(dst)
-        print (f"debug: {self.main_path}")
+
+    def __init__(self, paths):
+        self.paths = [os.path.abspath(str(p).rstrip('/')) for p in paths]
         self.pin_list = []
-    
+
     def collect_pins(self):
-        subfolders = sorted(os.listdir(self.main_path))
-        for sf in subfolders:
-            data_folder = self.main_path.split("/")[-1]
-            pin_line = f"{data_folder},{sf}"
-            print (pin_line)
-            self.pin_list.append(pin_line)
+        for path in self.paths:
+            data_folder = path.split("/")[-1]
+            for sf in sorted(os.listdir(path)):
+                pin_line = f"{data_folder},{sf}"
+                print(pin_line)
+                self.pin_list.append(pin_line)
         self.write_to_file()
-    
+
     def write_to_file(self):
-        filepath=f"{os.path.abspath(os.curdir)}/pin_list.txt"
+        filepath = f"{os.path.abspath(os.curdir)}/pin_list.txt"
         with open(filepath, 'w') as plf:
             for ln in self.pin_list:
-                print (ln)
                 plf.write(f"{ln}\n")
-            print(filepath)
+        print(filepath)
 
 
 class ParamWriter(object):
@@ -142,78 +167,78 @@ class Scraper(object):
         self.results = results
 
 
-    def plot_unit_cells(self):
-        """Collect all 'Average unit cell' entries from self.results,
-        split into six parameter lists (a, b, c, alpha, beta, gamma),
-        and display a 3x2 matplotlib plot (a,b,c left; alpha,beta,gamma right).
-        """
-        unit_cells_raw = [r['Average unit cell'] for r in self.results if r.get('outcome') == 'completed' and r.get('Average unit cell')]
+    # def plot_unit_cells(self):
+    #     """Collect all 'Average unit cell' entries from self.results,
+    #     split into six parameter lists (a, b, c, alpha, beta, gamma),
+    #     and display a 3x2 matplotlib plot (a,b,c left; alpha,beta,gamma right).
+    #     """
+    #     unit_cells_raw = [r['Average unit cell'] for r in self.results if r.get('outcome') == 'completed' and r.get('Average unit cell')]
 
-        # convert to float lists, skip malformed
-        unit_cells = []
-        for uc in unit_cells_raw:
-            try:
-                vals = [float(x) for x in uc[:6]]
-            except Exception:
-                continue
-            if len(vals) == 6:
-                unit_cells.append(vals)
+    #     # convert to float lists, skip malformed
+    #     unit_cells = []
+    #     for uc in unit_cells_raw:
+    #         try:
+    #             vals = [float(x) for x in uc[:6]]
+    #         except Exception:
+    #             continue
+    #         if len(vals) == 6:
+    #             unit_cells.append(vals)
 
-        if not unit_cells:
-            print("No valid 'Average unit cell' entries found in results.")
-            return
+    #     if not unit_cells:
+    #         print("No valid 'Average unit cell' entries found in results.")
+    #         return
 
-        # build separate lists
-        a_vals, b_vals, c_vals, alpha_vals, beta_vals, gamma_vals = zip(*unit_cells)
+    #     # build separate lists
+    #     a_vals, b_vals, c_vals, alpha_vals, beta_vals, gamma_vals = zip(*unit_cells)
 
-        # Use GridSpec with nested subgrids so histograms resize with the figure
-        fig = plt.figure(figsize=(10, 9), constrained_layout=True)
-        outer_gs = fig.add_gridspec(3, 2)
+    #     # Use GridSpec with nested subgrids so histograms resize with the figure
+    #     fig = plt.figure(figsize=(10, 9), constrained_layout=True)
+    #     outer_gs = fig.add_gridspec(3, 2)
 
-        # prepare pairs for plotting: (row, col, x_vals, y_vals, xlabel, ylabel, title)
-        pairs = [
-            (0, 0, a_vals, b_vals, 'a', 'b', 'a vs b'),
-            (1, 0, b_vals, c_vals, 'b', 'c', 'b vs c'),
-            (2, 0, a_vals, c_vals, 'a', 'c', 'a vs c'),
-            (0, 1, alpha_vals, beta_vals, 'alpha', 'beta', 'alpha vs beta'),
-            (1, 1, beta_vals, gamma_vals, 'beta', 'gamma', 'beta vs gamma'),
-            (2, 1, alpha_vals, gamma_vals, 'alpha', 'gamma', 'alpha vs gamma'),
-        ]
+    #     # prepare pairs for plotting: (row, col, x_vals, y_vals, xlabel, ylabel, title)
+    #     pairs = [
+    #         (0, 0, a_vals, b_vals, 'a', 'b', 'a vs b'),
+    #         (1, 0, b_vals, c_vals, 'b', 'c', 'b vs c'),
+    #         (2, 0, a_vals, c_vals, 'a', 'c', 'a vs c'),
+    #         (0, 1, alpha_vals, beta_vals, 'alpha', 'beta', 'alpha vs beta'),
+    #         (1, 1, beta_vals, gamma_vals, 'beta', 'gamma', 'beta vs gamma'),
+    #         (2, 1, alpha_vals, gamma_vals, 'alpha', 'gamma', 'alpha vs gamma'),
+    #     ]
 
-        # use the first color from the default color cycle (match 'a') for all plots
-        _colors = plt.rcParams['axes.prop_cycle'].by_key().get('color', ['C0'])
-        base_color = _colors[0]
+    #     # use the first color from the default color cycle (match 'a') for all plots
+    #     _colors = plt.rcParams['axes.prop_cycle'].by_key().get('color', ['C0'])
+    #     base_color = _colors[0]
 
-        for idx, (r, c, x_vals, y_vals, xl, yl, title) in enumerate(pairs):
-            # create a nested GridSpec: small top row for x-hist, main row for scatter and right hist
-            cell_gs = outer_gs[r, c].subgridspec(2, 2, height_ratios=[0.25, 1.0], width_ratios=[1.0, 0.25])
-            top_ax = fig.add_subplot(cell_gs[0, 0])
-            scatter_ax = fig.add_subplot(cell_gs[1, 0])
-            right_ax = fig.add_subplot(cell_gs[1, 1])
+    #     for idx, (r, c, x_vals, y_vals, xl, yl, title) in enumerate(pairs):
+    #         # create a nested GridSpec: small top row for x-hist, main row for scatter and right hist
+    #         cell_gs = outer_gs[r, c].subgridspec(2, 2, height_ratios=[0.25, 1.0], width_ratios=[1.0, 0.25])
+    #         top_ax = fig.add_subplot(cell_gs[0, 0])
+    #         scatter_ax = fig.add_subplot(cell_gs[1, 0])
+    #         right_ax = fig.add_subplot(cell_gs[1, 1])
 
-            color = base_color
-            scatter_ax.scatter(x_vals, y_vals, marker='o', s=10, color=color)
-            scatter_ax.set_xlabel(xl)
-            scatter_ax.set_ylabel(yl)
-            scatter_ax.set_title(title)
-            scatter_ax.grid(True)
+    #         color = base_color
+    #         scatter_ax.scatter(x_vals, y_vals, marker='o', s=10, color=color)
+    #         scatter_ax.set_xlabel(xl)
+    #         scatter_ax.set_ylabel(yl)
+    #         scatter_ax.set_title(title)
+    #         scatter_ax.grid(True)
 
-            # top histogram (x-values)
-            top_ax.hist(x_vals, bins=20, color=color, alpha=0.6)
-            top_ax.tick_params(axis='x', labelbottom=False)
-            top_ax.tick_params(axis='y', left=False, labelleft=False)
-            # remove box/frame from histogram axes
-            top_ax.patch.set_alpha(0)
+    #         # top histogram (x-values)
+    #         top_ax.hist(x_vals, bins=20, color=color, alpha=0.6)
+    #         top_ax.tick_params(axis='x', labelbottom=False)
+    #         top_ax.tick_params(axis='y', left=False, labelleft=False)
+    #         # remove box/frame from histogram axes
+    #         top_ax.patch.set_alpha(0)
 
-            # right histogram (y-values)
-            right_ax.hist(y_vals, bins=20, orientation='horizontal', color=color, alpha=0.6)
-            right_ax.tick_params(axis='y', labelleft=False)
-            right_ax.tick_params(axis='x', bottom=False, labelbottom=False)
-            right_ax.patch.set_alpha(0)
+    #         # right histogram (y-values)
+    #         right_ax.hist(y_vals, bins=20, orientation='horizontal', color=color, alpha=0.6)
+    #         right_ax.tick_params(axis='y', labelleft=False)
+    #         right_ax.tick_params(axis='x', bottom=False, labelbottom=False)
+    #         right_ax.patch.set_alpha(0)
 
-        # save and show
-        fig.savefig('unit_cells.png', bbox_inches='tight')
-        plt.show()
+    #     # save and show
+    #     fig.savefig('unit_cells.png', bbox_inches='tight')
+    #     plt.show()
 
 
     def print_info(self):
@@ -253,10 +278,10 @@ class Watcher(object):
                 return c.strip()
         return None
 
-    def __init__(self, args=None):
-        self.procpath = os.path.abspath(args.procpath) if args.procpath is not None else os.path.abspath(os.curdir)
-        self.pincode = args.pincode
-        self.details = args.details
+    def __init__(self, procpath=None, pincode=None, details=False):
+        self.procpath = os.path.abspath(procpath) if procpath is not None else os.path.abspath(os.curdir)
+        self.pincode = pincode
+        self.details = details
         self.get_info()
 
     def get_info(self):
@@ -269,13 +294,13 @@ class Watcher(object):
         with open(pin_list_path, 'r') as f:
             for line in f:
                 parts = line.split(',')
-                self.datasets[parts[1].strip()] = None
+                self.datasets[f"{parts[0].strip().replace('_transfer', '')}_{parts[1].strip()}"] = None
         folders = [name for name in os.listdir(self.procpath)
                    if os.path.isdir(os.path.join(self.procpath, name))]
         for pin in self.datasets:
             pin_folder = next((f for f in folders if pin in f), None)
             if pin_folder is None:
-                self.datasets[pin] = {'none': {"NOT PROCESSED", None}}
+                self.datasets[pin] = {'none': {"REJECTED", None}}
             else:
                 pin_folder_path = os.path.join(self.procpath, pin_folder)
                 subfolders = [name for name in os.listdir(pin_folder_path)
@@ -310,15 +335,42 @@ class Watcher(object):
                     else:
                         self.datasets[pin][psf_name] = (self.tells[last_logfile], None)
 
+    def show_progress(self):
+        self.watch()
+        all_datasets  = [v for sub in self.datasets.values() for v in sub.values()]
+        rejected   = len([d for d in all_datasets if "REJECTED" in d])
+        processed     = [d for d in all_datasets if "REJECTED" not in d]
+        finished      = len([d for d in processed if d[0] == "FINISHED"])
+        failed        = len([d for d in processed if d[0] == "FAILED"])
+        in_progress   = len(processed) - finished - failed
+        total         = len(all_datasets)
+
+        bar_width = 40
+        if total > 0:
+            n_done     = round(finished    / total * bar_width)
+            n_failed   = round(failed      / total * bar_width)
+            n_not_proc = round(rejected / total * bar_width)
+            n_active   = bar_width - n_done - n_failed - n_not_proc
+        else:
+            n_done = n_failed = n_active = 0
+            n_not_proc = bar_width
+
+        bar  = "#" * n_done + "!" * n_failed + "-" * n_active + "X" * n_not_proc
+        line = (f"\r[{bar}] {finished + failed + rejected}/{total} done | "
+                f"{finished} processed | {failed} failed | {in_progress} running | {rejected} rejected")
+        print(f"{line:100}", end="", flush=True)
+
+        return in_progress > 0 or rejected > 0
+
     def show_count(self):
         self.watch()
         all_datasets = [v for sub in self.datasets.values() for v in sub.values()]
-        not_processed_count = len([d for d in all_datasets if "NOT PROCESSED" in d])
-        processed = [d for d in all_datasets if "NOT PROCESSED" not in d]
+        rejected_count = len([d for d in all_datasets if "REJECTED" in d])
+        processed = [d for d in all_datasets if "REJECTED" not in d]
         total_count = len(processed)
         failed_count = len([d for d in processed if d[0] == "FAILED"])
         finished_count = len([d for d in processed if d[0] == "FINISHED"])
-        print(f"\rTotal: {total_count} | Not Processed: {not_processed_count} | Failed: {failed_count} | Finished: {finished_count}", end="", flush=True)
+        print(f"\rTotal: {total_count} | Rejected: {rejected_count} | Failed: {failed_count} | Finished: {finished_count}", end="", flush=True)
 
     def show_details(self):
         self.watch()
@@ -334,5 +386,5 @@ class Watcher(object):
     def run(self):
         if self.details:
             self.show_details()
-        else:
-            self.show_count()
+            return True
+        return self.show_progress()
