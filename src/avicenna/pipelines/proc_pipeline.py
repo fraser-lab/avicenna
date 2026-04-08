@@ -13,6 +13,7 @@ RunXtriage    -- Phenix Xtriage data quality analysis
 RunProcess    -- orchestrator that drives the full pipeline
 """
 
+import json
 import os
 import sys
 import pathlib
@@ -20,6 +21,7 @@ import re
 import shutil
 import stat
 import subprocess
+from datetime import datetime
 from pathlib import Path
 sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "src"))
 from avicenna.utils.utils import BRAVAIS_LATTICES
@@ -1166,7 +1168,6 @@ class RunProcess:
         Serialise per_params to params.json and write a run_pipeline.py that
         imports this module and calls RunProcess(params).{method}().
         """
-        import json
         Path(pipeline_subdir, "params.json").write_text(
             json.dumps(per_params, indent=2, default=str)
         )
@@ -1254,10 +1255,28 @@ RunProcess(params).{method}()
     def _xds_ascii_ok(self, pipeline_subdir, job):
         return (Path(pipeline_subdir) / f"{job}_xds" / "XDS_ASCII.HKL").is_file()
 
+    def _setup_scratch(self, params):
+        """Copy image directory to SGE scratch ($TMPDIR) if not already there.
+
+        Mirrors the cp block in run_xds.sh (lines 42-53): checks for
+        $TMPDIR/<image_dir_name>; copies once per job; then updates
+        params["image_dir"] to the scratch path so all subsequent XDS
+        runs read from fast local storage.
+
+        No-ops silently when $TMPDIR is not set (e.g. local/test runs).
+        """
+        tmpdir = os.environ.get("TMPDIR")
+        if not tmpdir:
+            return
+        image_dir = Path(params["image_dir"])
+        scratch_dir = Path(tmpdir) / image_dir.name
+        if not scratch_dir.exists():
+            shutil.copytree(image_dir, scratch_dir)
+        params["image_dir"] = str(scratch_dir)
+
     def _log(self, pipeline_subdir, tag, message):
         """Append a timestamped line to pipeline.log in pipeline_subdir,
         and also to processing.log in process_dir (the omnibus log)."""
-        from datetime import datetime
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         line = f"[{ts}] {tag:<10} {message}\n"
         with open(Path(pipeline_subdir) / "pipeline.log", "a") as fh:
@@ -1429,6 +1448,8 @@ RunProcess(params).{method}()
         self._log(pipeline_subdir, "START",
                   f"{params.get('pin_id','?')} | {pipeline_subdir.name} | sg={sg} cell={cell}")
 
+        self._setup_scratch(params)
+
         # --- job 1: initial indexing ---
         self._xds(1, params, "xds_initial_indexing")
 
@@ -1571,6 +1592,8 @@ RunProcess(params).{method}()
         cell = params.get("cell", "none")
         self._log(pipeline_subdir, "START",
                   f"{params.get('pin_id','?')} | {pipeline_subdir.name} | sg={sg} cell={cell}")
+
+        self._setup_scratch(params)
 
         self._xds(1, params, "xds_forced_integration")
 
