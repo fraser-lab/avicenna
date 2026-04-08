@@ -516,35 +516,26 @@ class RunPointless(RunBase):
         log_path = job_dir / f"{self.job}_pointless.log"
 
         sg = self.sg
-        if sg == "none":
-            if self.job == 3:
-                # First Pointless pass: no space group constraint
-                stdin = (
-                    f"HKLIN {hklin}\n"
-                    f"HKLOUT {hklout}\n"
-                    "SETTING SYMMETRY-BASED\n"
-                    "END\n"
-                )
-            else:
-                # Read space group chosen by the previous Aimless run
-                last_aimless_job = last_xds_job - 1
-                aimless_log = (self.pipeline_subdir
-                               / f"{last_aimless_job}_aimless"
-                               / f"{last_aimless_job}_aimless.log")
-                aim_text = aimless_log.read_text()
-                sg = next(
-                    (line.split(":", 1)[1].replace(" ", "").strip()
-                     for line in aim_text.splitlines() if "Space group:" in line),
-                    "P1",
-                )
-                stdin = (
-                    f"HKLIN {hklin}\n"
-                    f"HKLOUT {hklout}\n"
-                    "SETTING SYMMETRY-BASED\n"
-                    f"SPACEGROUP {sg}\n"
-                    "END\n"
-                )
+        if self.job == 3:
+            # First Pointless pass: no space group constraint
+            stdin = (
+                f"HKLIN {hklin}\n"
+                f"HKLOUT {hklout}\n"
+                "SETTING SYMMETRY-BASED\n"
+                "END\n"
+            )
         else:
+            # Read space group chosen by the previous Aimless run
+            last_aimless_job = last_xds_job - 1
+            aimless_log = (self.pipeline_subdir
+                            / f"{last_aimless_job}_aimless"
+                            / f"{last_aimless_job}_aimless.log")
+            aim_text = aimless_log.read_text()
+            sg = next(
+                (line.split(":", 1)[1].replace(" ", "").strip()
+                    for line in aim_text.splitlines() if "Space group:" in line),
+                "P1",
+            )
             stdin = (
                 f"HKLIN {hklin}\n"
                 f"HKLOUT {hklout}\n"
@@ -552,6 +543,7 @@ class RunPointless(RunBase):
                 f"SPACEGROUP {sg}\n"
                 "END\n"
             )
+
 
         with open(log_path, "w") as fh:
             subprocess.run(["pointless"], input=stdin, text=True, stdout=fh, stderr=fh)
@@ -1087,7 +1079,8 @@ class RunProcess:
             lattice = clean[1]
             cell    = " ".join(clean[3:9])
             solutions.append((lattice, cell))
-        solutions = list(reversed(solutions))   # lowest penalty first
+        solutions = solutions[1:]               # skip first row (aP/P1 — trivially correct, uninformative)
+        solutions = list(reversed(solutions))   # lowest penalty first → highest symmetry first
 
         if self.try_alt_sym == "all":
             results = []

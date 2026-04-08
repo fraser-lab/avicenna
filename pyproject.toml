@@ -4,7 +4,7 @@ build-backend = "setuptools.backends.legacy:build"
 
 [project]
 name = "avicenna"
-version = "0.2.4"
+version = "0.2.5"
 requires-python = ">=3.11"
 dependencies = []
 

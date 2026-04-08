@@ -116,37 +116,71 @@ class Scraper(object):
     def __init__(self, result_path):
         self.result_path = result_path
         self.results = {}
-    
+
+    def _find_aimless_log(self, index_path):
+        """Given an index_X_Y folder, return the path to the appropriate
+        10_aimless.log, or None if no completed job is found.
+        """
+        # Flat case: job completed directly under index_path
+        if os.path.isdir(os.path.join(index_path, '13_xtriage')):
+            logs = []
+            for d in os.listdir(index_path):
+                if d.endswith('_aimless') and os.path.isdir(os.path.join(index_path, d)):
+                    log = os.path.join(index_path, d, f'{d}.log')
+                    if os.path.isfile(log):
+                        try:
+                            logs.append((int(d.split('_')[0]), log))
+                        except ValueError:
+                            pass
+            return max(logs, key=lambda x: x[0])[1] if logs else None
+
+        # Force dir case: find *_force subdirs, sorted by integer prefix
+        # (prefix encodes symmetry order: 1 = highest symmetry)
+        force_dirs = sorted(
+            [d for d in os.listdir(index_path)
+             if d.endswith('_force') and os.path.isdir(os.path.join(index_path, d))],
+            key=lambda d: int(d.split('_')[0])
+        )
+        for force_dir in force_dirs:
+            force_path = os.path.join(index_path, force_dir)
+            if os.path.isdir(os.path.join(force_path, '13_xtriage')):
+                log = os.path.join(force_path, '10_aimless', '10_aimless.log')
+                return log if os.path.isfile(log) else None
+
+        return None
+
     def find_results(self):
-        print (f"Looking in {self.result_path}...")
-        paths = sorted([os.path.join(self.result_path, p) for p in os.listdir(self.result_path) if os.path.isdir(os.path.join(self.result_path, p)) == True])
+        print(f"Looking in {self.result_path}...")
         results = []
-        for path in paths:
-            result_folders = [os.path.join(path, p) for p in os.listdir(path) if os.path.isdir(os.path.join(path, p)) == True]
-            for rf in result_folders:
-                result = {
-                    'pin_code'      : os.path.basename(path).split('_')[-3],
-                    'dataset_code'  : '_'.join(os.path.basename(path).split('_')[-3:-1]),
-                    'proc_path'     : path,
-                    'result_path'   : rf,
-                    'outcome'       : 'unprocessed'
-                }
-                results.append(result)
+        for dataset_name in sorted(os.listdir(self.result_path)):
+            dataset_path = os.path.join(self.result_path, dataset_name)
+            if not os.path.isdir(dataset_path):
+                continue
+            parts = dataset_name.split('_')
+            pin_code     = parts[-3]
+            dataset_code = '_'.join(parts[-3:-1])
+            for result_type in os.listdir(dataset_path):
+                result_type_path = os.path.join(dataset_path, result_type)
+                if not os.path.isdir(result_type_path):
+                    continue
+                for index_name in sorted(os.listdir(result_type_path)):
+                    index_path = os.path.join(result_type_path, index_name)
+                    if not os.path.isdir(index_path) or not index_name.startswith('index_'):
+                        continue
+                    results.append({
+                        'pin_code'     : pin_code,
+                        'dataset_code' : dataset_code,
+                        'proc_path'    : dataset_path,
+                        'result_path'  : result_type_path,
+                        'aimless_log'  : self._find_aimless_log(index_path),
+                        'outcome'      : 'unprocessed',
+                    })
         return results
 
     def scrape_one_log(self, info_dict):
-
-        # collect aimless log files and pick the last one
-        aimless_log_files = []
-        for dirpath, _, files in os.walk(info_dict['result_path']):
-            for file in files:
-                if 'aimless' in file and file.endswith(".log"):
-                    aimless_log_files.append(os.path.join(dirpath, file))
-
-        if len(aimless_log_files) == 0:
+        logfile = info_dict.get('aimless_log')
+        if not logfile or not os.path.isfile(logfile):
             return None
-
-        logfile = sorted(aimless_log_files)[-1]
 
         with open(logfile, 'r') as lf:
             contents = lf.readlines()
@@ -379,7 +413,7 @@ class Watcher(object):
             n_not_proc = bar_width
 
         bar  = "#" * n_done + "!" * n_failed + "-" * n_active + "X" * n_not_proc
-        line = (f"\r[{bar}] {finished + failed + rejected}/{total} done | "
+        line = (f"\r({finished + failed + rejected}/{total}) [{bar}] "
                 f"{finished} processed | {failed} failed | {in_progress} running | {rejected} rejected")
         print(f"{line:100}", end="", flush=True)
 
