@@ -223,80 +223,6 @@ class Scraper(object):
         self.results = results
 
 
-    # def plot_unit_cells(self):
-    #     """Collect all 'Average unit cell' entries from self.results,
-    #     split into six parameter lists (a, b, c, alpha, beta, gamma),
-    #     and display a 3x2 matplotlib plot (a,b,c left; alpha,beta,gamma right).
-    #     """
-    #     unit_cells_raw = [r['Average unit cell'] for r in self.results if r.get('outcome') == 'completed' and r.get('Average unit cell')]
-
-    #     # convert to float lists, skip malformed
-    #     unit_cells = []
-    #     for uc in unit_cells_raw:
-    #         try:
-    #             vals = [float(x) for x in uc[:6]]
-    #         except Exception:
-    #             continue
-    #         if len(vals) == 6:
-    #             unit_cells.append(vals)
-
-    #     if not unit_cells:
-    #         print("No valid 'Average unit cell' entries found in results.")
-    #         return
-
-    #     # build separate lists
-    #     a_vals, b_vals, c_vals, alpha_vals, beta_vals, gamma_vals = zip(*unit_cells)
-
-    #     # Use GridSpec with nested subgrids so histograms resize with the figure
-    #     fig = plt.figure(figsize=(10, 9), constrained_layout=True)
-    #     outer_gs = fig.add_gridspec(3, 2)
-
-    #     # prepare pairs for plotting: (row, col, x_vals, y_vals, xlabel, ylabel, title)
-    #     pairs = [
-    #         (0, 0, a_vals, b_vals, 'a', 'b', 'a vs b'),
-    #         (1, 0, b_vals, c_vals, 'b', 'c', 'b vs c'),
-    #         (2, 0, a_vals, c_vals, 'a', 'c', 'a vs c'),
-    #         (0, 1, alpha_vals, beta_vals, 'alpha', 'beta', 'alpha vs beta'),
-    #         (1, 1, beta_vals, gamma_vals, 'beta', 'gamma', 'beta vs gamma'),
-    #         (2, 1, alpha_vals, gamma_vals, 'alpha', 'gamma', 'alpha vs gamma'),
-    #     ]
-
-    #     # use the first color from the default color cycle (match 'a') for all plots
-    #     _colors = plt.rcParams['axes.prop_cycle'].by_key().get('color', ['C0'])
-    #     base_color = _colors[0]
-
-    #     for idx, (r, c, x_vals, y_vals, xl, yl, title) in enumerate(pairs):
-    #         # create a nested GridSpec: small top row for x-hist, main row for scatter and right hist
-    #         cell_gs = outer_gs[r, c].subgridspec(2, 2, height_ratios=[0.25, 1.0], width_ratios=[1.0, 0.25])
-    #         top_ax = fig.add_subplot(cell_gs[0, 0])
-    #         scatter_ax = fig.add_subplot(cell_gs[1, 0])
-    #         right_ax = fig.add_subplot(cell_gs[1, 1])
-
-    #         color = base_color
-    #         scatter_ax.scatter(x_vals, y_vals, marker='o', s=10, color=color)
-    #         scatter_ax.set_xlabel(xl)
-    #         scatter_ax.set_ylabel(yl)
-    #         scatter_ax.set_title(title)
-    #         scatter_ax.grid(True)
-
-    #         # top histogram (x-values)
-    #         top_ax.hist(x_vals, bins=20, color=color, alpha=0.6)
-    #         top_ax.tick_params(axis='x', labelbottom=False)
-    #         top_ax.tick_params(axis='y', left=False, labelleft=False)
-    #         # remove box/frame from histogram axes
-    #         top_ax.patch.set_alpha(0)
-
-    #         # right histogram (y-values)
-    #         right_ax.hist(y_vals, bins=20, orientation='horizontal', color=color, alpha=0.6)
-    #         right_ax.tick_params(axis='y', labelleft=False)
-    #         right_ax.tick_params(axis='x', bottom=False, labelbottom=False)
-    #         right_ax.patch.set_alpha(0)
-
-    #     # save and show
-    #     fig.savefig('unit_cells.png', bbox_inches='tight')
-    #     plt.show()
-
-
     def print_info(self):
         for result in self.results:
             if result['outcome'] == 'completed':
@@ -318,26 +244,21 @@ class Scraper(object):
 
 
 class Watcher(object):
-    tells = {
-        "1_xds.log"        : "XDS(1)",
-        "4_aimless.log"    : "AIMLESS(1)",
-        "5_xds.log"        : "XDS(2)",
-        "7_aimless.log"    : "AIMLESS(2)",
-        "13_xtriage.log"   : "FINISHED",
-        }
 
-    def find_errors(self, logfile):
-        with open(logfile, 'r') as lf:
-            contents = lf.readlines()
-        for c in contents[-10:]:
-            if " ERROR " in c:
-                return c.strip()
-        return None
+    # Tag → Watcher status mapping
+    TAG_STATUS = {
+        "START"  : "RUNNING",
+        "STEP"   : "RUNNING",
+        "FORCE"  : "RUNNING_FORCE",
+        "DONE"   : "FINISHED",
+        "ERROR"  : "FAILED",
+    }
 
     def __init__(self, procpath=None, pincode=None, details=False):
         self.procpath = os.path.abspath(procpath) if procpath is not None else os.path.abspath(os.curdir)
         self.pincode = pincode
         self.details = details
+        self._log_offsets = {}   # path → number of lines already printed
         self.get_info()
 
     def get_info(self):
@@ -364,6 +285,44 @@ class Watcher(object):
                               if os.path.isdir(os.path.join(pin_folder_path, name))]
                 self.datasets[pin] = {sf: (None, None) for sf in subfolders}
 
+    def _pipeline_logs(self, result_type_path):
+        """Find all pipeline.log files under result_type_path, searching
+        index_*/ dirs at the top level and *_force/ dirs one level deeper.
+        Returns a list of absolute paths."""
+        logs = []
+        for entry in os.listdir(result_type_path):
+            index_path = os.path.join(result_type_path, entry)
+            if not os.path.isdir(index_path) or not entry.startswith('index_'):
+                continue
+            flat_log = os.path.join(index_path, 'pipeline.log')
+            if os.path.isfile(flat_log):
+                logs.append(flat_log)
+            for sub in os.listdir(index_path):
+                if sub.endswith('_force'):
+                    force_log = os.path.join(index_path, sub, 'pipeline.log')
+                    if os.path.isfile(force_log):
+                        logs.append(force_log)
+        return logs
+
+    def _read_pipeline_log(self, log_path):
+        """Return (status, message) from the last meaningful line of pipeline.log."""
+        try:
+            with open(log_path) as fh:
+                lines = [l.rstrip() for l in fh if l.strip()]
+        except OSError:
+            return (None, None)
+        for line in reversed(lines):
+            # format: [YYYY-MM-DD HH:MM:SS] TAG        message
+            try:
+                _, tag, *rest = line.split(None, 2)
+                tag = tag.strip()
+                msg = rest[0].strip() if rest else ""
+                status = self.TAG_STATUS.get(tag)
+                if status:
+                    return (status, msg)
+            except ValueError:
+                continue
+        return (None, None)
 
     def watch(self):
         folders = [name for name in os.listdir(self.procpath)
@@ -374,23 +333,56 @@ class Watcher(object):
                 continue
             pin_folder_path = os.path.join(self.procpath, pin_folder)
             for psf_name in self.datasets[pin]:
+                if "REJECTED" in self.datasets[pin][psf_name]:
+                    continue
                 psf = os.path.join(pin_folder_path, psf_name)
-                logfiles = []
-                for dirname, _, files in os.walk(psf):
-                    local_logfile_splits = []
-                    for f in files:
-                        if f in self.tells.keys():
-                            f_split = f.split("_")
-                            local_logfile_splits.append([dirname, f_split[0], f_split[1]])
-                        logfiles.extend(local_logfile_splits)
-                if len(logfiles) > 0:
-                    logs = sorted(logfiles, key=lambda x: int(x[1]))
-                    last_log = os.path.join(logs[-1][0], f"{logs[-1][1]}_{logs[-1][2]}")
-                    last_logfile = os.path.basename(last_log)
-                    if self.find_errors(last_log) is not None:
-                        self.datasets[pin][psf_name] = ("FAILED", f"error in {last_logfile}")
-                    else:
-                        self.datasets[pin][psf_name] = (self.tells[last_logfile], None)
+                logs = self._pipeline_logs(psf)
+                if not logs:
+                    continue
+                # Aggregate: DONE only if all logs are DONE; any FAILED → FAILED;
+                # otherwise use the most recent non-None status
+                statuses = [self._read_pipeline_log(l) for l in logs]
+                statuses = [(s, m) for s, m in statuses if s is not None]
+                if not statuses:
+                    continue
+                if any(s == "FAILED" for s, _ in statuses):
+                    failed_msg = next(m for s, m in statuses if s == "FAILED")
+                    self.datasets[pin][psf_name] = ("FAILED", failed_msg)
+                elif all(s == "FINISHED" for s, _ in statuses):
+                    self.datasets[pin][psf_name] = ("FINISHED", None)
+                else:
+                    # pick most informative running status
+                    last_s, last_m = statuses[-1]
+                    self.datasets[pin][psf_name] = (last_s, last_m)
+
+    def tail_logs(self):
+        """Print any new lines added to pipeline.log files since last call.
+        Returns the list of new lines printed."""
+        new_lines = []
+        for pin in self.datasets:
+            pin_folder_path = next(
+                (os.path.join(self.procpath, f) for f in os.listdir(self.procpath)
+                 if pin in f and os.path.isdir(os.path.join(self.procpath, f))),
+                None
+            )
+            if pin_folder_path is None:
+                continue
+            for psf_name in self.datasets[pin]:
+                psf = os.path.join(pin_folder_path, psf_name)
+                if not os.path.isdir(psf):
+                    continue
+                for log_path in self._pipeline_logs(psf):
+                    try:
+                        with open(log_path) as fh:
+                            all_lines = fh.readlines()
+                    except OSError:
+                        continue
+                    offset = self._log_offsets.get(log_path, 0)
+                    for line in all_lines[offset:]:
+                        print(line, end="", flush=True)
+                        new_lines.append(line)
+                    self._log_offsets[log_path] = len(all_lines)
+        return new_lines
 
     def show_progress(self):
         self.watch()

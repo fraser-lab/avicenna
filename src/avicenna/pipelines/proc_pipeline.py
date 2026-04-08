@@ -74,7 +74,7 @@ class RunXDS(RunBase):
         self.xdsstat_executable = Path(xdsstat_executable)
 
         # Convenience aliases derived from params
-        self.dset              = params.get("dset")
+        self.pin_id            = params.get("pin_id")
         self.image_dir         = Path(params.get("image_dir"))
         self.script_dir        = Path(params.get("script_dir"))
         self.pipeline_subdir   = Path(params.get("pipeline_subdir"))
@@ -233,7 +233,7 @@ class RunXDS(RunBase):
         generate_inp.write_text(template.replace("sed_replace", self.image_range))
         generate_inp.chmod(generate_inp.stat().st_mode | stat.S_IXUSR | stat.S_IRUSR | stat.S_IWUSR)
         subprocess.run([str(generate_inp),
-                        str(self.image_dir / f"{self.dset}_1_0????.cbf")])
+                        str(self.image_dir / f"{self.pin_id}_1_0????.cbf")])
 
         xds_inp = job_dir / "XDS.INP"
         text = xds_inp.read_text()
@@ -297,7 +297,7 @@ class RunXDS(RunBase):
             "JOB= DEFPIX INTEGRATE CORRECT",
         )
         text = re.sub(r"NAME_TEMPLATE_OF_DATA_FRAMES=.*",
-                      f"NAME_TEMPLATE_OF_DATA_FRAMES={self.image_dir}/{self.dset}_1_0????.cbf",
+                      f"NAME_TEMPLATE_OF_DATA_FRAMES={self.image_dir}/{self.pin_id}_1_0????.cbf",
                       text)
         (job_dir / "XDS.INP").write_text(text)
 
@@ -480,6 +480,7 @@ class RunPointless(RunBase):
         self.params      = params
         self.job         = job
         self.sg          = params.get("sg", "none")
+        self.known_sg    = params.get("known_sg", "none")
         self.scaling     = params.get("scaling", "correct")
         self.recycle_xds = params.get("recycle_xds", "false")
         self.pipeline_subdir = Path(params.get("pipeline_subdir"))
@@ -515,15 +516,24 @@ class RunPointless(RunBase):
         hklout = f"XDS_ASCII_{self.job}_pointless.mtz"
         log_path = job_dir / f"{self.job}_pointless.log"
 
-        sg = self.sg
         if self.job == 3:
-            # First Pointless pass: no space group constraint
-            stdin = (
-                f"HKLIN {hklin}\n"
-                f"HKLOUT {hklout}\n"
-                "SETTING SYMMETRY-BASED\n"
-                "END\n"
-            )
+            if self.known_sg != "none":
+                # User explicitly provided symmetry — constrain from the start
+                stdin = (
+                    f"HKLIN {hklin}\n"
+                    f"HKLOUT {hklout}\n"
+                    "SETTING SYMMETRY-BASED\n"
+                    f"SPACEGROUP {self.known_sg}\n"
+                    "END\n"
+                )
+            else:
+                # Free run or auto-forced integration — let Pointless choose freely
+                stdin = (
+                    f"HKLIN {hklin}\n"
+                    f"HKLOUT {hklout}\n"
+                    "SETTING SYMMETRY-BASED\n"
+                    "END\n"
+                )
         else:
             # Read space group chosen by the previous Aimless run
             last_aimless_job = last_xds_job - 1
@@ -963,10 +973,52 @@ class RunProcess:
     # Setup helpers
     # ------------------------------------------------------------------
 
+    def _parse_crystal_sections(self):
+        """
+        Parse ## crystal ## sections from xds_input_parameters.txt in
+        process_dir.  Returns a list of dicts (one per crystal form), each
+        with keys: first_pass, sg, sg_number, cell, ref_hkl, ref_mtz.
+        Missing keys default to "none".
+        """
+        xds_params_path = self.process_dir / "xds_input_parameters.txt"
+        if not xds_params_path.is_file():
+            return []
+        lines = xds_params_path.read_text().splitlines()
+
+        # Split into sections on ## crystal ## markers
+        sections = []
+        current = None
+        for line in lines:
+            if "crystal" in line and line.strip().startswith("##"):
+                current = []
+                sections.append(current)
+            elif current is not None:
+                current.append(line)
+
+        crystals = []
+        for section in sections:
+            kv = {}
+            for line in section:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                kv[key.strip()] = val.strip()
+            crystals.append({
+                "first_pass": kv.get("first_pass", "none"),
+                "sg":         kv.get("sg", "none"),
+                "sg_number":  kv.get("number", "none"),
+                "cell":       kv.get("cell", "none"),
+                "ref_hkl":    kv.get("ref_hkl", "none"),
+                "ref_mtz":    kv.get("ref_mtz", "none"),
+            })
+        return crystals
+
     def _known_symmetry_entries(self):
         """
         Return a list of symmetry-entry dicts, reading from known_symmetry.txt
-        if present, otherwise building a single entry from params.
+        if present, otherwise parsing ## crystal ## sections from
+        xds_input_parameters.txt, otherwise building a no-symmetry entry.
 
         Each dict has keys: crystal_number, first_pass, sg, sg_number, cell,
         ref_hkl, ref_mtz, refine_cell_integrate.
@@ -991,33 +1043,40 @@ class RunProcess:
                     "ref_mtz":               parts[6],
                     "refine_cell_integrate": parts[7],
                 })
-        elif self.no_symmetry == "true":
-            entries.append({
-                "crystal_number":        "none",
-                "first_pass":            "none",
-                "sg":                    "none",
-                "sg_number":             "none",
-                "cell":                  "none",
-                "ref_hkl":               "none",
-                "ref_mtz":               "none",
-                "refine_cell_integrate": "false",
-            })
         else:
             refcell = self.params.get("refine_cell_integrate", "true")
-            base = {
-                "crystal_number":        "1",
-                "first_pass":            self.params.get("first_pass", "none"),
-                "sg":                    self.params.get("sg", "none"),
-                "sg_number":             self.params.get("number", "none"),
-                "cell":                  self.params.get("cell", "none"),
-                "ref_hkl":               str(self.params.get("ref_hkl") or "none"),
-                "ref_mtz":               str(self.params.get("ref_mtz") or "none"),
-            }
-            if refcell == "both":
-                entries.append({**base, "refine_cell_integrate": "true"})
-                entries.append({**base, "refine_cell_integrate": "false"})
-            else:
-                entries.append({**base, "refine_cell_integrate": refcell})
+            crystal_forms = self._parse_crystal_sections()
+            if crystal_forms:
+                for crystal_number, form in enumerate(crystal_forms, start=1):
+                    base = {"crystal_number": str(crystal_number), **form}
+                    if refcell == "both":
+                        entries.append({**base, "refine_cell_integrate": "true"})
+                        entries.append({**base, "refine_cell_integrate": "false"})
+                    else:
+                        entries.append({**base, "refine_cell_integrate": refcell})
+            if self.no_symmetry == "true":
+                entries.append({
+                    "crystal_number":        "none",
+                    "first_pass":            "none",
+                    "sg":                    "none",
+                    "sg_number":             "none",
+                    "cell":                  "none",
+                    "ref_hkl":               "none",
+                    "ref_mtz":               "none",
+                    "refine_cell_integrate": "false",
+                })
+            if not entries:
+                # No crystal sections and no_symmetry=false: single free run
+                entries.append({
+                    "crystal_number":        "none",
+                    "first_pass":            "none",
+                    "sg":                    "none",
+                    "sg_number":             "none",
+                    "cell":                  "none",
+                    "ref_hkl":               "none",
+                    "ref_mtz":               "none",
+                    "refine_cell_integrate": "false",
+                })
         return entries
 
     def _indexing_ranges(self, image_count, first_image):
@@ -1134,7 +1193,7 @@ for _line in _result.stdout.splitlines():
 params = json.loads(Path('params.json').read_text())
 print("=" * 60)
 print(f"pin          : {{params.get('pin', 'n/a')}}")
-print(f"dataset      : {{params.get('dset', 'n/a')}}")
+print(f"dataset      : {{params.get('pin_id', 'n/a')}}")
 print(f"image_dir    : {{params.get('image_dir', 'n/a')}}")
 print(f"image_range  : {{params.get('image_range', 'n/a')}}")
 print(f"workdir      : {{params.get('pipeline_subdir', 'n/a')}}")
@@ -1195,6 +1254,75 @@ RunProcess(params).{method}()
     def _xds_ascii_ok(self, pipeline_subdir, job):
         return (Path(pipeline_subdir) / f"{job}_xds" / "XDS_ASCII.HKL").is_file()
 
+    def _log(self, pipeline_subdir, tag, message):
+        """Append a timestamped line to pipeline.log in pipeline_subdir,
+        and also to processing.log in process_dir (the omnibus log)."""
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{ts}] {tag:<10} {message}\n"
+        with open(Path(pipeline_subdir) / "pipeline.log", "a") as fh:
+            fh.write(line)
+        process_dir = self.params.get("process_dir")
+        if process_dir:
+            pin_id = self.params.get("pin_id", "?")
+            if tag == "ERROR":
+                display_tag = " ERROR ***"
+            elif tag == "DONE":
+                display_tag = " DONE  !!!"
+            else:
+                display_tag = f"{tag:<10}"
+            omnibus_line = f"[{ts}] {display_tag} [{pin_id}] {message}\n"
+            with open(Path(process_dir) / "processing.log", "a") as fh:
+                fh.write(omnibus_line)
+
+    def _aimless_summary(self, log_path):
+        """Extract SG, resolution, completeness, multiplicity, and Rpim
+        from the last 100 lines of an aimless log. Returns a string."""
+        summary = {}
+        if not Path(log_path).is_file():
+            return "completed"
+        for line in Path(log_path).read_text().splitlines()[-100:]:
+            if "Space group:" in line and "sg" not in summary:
+                summary["sg"] = line.split(":", 1)[1].strip().replace(" ", "")
+            if "High resolution limit" in line and "res" not in summary:
+                nums = [s for s in line.split() if s.replace(".", "", 1).isdigit()]
+                if nums:
+                    summary["res"] = nums[-1]
+            if "Average unit cell" in line and "uc" not in summary:
+                nums = [s for s in line.split() if s.replace(".", "", 1).isdigit()]
+                if nums:
+                    summary["uc"] = " ".join(nums)
+            if "Completeness" in line and "comp" not in summary:
+                nums = [s for s in line.split() if s.replace(".", "", 1).isdigit()]
+                if nums:
+                    summary["comp"] = nums[0]
+            if "Multiplicity" in line and "mult" not in summary:
+                nums = [s for s in line.split() if s.replace(".", "", 1).isdigit()]
+                if nums:
+                    summary["mult"] = nums[0]
+            if "Rpim (within I+/I-)" in line and "rpim" not in summary:
+                nums = [s for s in line.split() if s.replace(".", "", 1).isdigit()]
+                if nums:
+                    summary["rpim"] = nums[0]
+        parts = []
+        if "sg"   in summary: parts.append(f"SG={summary['sg']}")
+        if "res"  in summary: parts.append(f"res={summary['res']}Å")
+        if "uc"   in summary: parts.append(f"UC={summary['uc']}")
+        if "comp" in summary: parts.append(f"comp={summary['comp']}")
+        if "mult" in summary: parts.append(f"mult={summary['mult']}")
+        if "rpim" in summary: parts.append(f"rpim={summary['rpim']}")
+        return " ".join(parts) if parts else "completed"
+
+    def _xds_error(self, pipeline_subdir, job):
+        """Return the first ERROR line from an XDS log, or None."""
+        log = Path(pipeline_subdir) / f"{job}_xds" / f"{job}_xds.log"
+        if not log.is_file():
+            return None
+        for line in log.read_text().splitlines():
+            if "!!! ERROR !!!" in line:
+                return line.strip()
+        return None
+
     # ------------------------------------------------------------------
     # Public entry points
     # ------------------------------------------------------------------
@@ -1217,17 +1345,17 @@ RunProcess(params).{method}()
             if len(parts) < 2:
                 continue
             collection  = parts[0].strip()
-            dset        = parts[1].strip()
+            pin_id      = parts[1].strip()
             data_range  = parts[2].strip() if len(parts) > 2 else "false"
             collection_id = Path(collection).name.replace("_transfer", "")
 
             for prefix in range(1, 5):
-                image_dir = Path(collection) / dset
-                if not (image_dir / f"{dset}_{prefix}_00100.cbf").is_file():
+                image_dir = Path(collection) / pin_id
+                if not (image_dir / f"{pin_id}_{prefix}_00100.cbf").is_file():
                     continue
 
                 if data_range == "false":
-                    image_count = len(list(image_dir.glob(f"{dset}_{prefix}_*.cbf")))
+                    image_count = len(list(image_dir.glob(f"{pin_id}_{prefix}_*.cbf")))
                     first_image = 1
                 else:
                     first_str, last_str = data_range.split("-")
@@ -1235,10 +1363,10 @@ RunProcess(params).{method}()
                     image_count = int(last_str)
 
                 if image_count < self.MIN_IMAGES:
-                    print(f"Partial dataset ({image_count} images) — skipping {dset}_{prefix}")
+                    print(f"Partial dataset ({image_count} images) — skipping {pin_id}_{prefix}")
                     continue
 
-                pin_dir = self.process_dir / f"{collection_id}_{dset}_{prefix}"
+                pin_dir = self.process_dir / f"{collection_id}_{pin_id}_{prefix}"
                 pin_dir.mkdir(exist_ok=True)
 
                 index_ranges = self._indexing_ranges(image_count, first_image)
@@ -1261,9 +1389,10 @@ RunProcess(params).{method}()
 
                         per_params = {
                             **self.params,
-                            "dset":                  dset,
+                            "pin_id":                f"{collection_id}_{pin_id}_{prefix}",
                             "image_dir":             str(image_dir),
                             "pipeline_subdir":       str(pipeline_subdir),
+                            "process_dir":           str(self.process_dir),
                             "image_range":           image_range,
                             "force_integration":     "false",
                             "known_first_pass":      sym["first_pass"],
@@ -1283,7 +1412,7 @@ RunProcess(params).{method}()
                             fh.write(str(pipeline_subdir) + "\n")
 
                 with open(processed, "a") as fh:
-                    fh.write(f"{collection_id}_{dset}_{prefix}\n")
+                    fh.write(f"{collection_id}_{pin_id}_{prefix}\n")
 
         submit_sh = self.process_dir / "xds_pipeline_index_qsub_submit.sh"
         self._submit_sge_array(qsub_list, submit_sh, h_rt="06:00:00")
@@ -1295,27 +1424,38 @@ RunProcess(params).{method}()
         """
         params          = self.params
         pipeline_subdir = Path(params["pipeline_subdir"])
+        sg   = params.get("known_sg", "none")
+        cell = params.get("known_cell", "none")
+        self._log(pipeline_subdir, "START",
+                  f"{params.get('pin_id','?')} | {pipeline_subdir.name} | sg={sg} cell={cell}")
 
         # --- job 1: initial indexing ---
         self._xds(1, params, "xds_initial_indexing")
 
         if self._xds_ascii_ok(pipeline_subdir, 1):
+            self._log(pipeline_subdir, "STEP", "1_xds: completed")
             job = 1
             if params.get("recycle_xds") == "true":
-                print("## job 1 successful, re-running with recycled detector params")
                 self._xds(2, params, "xds_recycle_detector")
                 job = 2
+                if self._xds_ascii_ok(pipeline_subdir, 2):
+                    self._log(pipeline_subdir, "STEP", "2_xds: completed")
+                else:
+                    self._log(pipeline_subdir, "ERROR", f"2_xds: {self._xds_error(pipeline_subdir, 2) or 'unknown error'}")
 
             if self._xds_ascii_ok(pipeline_subdir, job):
-                print(f"## job {job} successful, running Pointless / Aimless / XDS")
                 self._pointless(3, params)
+                self._log(pipeline_subdir, "STEP", "3_pointless: completed")
                 self._aimless(4, params)
+                self._log(pipeline_subdir, "STEP", "4_aimless: completed")
                 self._xds(5, params, "xds_refine_symmetry")
 
                 if self._xds_ascii_ok(pipeline_subdir, 5):
-                    print("## job 5 successful, running Pointless / Aimless")
+                    self._log(pipeline_subdir, "STEP", "5_xds: completed")
                     self._pointless(6, params)
+                    self._log(pipeline_subdir, "STEP", "6_pointless: completed")
                     self._aimless(7, params)
+                    self._log(pipeline_subdir, "STEP", "7_aimless: completed")
 
                     # Third XDS round only if resolution improved after job 7
                     aim7_log = pipeline_subdir / "7_aimless" / "7_aimless.log"
@@ -1334,27 +1474,40 @@ RunProcess(params).{method}()
                     )
 
                     if float(res_lim_7) > float(res_lim_5):
-                        print("## Resolution improved, running third XDS round")
+                        self._log(pipeline_subdir, "STEP", f"resolution improved ({res_lim_5} → {res_lim_7} Å), running third XDS round")
                         self._xds(8, params, "xds_refine_symmetry")
                         if self._xds_ascii_ok(pipeline_subdir, 8):
+                            self._log(pipeline_subdir, "STEP", "8_xds: completed")
                             self._pointless(9, params)
+                            self._log(pipeline_subdir, "STEP", "9_pointless: completed")
                             self._aimless(10, params)
+                            self._log(pipeline_subdir, "STEP", "10_aimless: completed")
                         else:
-                            print("## job 8 failed. Check logs.")
+                            self._log(pipeline_subdir, "ERROR", f"8_xds: {self._xds_error(pipeline_subdir, 8) or 'unknown error'}")
 
-                    print("## Running Rfree / Xtriage")
                     self._rfree(11, params)
+                    self._log(pipeline_subdir, "STEP", "11_rfree: completed")
                     self._xtriage(13, params)
+                    # Extract final SG and resolution from last aimless log
+                    last_aimless = max(
+                        (p for p in pipeline_subdir.glob("*_aimless/*_aimless.log")),
+                        key=lambda p: int(p.parent.name.split("_")[0]),
+                        default=None,
+                    )
+                    summary = self._aimless_summary(last_aimless) if last_aimless else "completed"
+                    self._log(pipeline_subdir, "DONE", summary)
                 else:
-                    print("## job 5 failed. Check logs.")
+                    self._log(pipeline_subdir, "ERROR", f"5_xds: {self._xds_error(pipeline_subdir, 5) or 'unknown error'}")
             else:
-                print(f"## job {job} failed. Check logs.")
+                self._log(pipeline_subdir, "ERROR", f"{job}_xds: {self._xds_error(pipeline_subdir, job) or 'unknown error'}")
 
         elif (pipeline_subdir / "1_xds" / "XPARM.XDS").is_file():
-            print("## Indexing failed; trying forced integration from IDXREF.LP solutions")
+            err = self._xds_error(pipeline_subdir, 1) or "indexing failed"
+            self._log(pipeline_subdir, "ERROR", f"1_xds: {err}")
+            self._log(pipeline_subdir, "FORCE", "submitting forced integration jobs")
             self._run_forced_integration(params, pipeline_subdir)
         else:
-            print("## XDS did not attempt to index. Check images and logs.")
+            self._log(pipeline_subdir, "ERROR", "1_xds: XDS did not attempt to index")
 
     def _run_forced_integration(self, params, pipeline_subdir):
         """
@@ -1380,6 +1533,7 @@ RunProcess(params).{method}()
         if lattice_list.is_file():
             lattice_list.unlink()
 
+        sg_list = []
         for sg_prefix, sg, sg_number, cell in sym_to_try:
             force_dir = pipeline_subdir / f"{sg_prefix}_{sg}_force"
             force_dir.mkdir(exist_ok=True)
@@ -1394,7 +1548,10 @@ RunProcess(params).{method}()
             self._write_worker_script(force_dir, per_params, method="run_single_forced")
             with open(lattice_list, "a") as fh:
                 fh.write(str(force_dir) + "\n")
+            sg_list.append(sg)
 
+        self._log(pipeline_subdir, "FORCE",
+                  f"submitting {len(sg_list)} job(s): {', '.join(sg_list)}")
         submit_sh = pipeline_subdir / "xds_pipeline_lattice_qsub_submit.sh"
         self._submit_sge_array(lattice_list, submit_sh, h_rt="02:00:00")
 
@@ -1410,41 +1567,63 @@ RunProcess(params).{method}()
         """
         params          = self.params
         pipeline_subdir = Path(params["pipeline_subdir"])
+        sg   = params.get("sg", "none")
+        cell = params.get("cell", "none")
+        self._log(pipeline_subdir, "START",
+                  f"{params.get('pin_id','?')} | {pipeline_subdir.name} | sg={sg} cell={cell}")
 
         self._xds(1, params, "xds_forced_integration")
 
         if not self._xds_ascii_ok(pipeline_subdir, 1):
-            print("## XDS did not attempt to index. Check images and logs.")
+            self._log(pipeline_subdir, "ERROR", f"1_xds: {self._xds_error(pipeline_subdir, 1) or 'XDS did not produce XDS_ASCII.HKL'}")
             return
 
+        self._log(pipeline_subdir, "STEP", "1_xds: completed")
         job = 1
         if params.get("recycle_xds") == "true":
             self._xds(2, params, "xds_recycle_detector")
             job = 2
+            if self._xds_ascii_ok(pipeline_subdir, 2):
+                self._log(pipeline_subdir, "STEP", "2_xds: completed")
+            else:
+                self._log(pipeline_subdir, "ERROR", f"2_xds: {self._xds_error(pipeline_subdir, 2) or 'unknown error'}")
 
         if not self._xds_ascii_ok(pipeline_subdir, job):
-            print(f"## job {job} failed. Check logs.")
+            self._log(pipeline_subdir, "ERROR", f"{job}_xds: {self._xds_error(pipeline_subdir, job) or 'unknown error'}")
             return
 
         # Round 2: first symmetry refinement
         self._pointless(3, params)
+        self._log(pipeline_subdir, "STEP", "3_pointless: completed")
         self._aimless(4, params)
+        self._log(pipeline_subdir, "STEP", "4_aimless: completed")
         self._xds(5, params, "xds_refine_symmetry")
 
         if not self._xds_ascii_ok(pipeline_subdir, 5):
-            print("## job 5 failed. Check logs.")
+            self._log(pipeline_subdir, "ERROR", f"5_xds: {self._xds_error(pipeline_subdir, 5) or 'unknown error'}")
             return
+
+        self._log(pipeline_subdir, "STEP", "5_xds: completed")
 
         # Round 3: second symmetry refinement (always runs for forced path)
         self._pointless(6, params)
+        self._log(pipeline_subdir, "STEP", "6_pointless: completed")
         self._aimless(7, params)
+        self._log(pipeline_subdir, "STEP", "7_aimless: completed")
         self._xds(8, params, "xds_refine_symmetry")
 
         if not self._xds_ascii_ok(pipeline_subdir, 8):
-            print("## job 8 failed. Check logs.")
+            self._log(pipeline_subdir, "ERROR", f"8_xds: {self._xds_error(pipeline_subdir, 8) or 'unknown error'}")
             return
 
+        self._log(pipeline_subdir, "STEP", "8_xds: completed")
         self._pointless(9, params)
+        self._log(pipeline_subdir, "STEP", "9_pointless: completed")
         self._aimless(10, params)
+        self._log(pipeline_subdir, "STEP", "10_aimless: completed")
         self._rfree(11, params)
+        self._log(pipeline_subdir, "STEP", "11_rfree: completed")
         self._xtriage(13, params)
+        # Extract final SG and resolution
+        last_aimless = pipeline_subdir / "10_aimless" / "10_aimless.log"
+        self._log(pipeline_subdir, "DONE", self._aimless_summary(last_aimless))
