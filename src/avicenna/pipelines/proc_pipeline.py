@@ -60,7 +60,7 @@ class RunXDS(RunBase):
         Parameters
         ----------
         params : dict
-            Pipeline parameters from vic_submit.py / RunProcess.
+            Pipeline parameters from vic_process.py / RunProcess.
         job : int
             Sequential job number within the pipeline (1, 2, 5, or 8).
         xds_executable : str or Path
