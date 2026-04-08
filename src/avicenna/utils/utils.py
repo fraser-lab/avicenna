@@ -240,7 +240,8 @@ class Watcher(object):
     # Tag → Watcher status mapping
     TAG_STATUS = {
         "START"  : "RUNNING",
-        "STEP"   : "RUNNING",
+        "PREP"   : "PREPARING",
+        "RUN"    : "RUNNING",
         "FORCE"  : "RUNNING_FORCE",
         "DONE"   : "FINISHED",
         "ERROR"  : "FAILED",

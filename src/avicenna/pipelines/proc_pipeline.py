@@ -1271,8 +1271,15 @@ RunProcess(params).{method}()
             return
         image_dir = Path(params["image_dir"])
         scratch_dir = Path(tmpdir) / image_dir.name
+        pipeline_subdir = Path(params["pipeline_subdir"])
+        params["original_image_dir"] = str(image_dir)
         if not scratch_dir.exists():
+            self._log(pipeline_subdir, "PREP",
+                      f"copying images to scratch: {image_dir} → {scratch_dir}")
             shutil.copytree(image_dir, scratch_dir)
+        else:
+            self._log(pipeline_subdir, "PREP",
+                      f"images already in scratch: {scratch_dir}")
         params["image_dir"] = str(scratch_dir)
 
     def _log(self, pipeline_subdir, tag, message):
@@ -1456,29 +1463,29 @@ RunProcess(params).{method}()
         self._xds(1, params, "xds_initial_indexing")
 
         if self._xds_ascii_ok(pipeline_subdir, 1):
-            self._log(pipeline_subdir, "STEP", "1_xds: completed")
+            self._log(pipeline_subdir, "RUN", "1_xds: completed")
             job = 1
             if params.get("recycle_xds") == "true":
                 self._xds(2, params, "xds_recycle_detector")
                 job = 2
                 if self._xds_ascii_ok(pipeline_subdir, 2):
-                    self._log(pipeline_subdir, "STEP", "2_xds: completed")
+                    self._log(pipeline_subdir, "RUN", "2_xds: completed")
                 else:
                     self._log(pipeline_subdir, "ERROR", f"2_xds: {self._xds_error(pipeline_subdir, 2) or 'unknown error'}")
 
             if self._xds_ascii_ok(pipeline_subdir, job):
                 self._pointless(3, params)
-                self._log(pipeline_subdir, "STEP", "3_pointless: completed")
+                self._log(pipeline_subdir, "RUN", "3_pointless: completed")
                 self._aimless(4, params)
-                self._log(pipeline_subdir, "STEP", "4_aimless: completed")
+                self._log(pipeline_subdir, "RUN", "4_aimless: completed")
                 self._xds(5, params, "xds_refine_symmetry")
 
                 if self._xds_ascii_ok(pipeline_subdir, 5):
-                    self._log(pipeline_subdir, "STEP", "5_xds: completed")
+                    self._log(pipeline_subdir, "RUN", "5_xds: completed")
                     self._pointless(6, params)
-                    self._log(pipeline_subdir, "STEP", "6_pointless: completed")
+                    self._log(pipeline_subdir, "RUN", "6_pointless: completed")
                     self._aimless(7, params)
-                    self._log(pipeline_subdir, "STEP", "7_aimless: completed")
+                    self._log(pipeline_subdir, "RUN", "7_aimless: completed")
 
                     # Third XDS round only if resolution improved after job 7
                     aim7_log = pipeline_subdir / "7_aimless" / "7_aimless.log"
@@ -1497,19 +1504,19 @@ RunProcess(params).{method}()
                     )
 
                     if float(res_lim_7) > float(res_lim_5):
-                        self._log(pipeline_subdir, "STEP", f"resolution improved ({res_lim_5} → {res_lim_7} Å), running third XDS round")
+                        self._log(pipeline_subdir, "RUN", f"resolution improved ({res_lim_5} → {res_lim_7} Å), running third XDS round")
                         self._xds(8, params, "xds_refine_symmetry")
                         if self._xds_ascii_ok(pipeline_subdir, 8):
-                            self._log(pipeline_subdir, "STEP", "8_xds: completed")
+                            self._log(pipeline_subdir, "RUN", "8_xds: completed")
                             self._pointless(9, params)
-                            self._log(pipeline_subdir, "STEP", "9_pointless: completed")
+                            self._log(pipeline_subdir, "RUN", "9_pointless: completed")
                             self._aimless(10, params)
-                            self._log(pipeline_subdir, "STEP", "10_aimless: completed")
+                            self._log(pipeline_subdir, "RUN", "10_aimless: completed")
                         else:
                             self._log(pipeline_subdir, "ERROR", f"8_xds: {self._xds_error(pipeline_subdir, 8) or 'unknown error'}")
 
                     self._rfree(11, params)
-                    self._log(pipeline_subdir, "STEP", "11_rfree: completed")
+                    self._log(pipeline_subdir, "RUN", "11_rfree: completed")
                     self._xtriage(13, params)
                     # Extract final SG and resolution from last aimless log
                     last_aimless = max(
@@ -1562,6 +1569,7 @@ RunProcess(params).{method}()
             force_dir.mkdir(exist_ok=True)
             per_params = {
                 **params,
+                "image_dir":         params.get("original_image_dir", params["image_dir"]),
                 "pipeline_subdir":   str(force_dir),
                 "force_integration": "true",
                 "sg":                sg,
@@ -1603,13 +1611,13 @@ RunProcess(params).{method}()
             self._log(pipeline_subdir, "ERROR", f"1_xds: {self._xds_error(pipeline_subdir, 1) or 'XDS did not produce XDS_ASCII.HKL'}")
             return
 
-        self._log(pipeline_subdir, "STEP", "1_xds: completed")
+        self._log(pipeline_subdir, "RUN", "1_xds: completed")
         job = 1
         if params.get("recycle_xds") == "true":
             self._xds(2, params, "xds_recycle_detector")
             job = 2
             if self._xds_ascii_ok(pipeline_subdir, 2):
-                self._log(pipeline_subdir, "STEP", "2_xds: completed")
+                self._log(pipeline_subdir, "RUN", "2_xds: completed")
             else:
                 self._log(pipeline_subdir, "ERROR", f"2_xds: {self._xds_error(pipeline_subdir, 2) or 'unknown error'}")
 
@@ -1619,35 +1627,35 @@ RunProcess(params).{method}()
 
         # Round 2: first symmetry refinement
         self._pointless(3, params)
-        self._log(pipeline_subdir, "STEP", "3_pointless: completed")
+        self._log(pipeline_subdir, "RUN", "3_pointless: completed")
         self._aimless(4, params)
-        self._log(pipeline_subdir, "STEP", "4_aimless: completed")
+        self._log(pipeline_subdir, "RUN", "4_aimless: completed")
         self._xds(5, params, "xds_refine_symmetry")
 
         if not self._xds_ascii_ok(pipeline_subdir, 5):
             self._log(pipeline_subdir, "ERROR", f"5_xds: {self._xds_error(pipeline_subdir, 5) or 'unknown error'}")
             return
 
-        self._log(pipeline_subdir, "STEP", "5_xds: completed")
+        self._log(pipeline_subdir, "RUN", "5_xds: completed")
 
         # Round 3: second symmetry refinement (always runs for forced path)
         self._pointless(6, params)
-        self._log(pipeline_subdir, "STEP", "6_pointless: completed")
+        self._log(pipeline_subdir, "RUN", "6_pointless: completed")
         self._aimless(7, params)
-        self._log(pipeline_subdir, "STEP", "7_aimless: completed")
+        self._log(pipeline_subdir, "RUN", "7_aimless: completed")
         self._xds(8, params, "xds_refine_symmetry")
 
         if not self._xds_ascii_ok(pipeline_subdir, 8):
             self._log(pipeline_subdir, "ERROR", f"8_xds: {self._xds_error(pipeline_subdir, 8) or 'unknown error'}")
             return
 
-        self._log(pipeline_subdir, "STEP", "8_xds: completed")
+        self._log(pipeline_subdir, "RUN", "8_xds: completed")
         self._pointless(9, params)
-        self._log(pipeline_subdir, "STEP", "9_pointless: completed")
+        self._log(pipeline_subdir, "RUN", "9_pointless: completed")
         self._aimless(10, params)
-        self._log(pipeline_subdir, "STEP", "10_aimless: completed")
+        self._log(pipeline_subdir, "RUN", "10_aimless: completed")
         self._rfree(11, params)
-        self._log(pipeline_subdir, "STEP", "11_rfree: completed")
+        self._log(pipeline_subdir, "RUN", "11_rfree: completed")
         self._xtriage(13, params)
         # Extract final SG and resolution
         last_aimless = pipeline_subdir / "10_aimless" / "10_aimless.log"
