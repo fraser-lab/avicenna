@@ -1093,7 +1093,9 @@ class RunProcess:
             results = []
             prefix = 0
             for lattice, cell in solutions:
-                for number, name in BRAVAIS_LATTICES.get(lattice, []):
+                sg_list = BRAVAIS_LATTICES.get(lattice, [])
+                if sg_list:
+                    number, name = sg_list[0]
                     prefix += 1
                     results.append((str(prefix), name, str(number), cell.replace(" ", "-")))
             return results

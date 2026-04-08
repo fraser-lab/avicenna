@@ -37,6 +37,27 @@ parser.add_argument("--watch", action="store_true", help="Whether to watch the p
 parser.add_argument("--dry_run", action="store_true", help="Create pin_list.txt and xds_input_parameters.txt without submitting jobs")
 
 
+XDS_PARAM_KEYS = {
+    "script_dir", "image_dir", "detector_edge", "indexing_images",
+    "try_alt_sym", "ncpu", "no_symmetry", "scaling", "recycle_xds",
+    "refine_cell_integrate", "res_limit", "cleanup", "ref_hkl", "ref_mtz",
+}
+
+def _read_xds_params(filepath):
+    """Read only XDS_PARAM_KEYS from a params file; these override any args."""
+    result = {}
+    with open(filepath) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            if key in XDS_PARAM_KEYS:
+                result[key] = value.strip()
+    return result
+
+
 if __name__ == "__main__":
     args = parser.parse_args()
     if not args.pinlist and not args.data:
@@ -57,7 +78,7 @@ if __name__ == "__main__":
         print("Dry run complete.")
         sys.exit(0)
 
-    params = vars(args)
+    params = {}
     data_path = None
 
     # Phase 1: Resolve pin list
@@ -92,18 +113,9 @@ if __name__ == "__main__":
         params["pins"] = pin_list
         params["image_dir"] = image_dir
 
-    # Phase 2: Resolve XDS params
+    # Phase 2: Resolve XDS params (file overrides args)
     if args.xdsparams and os.path.isfile(args.xdsparams):
-        with open(args.xdsparams) as fh:
-            for line in fh:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, _, value = line.partition("=")
-                params[key.strip()] = value.strip()
-        with open(args.xdsparams, "w") as fh:
-            for key, value in params.items():
-                fh.write(f"{key}={value}\n")
+        params.update(_read_xds_params(args.xdsparams))
     else:
         if data_path is None:
             sys.exit(
@@ -111,13 +123,7 @@ if __name__ == "__main__":
             )
         args.data = data_path
         ParamWriter(args=args).build_parameters()
-        with open("xds_input_parameters.txt") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, _, value = line.partition("=")
-                params[key.strip()] = value.strip()
+        params.update(_read_xds_params("xds_input_parameters.txt"))
 
     if args.python:
         proc = RunProcess(params)

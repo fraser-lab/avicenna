@@ -102,9 +102,9 @@ class ParamWriter(object):
             'cleanup'               : self.args.cleanup,
         }
         if self.args.refhkl is not None:
-            xds_params['ref_hkl'] = self.args.refhkl
+            xds_params['ref_hkl'] = os.path.abspath(self.args.refhkl)
         if self.args.refmtz is not None:
-            xds_params['ref_mtz'] = self.args.refmtz
+            xds_params['ref_mtz'] = os.path.abspath(self.args.refmtz)
         xds_param_filepath = f"{os.path.abspath(os.curdir)}/xds_input_parameters.txt"
         print (xds_param_filepath)
         with open(xds_param_filepath, 'w') as xpf:
