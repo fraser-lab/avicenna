@@ -80,33 +80,25 @@ class ParamWriter(object):
     def __init__(self, args):
         dst = str(args.data)[:-1] if str(args.data).endswith('/') else str(args.data)
         self.main_path = os.path.abspath(dst)
-        self.args = args
 
     def build_parameters(self):
         image_dir = os.path.dirname(self.main_path)
-        no_symmetry = not (os.path.isfile(str(self.args.refhkl)) or os.path.isfile(str(self.args.refmtz)))
-
-        
         xds_params = {
-            'script_dir'            : os.path.abspath(self.args.scripts),
-            'image_dir'             : image_dir,
-            'detector_edge'         : self.args.edge,
-            'indexing_images'       : self.args.idxrange,
-            'try_alt_sym'           : self.args.altsym,
-            'ncpu'                  : self.args.ncpu,
-            'no_symmetry'           : str(no_symmetry).lower(),
-            'scaling'               : self.args.scaling,
-            'recycle_xds'           : str(self.args.recycle).lower(),
-            'refine_cell_integrate' : self.args.refcell,
-            'res_limit'             : self.args.reslim,
-            'cleanup'               : self.args.cleanup,
+            'script_dir':            '../scripts',
+            'image_dir':             image_dir,
+            'detector_edge':         '0.8',
+            'indexing_images':       'first_half',
+            'try_alt_sym':           'all',
+            'ncpu':                  '8',
+            'no_symmetry':           'false',
+            'scaling':               'correct',
+            'recycle_xds':           'false',
+            'refine_cell_integrate': 'both',
+            'res_limit':             'cc12',
+            'cleanup':               'partial',
         }
-        if self.args.refhkl is not None:
-            xds_params['ref_hkl'] = os.path.abspath(self.args.refhkl)
-        if self.args.refmtz is not None:
-            xds_params['ref_mtz'] = os.path.abspath(self.args.refmtz)
         xds_param_filepath = f"{os.path.abspath(os.curdir)}/xds_input_parameters.txt"
-        print (xds_param_filepath)
+        print(xds_param_filepath)
         with open(xds_param_filepath, 'w') as xpf:
             for key, value in xds_params.items():
                 xpf.write(f"{key}={value}\n")
@@ -382,6 +374,34 @@ class Watcher(object):
                         print(line, end="", flush=True)
                         new_lines.append(line)
                     self._log_offsets[log_path] = len(all_lines)
+        return new_lines
+
+    def is_running(self):
+        """Return True if any jobs are still in progress (no output)."""
+        self.watch()
+        all_datasets = [v for sub in self.datasets.values() for v in sub.values()]
+        processed    = [d for d in all_datasets if "REJECTED" not in d]
+        finished     = len([d for d in processed if d[0] == "FINISHED"])
+        failed       = len([d for d in processed if d[0] == "FAILED"])
+        return (len(processed) - finished - failed) > 0
+
+    def tail_log(self):
+        """Print any new lines added to processing.log since the last call.
+        Returns the list of new lines printed."""
+        omnibus = os.path.join(self.procpath, "processing.log")
+        new_lines = []
+        if not os.path.isfile(omnibus):
+            return new_lines
+        try:
+            with open(omnibus) as fh:
+                all_lines = fh.readlines()
+        except OSError:
+            return new_lines
+        offset = self._log_offsets.get(omnibus, 0)
+        for line in all_lines[offset:]:
+            print(line, end="", flush=True)
+            new_lines.append(line)
+        self._log_offsets[omnibus] = len(all_lines)
         return new_lines
 
     def show_progress(self):

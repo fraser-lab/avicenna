@@ -77,6 +77,7 @@ class RunXDS(RunBase):
 
         # Convenience aliases derived from params
         self.pin_id            = params.get("pin_id")
+        self.image_prefix      = params.get("image_prefix", Path(params.get("image_dir", ".")).name)
         self.image_dir         = Path(params.get("image_dir"))
         self.script_dir        = Path(params.get("script_dir"))
         self.pipeline_subdir   = Path(params.get("pipeline_subdir"))
@@ -235,7 +236,7 @@ class RunXDS(RunBase):
         generate_inp.write_text(template.replace("sed_replace", self.image_range))
         generate_inp.chmod(generate_inp.stat().st_mode | stat.S_IXUSR | stat.S_IRUSR | stat.S_IWUSR)
         subprocess.run([str(generate_inp),
-                        str(self.image_dir / f"{self.pin_id}_1_0????.cbf")])
+                        str(self.image_dir / f"{self.image_prefix}_0????.cbf")])
 
         xds_inp = job_dir / "XDS.INP"
         text = xds_inp.read_text()
@@ -299,7 +300,7 @@ class RunXDS(RunBase):
             "JOB= DEFPIX INTEGRATE CORRECT",
         )
         text = re.sub(r"NAME_TEMPLATE_OF_DATA_FRAMES=.*",
-                      f"NAME_TEMPLATE_OF_DATA_FRAMES={self.image_dir}/{self.pin_id}_1_0????.cbf",
+                      f"NAME_TEMPLATE_OF_DATA_FRAMES={self.image_dir}/{self.image_prefix}_0????.cbf",
                       text)
         (job_dir / "XDS.INP").write_text(text)
 
@@ -1409,6 +1410,7 @@ RunProcess(params).{method}()
                         per_params = {
                             **self.params,
                             "pin_id":                f"{collection_id}_{pin_id}_{prefix}",
+                            "image_prefix":          f"{pin_id}_{prefix}",
                             "image_dir":             str(image_dir),
                             "pipeline_subdir":       str(pipeline_subdir),
                             "process_dir":           str(self.process_dir),
@@ -1446,7 +1448,7 @@ RunProcess(params).{method}()
         sg   = params.get("known_sg", "none")
         cell = params.get("known_cell", "none")
         self._log(pipeline_subdir, "START",
-                  f"{params.get('pin_id','?')} | {pipeline_subdir.name} | sg={sg} cell={cell}")
+                  f"{params.get('pin_id','?')} | {pipeline_subdir.parent.name} | sg={sg} cell={cell}")
 
         self._setup_scratch(params)
 
