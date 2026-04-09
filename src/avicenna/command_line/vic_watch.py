@@ -21,7 +21,7 @@ _mode.add_argument("-d", "--details", action="store_true", default=False, help="
 _mode.add_argument("-l", "--log", action="store_true", default=False, help="Print omnibus processing.log to stdout as jobs run (no progress bar)")
 
 
-if __name__ == "__main__":
+def main():
     args = parser.parse_args()
     watcher = Watcher(procpath=args.procpath, pincode=args.pincode, details=args.details)
     if args.log:
@@ -38,3 +38,7 @@ if __name__ == "__main__":
             if not watcher.run():
                 print()
                 break
+
+
+if __name__ == "__main__":
+    main()

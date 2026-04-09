@@ -60,7 +60,7 @@ def _read_xds_params(filepath):
     return result
 
 
-if __name__ == "__main__":
+def main():
     args = parser.parse_args()
     if not args.pinlist and not args.data:
         parser.error("either -d/--data or -p/--pinlist must be provided")
@@ -176,3 +176,7 @@ if __name__ == "__main__":
         scraper = Scraper(str(os.path.abspath(args.output)))
         scraper.scrape_all()
         scraper.print_info()
+
+
+if __name__ == "__main__":
+    main()
