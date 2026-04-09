@@ -13,6 +13,7 @@ RunXtriage    -- Phenix Xtriage data quality analysis
 RunProcess    -- orchestrator that drives the full pipeline
 """
 
+import importlib.resources
 import json
 import os
 import sys
@@ -79,7 +80,6 @@ class RunXDS(RunBase):
         self.pin_id            = params.get("pin_id")
         self.image_prefix      = params.get("image_prefix", Path(params.get("image_dir", ".")).name)
         self.image_dir         = Path(params.get("image_dir"))
-        self.script_dir        = Path(params.get("script_dir"))
         self.pipeline_subdir   = Path(params.get("pipeline_subdir"))
         self.image_range       = params.get("image_range", "").replace("-", " ")
         self.ncpu              = params.get("ncpu", 8)
@@ -230,9 +230,9 @@ class RunXDS(RunBase):
         job_dir.mkdir(parents=True, exist_ok=True)
         os.chdir(job_dir)
 
-        # Generate XDS.INP from the template script
+        # Generate XDS.INP from the bundled script
         generate_inp = job_dir / "generate_XDS.INP"
-        template = (self.script_dir / "generate_XDS.INP").read_text()
+        template = importlib.resources.files("avicenna.resources.scripts").joinpath("generate_XDS.INP").read_text()
         generate_inp.write_text(template.replace("sed_replace", self.image_range))
         generate_inp.chmod(generate_inp.stat().st_mode | stat.S_IXUSR | stat.S_IRUSR | stat.S_IWUSR)
         subprocess.run([str(generate_inp),
@@ -963,7 +963,6 @@ class RunProcess:
         self.params        = params
         self.process_dir   = Path(params.get("process_dir", os.getcwd()))
         self.transfer_dir  = Path(params.get("image_dir", ""))
-        self.script_dir    = Path(params.get("script_dir", ""))
         self.ncpu          = int(params.get("ncpu", 8))
         self.indexing_images = params.get("indexing_images", "first_half")
         self.no_symmetry   = params.get("no_symmetry", "false")
