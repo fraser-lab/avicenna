@@ -42,7 +42,7 @@ The basic options include:
   
   `--dry_run` - generate `pin_list.txt` and `xds_input_parameters.txt` but do not actually run processing
 
-Whenever `vic_process.py` runs, it outputs its own pin_list.txt and xds_input_parameters.txt, so if you simply wish to generate those files and then edit them later, use the `--dry_run` option.
+Whenever `vic_process.py` runs, it outputs its own `pin_list.txt` and `xds_input_parameters.txt`, so if you simply wish to generate those files and then edit them later, use the `--dry_run` option.
 
 ### Examples
 
