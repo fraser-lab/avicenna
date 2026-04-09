@@ -6,11 +6,17 @@ AVICENNA is intended to someday become a fully automated data-to-structure pipel
 
 ## Installation
 
-Currently, AVICENNA can only be cloned from the Fraser Lab repository by going into an freshly created empty folder and issuing
+Currently, AVICENNA can only be cloned from the Fraser Lab repository by going into an freshly created empty folder and issuing the following commands:
 
-`https://github.com/fraser-lab/avicenna.git`
+	git clone https://github.com/fraser-lab/avicenna.git
+	cd avicenna
+	bash vic_install.sh
 
-There are no setup scripts yet. The various parts of the pipeline are currently to be invoked directly from where the repository is cloned.
+At the end of the installation, the install script will print out a line to add to your .bashrc / .zshrc file if you want the avicenna environment initialized on startup. Otherwise just issue:
+
+	source $AVICENNA_INSTALL_FOLDER/vic_setup.sh
+	
+
 
 ## Usage
 
