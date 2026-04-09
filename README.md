@@ -69,6 +69,7 @@ Run with pre-written `pin_list.txt` and `xds_input_parameters.txt` files (see be
 ### Sample xds_input_parameters.txt
 
 **NOTE**: the file *must* be called `xds_input_parameters.txt` at this time
+
 **NOTE**: to process without prior crystal information, remove everything from (and including) `## crystal ##` down.
 
 	script_dir=/wynton/group/fraser/alyubimov/processing_pipeline/scripts
