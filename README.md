@@ -20,9 +20,9 @@ At the end of the installation, the install script will print out a line to add 
 
 ## Usage
 
-The only implemented module, so far, is the data processing pipeline. It can be invoked by issuing
+AVICENNA is can now be run from a conda environment (activates automatically once you source `vic_setup.sh` as shown above) with aliased command:
 
-  `$AVICENNA_INSTALL/src/avicenna/command_line/vic_process.py [OPTIONS]`
+	vic.process [OPTIONS]
 
 The basic options include:
 
