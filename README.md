@@ -58,6 +58,7 @@ Run with pre-written `pin_list.txt` and `xds_input_parameters.txt` files (see be
 ### Sample pin_list.txt
 
 **NOTE**: the file *must* be called `pin_list.txt` at this time.
+
 **NOTE**: the paths in the first column *must* be absolute paths at this time.
 
 	/wynton/group/fraser/als_20251107_transfer,FRS-049_03
