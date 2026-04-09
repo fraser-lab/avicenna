@@ -1,5 +1,6 @@
 import os
 import sys
+from datetime import datetime
 # import matplotlib.pyplot as plt
 
 # Bravais lattice → list of (sg_number, sg_name) tuples.
@@ -430,7 +431,7 @@ class Watcher(object):
                 f"{finished} processed | {failed} failed | {in_progress} running | {rejected} rejected")
         print(f"{line:100}", end="", flush=True)
 
-        return in_progress > 0 or rejected > 0
+        return in_progress > 0
 
     def show_count(self):
         self.watch()
@@ -452,6 +453,26 @@ class Watcher(object):
                     entry += f" ({error})"
                 msg.append(entry)
         print("\n".join(msg) + "\n*************\n")
+
+    def print_summary(self, omnibus=None):
+        """Print a completion summary and optionally append it to the omnibus log."""
+        all_datasets = [v for sub in self.datasets.values() for v in sub.values()]
+        rejected     = len([d for d in all_datasets if "REJECTED" in d])
+        processed    = [d for d in all_datasets if "REJECTED" not in d]
+        finished     = len([d for d in processed if d[0] == "FINISHED"])
+        failed       = len([d for d in processed if d[0] == "FAILED"])
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        lines = [
+            f"[{ts}] Run complete.",
+            f"[{ts}] Processed: {finished} | Failed: {failed} | Rejected: {rejected}",
+            f"[{ts}] =======================",
+        ]
+        for line in lines:
+            print(line, flush=True)
+        if omnibus:
+            with open(omnibus, "a") as fh:
+                for line in lines:
+                    fh.write(line + "\n")
 
     def run(self):
         if self.details:
