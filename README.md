@@ -20,15 +20,17 @@ At the end of the installation, the install script will print out a line to add 
 
 ## Usage
 
-AVICENNA is can now be run from a conda environment (activates automatically once you source `vic_setup.sh` as shown above) with aliased command:
+### Processing X-ray diffraction data
+
+AVICENNA is can now be run from a conda environment (activates automatically once you source `vic_setup.sh` as shown above) with aliased commands:
 
 	vic.process [OPTIONS]
 
 The basic options include:
 
-  `-d </path/to/image/files>` - specify path(s) to data files (could be multiple paths); these paths can be relative or absolute
+  `-d </path/to/image/files>` - specify path(s) to data files (could be multiple paths)
   
-  `-d <file_with_list_of_paths.txt>` - a text file with a list of paths to image folder can also be submitted
+  `-d <file_with_list_of_paths.txt>` - a text file with a list of paths to image folder can also be submitted. **NOTE**: For best results, it's recommended to use absolute paths (e.g. `/path/to/images`) to avoid "file not found" errors.
   
   `-p pin_list.txt` - a text file with a list of pin codes and their corresponding data (see the example below); can be provided instead of the path to image files
   
@@ -46,16 +48,17 @@ Whenever `vic_process.py` runs, it outputs its own pin_list.txt and xds_input_pa
 
 Basic run with defaults and no prior crystal information:
   
-  `$AVICENNA_INSTALL/src/avicenna/command_line/vic_process.py -d /path/to/image/files/first_sweep/ /path/to/image/files/second_sweep -l`
+  `vic_process.py -d /path/to/image/files/first_sweep/ /path/to/image/files/second_sweep -l`
 
 Run with pre-written `pin_list.txt` and `xds_input_parameters.txt` files (see below for examples)
 
-  `$AVICENNA_INSTALL/src/avicenna/command_line/vic_process.py -p pin_list.txt -x xds_input_parameters.txt -l`
+  `vic_process.py -p pin_list.txt -x xds_input_parameters.txt -l`
 
 
 ### Sample pin_list.txt
 
 **NOTE**: the file *must* be called `pin_list.txt` at this time.
+**NOTE**: the paths in the first column *must* be absolute paths at this time.
 
 	/wynton/group/fraser/als_20251107_transfer,FRS-049_03
 	/wynton/group/fraser/als_20251107_transfer,FRS-049_04
