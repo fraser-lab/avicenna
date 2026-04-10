@@ -414,13 +414,19 @@ class Watcher(object):
 
     def show_progress(self):
         self.watch()
-        all_datasets  = [v for sub in self.datasets.values() for v in sub.values()]
-        rejected   = len([d for d in all_datasets if "REJECTED" in d])
-        processed     = [d for d in all_datasets if "REJECTED" not in d]
-        finished      = len([d for d in processed if d[0] == "FINISHED"])
-        failed        = len([d for d in processed if d[0] == "FAILED"])
-        in_progress   = len(processed) - finished - failed
-        total         = len(all_datasets)
+        # Count at pin level for the progress bar
+        finished = failed = in_progress = rejected = 0
+        for pin, subfolders in self.datasets.items():
+            statuses = list(subfolders.values())
+            if any("REJECTED" in s for s in statuses):
+                rejected += 1
+            elif any(s[0] not in ("FINISHED", "FAILED") for s in statuses):
+                in_progress += 1
+            elif any(s[0] == "FAILED" for s in statuses):
+                failed += 1
+            else:
+                finished += 1
+        total = len(self.datasets)
 
         bar_width = total if total <= 40 else 40
         if total > 0:
