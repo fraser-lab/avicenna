@@ -22,6 +22,7 @@ import re
 import shutil
 import stat
 import subprocess
+import time
 from datetime import datetime
 from pathlib import Path
 sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "src"))
@@ -1283,11 +1284,13 @@ RunProcess(params).{method}()
 
     def _log(self, pipeline_subdir, tag, message):
         """Append a timestamped line to pipeline.log in pipeline_subdir,
-        and also to processing.log in process_dir (the omnibus log)."""
+        and also to processing.log in process_dir (the omnibus log).
+        If pipeline_subdir is None, only the omnibus log is written."""
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         line = f"[{ts}] {tag:<10} {message}\n"
-        with open(Path(pipeline_subdir) / "pipeline.log", "a") as fh:
-            fh.write(line)
+        if pipeline_subdir is not None:
+            with open(Path(pipeline_subdir) / "pipeline.log", "a") as fh:
+                fh.write(line)
         process_dir = self.params.get("process_dir")
         if process_dir:
             pin_id = self.params.get("pin_id", "?")
@@ -1358,6 +1361,7 @@ RunProcess(params).{method}()
         Outer loop: build the directory tree and submit per-dataset SGE array jobs.
         Mirrors xds_pipeline_prep.sh.
         """
+        _run_start = time.time()
         qsub_list = self.process_dir / "xds_pipeline_index_qsub_list.txt"
         processed  = self.process_dir / "pin_list_processed.txt"
         for f in (qsub_list, processed):
@@ -1375,13 +1379,20 @@ RunProcess(params).{method}()
             data_range  = parts[2].strip() if len(parts) > 2 else "false"
             collection_id = Path(collection).name.replace("_transfer", "")
 
-            for prefix in range(1, 5):
-                image_dir = Path(collection) / pin_id
-                if not (image_dir / f"{pin_id}_{prefix}_00100.cbf").is_file():
+            image_dir = Path(collection) / pin_id
+            groups = {}
+            for f in image_dir.glob(f"{pin_id}_*.cbf"):
+                series_key = "_".join(f.stem.split("_")[:-1])
+                groups.setdefault(series_key, []).append(f)
+
+            for series_key, files in sorted(groups.items()):
+                pin_dir_check = self.process_dir / f"{collection_id}_{series_key}"
+                if pin_dir_check.is_dir():
+                    print(f"Output folder already exists — skipping {series_key}")
                     continue
 
                 if data_range == "false":
-                    image_count = len(list(image_dir.glob(f"{pin_id}_{prefix}_*.cbf")))
+                    image_count = len(files)
                     first_image = 1
                 else:
                     first_str, last_str = data_range.split("-")
@@ -1389,10 +1400,13 @@ RunProcess(params).{method}()
                     image_count = int(last_str)
 
                 if image_count < self.MIN_IMAGES:
-                    print(f"Partial dataset ({image_count} images) — skipping {pin_id}_{prefix}")
+                    print(f"Partial dataset ({image_count} images) — skipping {series_key}")
+                    self.params["pin_id"] = f"{collection_id}_{series_key}"
+                    self._log(None, "REJECT",
+                              f"partial dataset ({image_count} images, minimum is {self.MIN_IMAGES})")
                     continue
 
-                pin_dir = self.process_dir / f"{collection_id}_{pin_id}_{prefix}"
+                pin_dir = self.process_dir / f"{collection_id}_{series_key}"
                 pin_dir.mkdir(exist_ok=True)
 
                 index_ranges = self._indexing_ranges(image_count, first_image)
@@ -1415,8 +1429,8 @@ RunProcess(params).{method}()
 
                         per_params = {
                             **self.params,
-                            "pin_id":                f"{collection_id}_{pin_id}_{prefix}",
-                            "image_prefix":          f"{pin_id}_{prefix}",
+                            "pin_id":                f"{collection_id}_{series_key}",
+                            "image_prefix":          series_key,
                             "image_dir":             str(image_dir),
                             "pipeline_subdir":       str(pipeline_subdir),
                             "process_dir":           str(self.process_dir),
@@ -1439,10 +1453,11 @@ RunProcess(params).{method}()
                             fh.write(str(pipeline_subdir) + "\n")
 
                 with open(processed, "a") as fh:
-                    fh.write(f"{collection_id}_{pin_id}_{prefix}\n")
+                    fh.write(f"{collection_id}_{series_key}\n")
 
         submit_sh = self.process_dir / "xds_pipeline_index_qsub_submit.sh"
         self._submit_sge_array(qsub_list, submit_sh, h_rt="06:00:00")
+        print(f"Done in {time.time() - _run_start:.1f}s")
 
     def run_single(self):
         """

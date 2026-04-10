@@ -66,6 +66,8 @@ class DataFinder(object):
         self.image_dir = parents.pop()
         for path in self.paths:
             for sf in sorted(os.listdir(path)):
+                if not os.path.isdir(os.path.join(path, sf)):
+                    continue
                 pin_line = f"{path},{sf}"
                 print(pin_line)
                 self.pin_list.append(pin_line)
@@ -288,14 +290,18 @@ class Watcher(object):
             index_path = os.path.join(result_type_path, entry)
             if not os.path.isdir(index_path) or not entry.startswith('index_'):
                 continue
-            flat_log = os.path.join(index_path, 'pipeline.log')
-            if os.path.isfile(flat_log):
-                logs.append(flat_log)
+            force_logs = []
             for sub in os.listdir(index_path):
                 if sub.endswith('_force'):
                     force_log = os.path.join(index_path, sub, 'pipeline.log')
                     if os.path.isfile(force_log):
-                        logs.append(force_log)
+                        force_logs.append(force_log)
+            if force_logs:
+                logs.extend(force_logs)
+            else:
+                flat_log = os.path.join(index_path, 'pipeline.log')
+                if os.path.isfile(flat_log):
+                    logs.append(flat_log)
         return logs
 
     def _read_pipeline_log(self, log_path):
@@ -308,7 +314,7 @@ class Watcher(object):
         for line in reversed(lines):
             # format: [YYYY-MM-DD HH:MM:SS] TAG        message
             try:
-                _, tag, *rest = line.split(None, 2)
+                _, _, tag, *rest = line.split(None, 3)
                 tag = tag.strip()
                 msg = rest[0].strip() if rest else ""
                 status = self.TAG_STATUS.get(tag)
@@ -418,10 +424,12 @@ class Watcher(object):
 
         bar_width = total if total <= 40 else 40
         if total > 0:
-            n_done     = round(finished    / total * bar_width)
             n_failed   = round(failed      / total * bar_width)
-            n_not_proc = round(rejected / total * bar_width)
-            n_active   = bar_width - n_done - n_failed - n_not_proc
+            n_not_proc = round(rejected    / total * bar_width)
+            n_active   = round(in_progress / total * bar_width)
+            if n_active == 0 and in_progress > 0:
+                n_active = 1
+            n_done     = max(0, bar_width - n_failed - n_not_proc - n_active)
         else:
             n_done = n_failed = n_active = 0
             n_not_proc = bar_width
