@@ -1,4 +1,5 @@
 import os
+import pathlib
 import sys
 from datetime import datetime
 # import matplotlib.pyplot as plt
@@ -107,11 +108,33 @@ class ParamWriter(object):
                 xpf.write(f"{key}={value}\n")
 
 
-class Scraper(object):
+class ScraperBase(object):
     def __init__(self, result_path):
         self.result_path = result_path
         self.results = {}
 
+    def find_results(self):
+        raise NotImplementedError
+
+    def scrape_one_log(self, info_dict):
+        raise NotImplementedError
+
+    def scrape_all(self):
+        results = self.find_results()
+        for result in results:
+            updated_result = self.scrape_one_log(info_dict=result)
+            if updated_result is None:
+                result['outcome'] = 'failed'
+            else:
+                result.update(updated_result)
+                result['outcome'] = 'completed'
+        self.results = results
+
+    def print_info(self):
+        raise NotImplementedError
+
+
+class ProcessingScraper(ScraperBase):
     def _find_aimless_log(self, index_path):
         """Given an index_X_Y folder, return the path to the appropriate
         10_aimless.log, or None if no completed job is found.
@@ -205,19 +228,6 @@ class Scraper(object):
         info_dict.update(multi_params)
         return info_dict
 
-
-    def scrape_all(self):
-        results = self.find_results()
-        for result in results:
-            updated_result = self.scrape_one_log(info_dict=result)
-            if updated_result is None:
-                result['outcome'] = 'failed'
-            else:
-                result.update(updated_result)
-                result['outcome'] = 'completed'
-        self.results = results
-
-
     def print_info(self):
         for result in self.results:
             if result['outcome'] == 'completed':
@@ -227,20 +237,106 @@ class Scraper(object):
                     rpim = f"{result['Rpim (within I+/I-)' ][0]:>5} ({result['Rpim (within I+/I-)' ][-1]})"
                     cell = f"{' '.join(result['Average unit cell'])}"
                     print (
-                        f"{result['dataset_code']:10} ({os.path.basename(result['result_path'])}) SG: {result['Space group']:<10} CELL: {cell:22} RES: {result['High resolution limit'][-1]:8} COMP: {comp:<14} MULT: {mult:<14} RPIM: {rpim:<14}" 
+                        f"{result['dataset_code']:10} ({os.path.basename(result['result_path'])}) SG: {result['Space group']:<10} CELL: {cell:22} RES: {result['High resolution limit'][-1]:8} COMP: {comp:<14} MULT: {mult:<14} RPIM: {rpim:<14}"
                     )
                 except KeyError as e:
                     print (f"ERROR: {result['dataset_code']} Missing item: {str(e)}")
-                except TypeError as e:
+                except TypeError:
                     print (f"ERROR: {result['dataset_code']} Missing stats!")
             else:
                 print (f"{result['dataset_code']} ({os.path.basename(result['result_path'])}) FAILED")
 
 
+class QRefineScraper(ScraperBase):
+    def _parse_pdb_stats(self, pdb_path):
+        """Extract Rwork, Rfree, and resolution from REMARK 3 in a PDB file."""
+        rwork = rfree = res = None
+        try:
+            for line in pathlib.Path(pdb_path).read_text().splitlines():
+                if 'R VALUE            (WORKING SET) :' in line:
+                    try:
+                        rwork = float(line.split(':')[-1].strip())
+                    except ValueError:
+                        pass
+                elif 'FREE R VALUE                     :' in line:
+                    try:
+                        rfree = float(line.split(':')[-1].strip())
+                    except ValueError:
+                        pass
+                elif 'RESOLUTION RANGE HIGH (ANGSTROMS) :' in line:
+                    try:
+                        res = float(line.split(':')[-1].strip())
+                    except ValueError:
+                        pass
+        except OSError:
+            pass
+        return rwork, rfree, res
 
-class Watcher(object):
+    def find_results(self):
+        print(f"Looking in {self.result_path}...")
+        qrefine_dir = os.path.join(self.result_path, 'qrefine')
+        results = []
+        if not os.path.isdir(qrefine_dir):
+            return results
+        for job_dir_name in sorted(os.listdir(qrefine_dir)):
+            job_dir = os.path.join(qrefine_dir, job_dir_name)
+            if not os.path.isdir(job_dir):
+                continue
+            results.append({
+                'job_dir'      : job_dir,
+                'job_dir_name' : job_dir_name,
+                'outcome'      : 'unprocessed',
+            })
+        return results
 
-    # Tag → Watcher status mapping
+    def scrape_one_log(self, info_dict):
+        job_dir   = info_dict['job_dir']
+        hoh_pdb   = os.path.join(job_dir, 'final_hoh.pdb')
+        nohoh_pdb = os.path.join(job_dir, 'final_nohoh.pdb')
+
+        hoh_stats   = self._parse_pdb_stats(hoh_pdb)   if os.path.isfile(hoh_pdb)   else None
+        nohoh_stats = self._parse_pdb_stats(nohoh_pdb) if os.path.isfile(nohoh_pdb) else None
+
+        if hoh_stats and nohoh_stats:
+            h_rfree = hoh_stats[1] if hoh_stats[1] is not None else 1.0
+            n_rfree = nohoh_stats[1] if nohoh_stats[1] is not None else 1.0
+            rwork, rfree, res = hoh_stats if h_rfree <= n_rfree else nohoh_stats
+            info_dict['suffix'] = 'hoh' if h_rfree <= n_rfree else 'nohoh'
+        elif hoh_stats:
+            rwork, rfree, res = hoh_stats
+            info_dict['suffix'] = 'hoh'
+        elif nohoh_stats:
+            rwork, rfree, res = nohoh_stats
+            info_dict['suffix'] = 'nohoh'
+        else:
+            return None
+
+        s = info_dict['suffix']
+        info_dict['rwork']      = rwork
+        info_dict['rfree']      = rfree
+        info_dict['resolution'] = res
+        info_dict['phaser']     = os.path.isfile(os.path.join(job_dir, f'02-phaser_{s}.1.pdb'))
+        return info_dict
+
+    def print_info(self):
+        for result in self.results:
+            if result['outcome'] == 'completed':
+                rwork  = f"{result['rwork']:.4f}"  if result['rwork']      is not None else 'n/a'
+                rfree  = f"{result['rfree']:.4f}"  if result['rfree']      is not None else 'n/a'
+                res    = f"{result['resolution']:.2f}A" if result['resolution'] is not None else 'n/a'
+                phaser = 'phaser' if result.get('phaser') else 'no_phaser'
+                suffix = result.get('suffix', 'n/a')
+                print(f"{result['job_dir_name']}  Rwork: {rwork}  Rfree: {rfree}  Res: {res}  {phaser}  {suffix}")
+            else:
+                print(f"{result['job_dir_name']}  FAILED")
+
+
+Scraper = ProcessingScraper
+
+
+
+class WatcherBase(object):
+
     TAG_STATUS = {
         "START"  : "RUNNING",
         "PREP"   : "PREPARING",
@@ -254,55 +350,27 @@ class Watcher(object):
         self.procpath = os.path.abspath(procpath) if procpath is not None else os.path.abspath(os.curdir)
         self.pincode = pincode
         self.details = details
-        self._log_offsets = {}   # path → number of lines already printed
+        self._log_offsets = {}
         self.get_info()
 
     def get_info(self):
-        if not os.path.isdir(self.procpath):
-            sys.exit(f"Error: processing directory '{self.procpath}' does not exist.")
-        pin_list_path = os.path.join(self.procpath, "pin_list.txt")
-        if not os.path.isfile(pin_list_path):
-            sys.exit(f"Error: 'pin_list.txt' not found in '{self.procpath}'.")
-        self.datasets = {}
-        with open(pin_list_path, 'r') as f:
-            for line in f:
-                parts = line.split(',')
-                collection = os.path.basename(parts[0].strip()).replace('_transfer', '')
-                self.datasets[f"{collection}_{parts[1].strip()}"] = None
-        folders = [name for name in os.listdir(self.procpath)
-                   if os.path.isdir(os.path.join(self.procpath, name))]
-        for pin in self.datasets:
-            pin_folder = next((f for f in folders if pin in f), None)
-            if pin_folder is None:
-                self.datasets[pin] = {'none': {"REJECTED", None}}
-            else:
-                pin_folder_path = os.path.join(self.procpath, pin_folder)
-                subfolders = [name for name in os.listdir(pin_folder_path)
-                              if os.path.isdir(os.path.join(pin_folder_path, name))]
-                self.datasets[pin] = {sf: (None, None) for sf in subfolders}
+        raise NotImplementedError
 
-    def _pipeline_logs(self, result_type_path):
-        """Find all pipeline.log files under result_type_path, searching
-        index_*/ dirs at the top level and *_force/ dirs one level deeper.
-        Returns a list of absolute paths."""
-        logs = []
-        for entry in os.listdir(result_type_path):
-            index_path = os.path.join(result_type_path, entry)
-            if not os.path.isdir(index_path) or not entry.startswith('index_'):
-                continue
-            force_logs = []
-            for sub in os.listdir(index_path):
-                if sub.endswith('_force'):
-                    force_log = os.path.join(index_path, sub, 'pipeline.log')
-                    if os.path.isfile(force_log):
-                        force_logs.append(force_log)
-            if force_logs:
-                logs.extend(force_logs)
-            else:
-                flat_log = os.path.join(index_path, 'pipeline.log')
-                if os.path.isfile(flat_log):
-                    logs.append(flat_log)
-        return logs
+    def _pipeline_logs(self, *_):
+        raise NotImplementedError
+
+    def watch(self):
+        raise NotImplementedError
+
+    def _emit(self, line, log_file=None):
+        """Print a line and optionally append it to a log file."""
+        print(line, end="", flush=True)
+        if log_file:
+            with open(log_file, "a") as fh:
+                fh.write(line)
+
+    def tail_logs(self, log_file=None):
+        raise NotImplementedError
 
     def _read_pipeline_log(self, log_path):
         """Return (status, message) from the last meaningful line of pipeline.log."""
@@ -324,78 +392,29 @@ class Watcher(object):
                 continue
         return (None, None)
 
-    def watch(self):
-        folders = [name for name in os.listdir(self.procpath)
-                   if os.path.isdir(os.path.join(self.procpath, name))]
-        for pin in self.datasets:
-            pin_folder = next((f for f in folders if pin in f), None)
-            if pin_folder is None:
-                continue
-            pin_folder_path = os.path.join(self.procpath, pin_folder)
-            for psf_name in self.datasets[pin]:
-                if "REJECTED" in self.datasets[pin][psf_name]:
-                    continue
-                psf = os.path.join(pin_folder_path, psf_name)
-                logs = self._pipeline_logs(psf)
-                if not logs:
-                    continue
-                # Aggregate: DONE only if all logs are DONE; any FAILED → FAILED;
-                # otherwise use the most recent non-None status
-                statuses = [self._read_pipeline_log(l) for l in logs]
-                statuses = [(s, m) for s, m in statuses if s is not None]
-                if not statuses:
-                    continue
-                if any(s == "FAILED" for s, _ in statuses):
-                    failed_msg = next(m for s, m in statuses if s == "FAILED")
-                    self.datasets[pin][psf_name] = ("FAILED", failed_msg)
-                elif all(s == "FINISHED" for s, _ in statuses):
-                    self.datasets[pin][psf_name] = ("FINISHED", None)
-                else:
-                    # pick most informative running status
-                    last_s, last_m = statuses[-1]
-                    self.datasets[pin][psf_name] = (last_s, last_m)
-
-    def tail_logs(self):
-        """Print any new lines added to pipeline.log files since last call.
-        Returns the list of new lines printed."""
-        new_lines = []
-        for pin in self.datasets:
-            pin_folder_path = next(
-                (os.path.join(self.procpath, f) for f in os.listdir(self.procpath)
-                 if pin in f and os.path.isdir(os.path.join(self.procpath, f))),
-                None
-            )
-            if pin_folder_path is None:
-                continue
-            for psf_name in self.datasets[pin]:
-                psf = os.path.join(pin_folder_path, psf_name)
-                if not os.path.isdir(psf):
-                    continue
-                for log_path in self._pipeline_logs(psf):
-                    try:
-                        with open(log_path) as fh:
-                            all_lines = fh.readlines()
-                    except OSError:
-                        continue
-                    offset = self._log_offsets.get(log_path, 0)
-                    for line in all_lines[offset:]:
-                        print(line, end="", flush=True)
-                        new_lines.append(line)
-                    self._log_offsets[log_path] = len(all_lines)
-        return new_lines
+    def get_counts(self):
+        """Return (finished, failed, in_progress, rejected, total) counts."""
+        self.watch()
+        finished = failed = in_progress = rejected = 0
+        for pin, subfolders in self.datasets.items():
+            statuses = list(subfolders.values())
+            if any("REJECTED" in s for s in statuses):
+                rejected += 1
+            elif any(s[0] not in ("FINISHED", "FAILED") for s in statuses):
+                in_progress += 1
+            elif any(s[0] == "FAILED" for s in statuses):
+                failed += 1
+            else:
+                finished += 1
+        return finished, failed, in_progress, rejected, len(self.datasets)
 
     def is_running(self):
-        """Return True if any jobs are still in progress (no output)."""
-        self.watch()
-        all_datasets = [v for sub in self.datasets.values() for v in sub.values()]
-        processed    = [d for d in all_datasets if "REJECTED" not in d]
-        finished     = len([d for d in processed if d[0] == "FINISHED"])
-        failed       = len([d for d in processed if d[0] == "FAILED"])
-        return (len(processed) - finished - failed) > 0
+        """Return True if any jobs are still in progress."""
+        finished, failed, in_progress, rejected, total = self.get_counts()
+        return in_progress > 0
 
     def tail_log(self):
-        """Print any new lines added to processing.log since the last call.
-        Returns the list of new lines printed."""
+        """Print any new lines added to processing.log since the last call."""
         omnibus = os.path.join(self.procpath, "processing.log")
         new_lines = []
         if not os.path.isfile(omnibus):
@@ -413,49 +432,9 @@ class Watcher(object):
         return new_lines
 
     def show_progress(self):
-        self.watch()
-        # Count at pin level for the progress bar
-        finished = failed = in_progress = rejected = 0
-        for pin, subfolders in self.datasets.items():
-            statuses = list(subfolders.values())
-            if any("REJECTED" in s for s in statuses):
-                rejected += 1
-            elif any(s[0] not in ("FINISHED", "FAILED") for s in statuses):
-                in_progress += 1
-            elif any(s[0] == "FAILED" for s in statuses):
-                failed += 1
-            else:
-                finished += 1
-        total = len(self.datasets)
-
-        bar_width = total if total <= 40 else 40
-        if total > 0:
-            n_failed   = round(failed      / total * bar_width)
-            n_not_proc = round(rejected    / total * bar_width)
-            n_active   = round(in_progress / total * bar_width)
-            if n_active == 0 and in_progress > 0:
-                n_active = 1
-            n_done     = max(0, bar_width - n_failed - n_not_proc - n_active)
-        else:
-            n_done = n_failed = n_active = 0
-            n_not_proc = bar_width
-
-        bar  = "#" * n_done + "!" * n_failed + "-" * n_active + "X" * n_not_proc
-        line = (f"\r({finished + failed + rejected}/{total}) [{bar}] "
-                f"{finished} processed | {failed} failed | {in_progress} running | {rejected} rejected")
-        print(f"{line:100}", end="", flush=True)
-
+        """Return True if still running. Display is handled by ProgressBar."""
+        finished, failed, in_progress, rejected, total = self.get_counts()
         return in_progress > 0
-
-    def show_count(self):
-        self.watch()
-        all_datasets = [v for sub in self.datasets.values() for v in sub.values()]
-        rejected_count = len([d for d in all_datasets if "REJECTED" in d])
-        processed = [d for d in all_datasets if "REJECTED" not in d]
-        total_count = len(processed)
-        failed_count = len([d for d in processed if d[0] == "FAILED"])
-        finished_count = len([d for d in processed if d[0] == "FINISHED"])
-        print(f"\rTotal: {total_count} | Rejected: {rejected_count} | Failed: {failed_count} | Finished: {finished_count}", end="", flush=True)
 
     def show_details(self):
         self.watch()
@@ -493,3 +472,379 @@ class Watcher(object):
             self.show_details()
             return True
         return self.show_progress()
+
+
+class ProcessingWatcher(WatcherBase):
+
+    def get_info(self):
+        if not os.path.isdir(self.procpath):
+            sys.exit(f"Error: processing directory '{self.procpath}' does not exist.")
+        pin_list_path = os.path.join(self.procpath, "pin_list.txt")
+        if not os.path.isfile(pin_list_path):
+            sys.exit(f"Error: 'pin_list.txt' not found in '{self.procpath}'.")
+        self.datasets = {}
+        with open(pin_list_path, 'r') as f:
+            for line in f:
+                parts = line.split(',')
+                collection = os.path.basename(parts[0].strip()).replace('_transfer', '')
+                self.datasets[f"{collection}_{parts[1].strip()}"] = None
+        folders = [name for name in os.listdir(self.procpath)
+                   if os.path.isdir(os.path.join(self.procpath, name))]
+        for pin in self.datasets:
+            pin_folder = next((f for f in folders if pin in f), None)
+            if pin_folder is None:
+                self.datasets[pin] = {'none': {"REJECTED", None}}
+            else:
+                pin_folder_path = os.path.join(self.procpath, pin_folder)
+                subfolders = [name for name in os.listdir(pin_folder_path)
+                              if os.path.isdir(os.path.join(pin_folder_path, name))]
+                self.datasets[pin] = {sf: (None, None) for sf in subfolders}
+
+    def _pipeline_logs(self, result_type_path):
+        """Find all pipeline.log files under result_type_path, searching
+        index_*/ dirs at the top level and *_force/ dirs one level deeper."""
+        logs = []
+        for entry in os.listdir(result_type_path):
+            index_path = os.path.join(result_type_path, entry)
+            if not os.path.isdir(index_path) or not entry.startswith('index_'):
+                continue
+            force_logs = []
+            for sub in os.listdir(index_path):
+                if sub.endswith('_force'):
+                    force_log = os.path.join(index_path, sub, 'pipeline.log')
+                    if os.path.isfile(force_log):
+                        force_logs.append(force_log)
+            if force_logs:
+                logs.extend(force_logs)
+            else:
+                flat_log = os.path.join(index_path, 'pipeline.log')
+                if os.path.isfile(flat_log):
+                    logs.append(flat_log)
+        return logs
+
+    def watch(self):
+        folders = [name for name in os.listdir(self.procpath)
+                   if os.path.isdir(os.path.join(self.procpath, name))]
+        for pin in self.datasets:
+            pin_folder = next((f for f in folders if pin in f), None)
+            if pin_folder is None:
+                continue
+            pin_folder_path = os.path.join(self.procpath, pin_folder)
+            for psf_name in self.datasets[pin]:
+                if "REJECTED" in self.datasets[pin][psf_name]:
+                    continue
+                psf = os.path.join(pin_folder_path, psf_name)
+                logs = self._pipeline_logs(psf)
+                if not logs:
+                    continue
+                statuses = [self._read_pipeline_log(l) for l in logs]
+                statuses = [(s, m) for s, m in statuses if s is not None]
+                if not statuses:
+                    continue
+                if any(s == "FAILED" for s, _ in statuses):
+                    failed_msg = next(m for s, m in statuses if s == "FAILED")
+                    self.datasets[pin][psf_name] = ("FAILED", failed_msg)
+                elif all(s == "FINISHED" for s, _ in statuses):
+                    self.datasets[pin][psf_name] = ("FINISHED", None)
+                else:
+                    last_s, last_m = statuses[-1]
+                    self.datasets[pin][psf_name] = (last_s, last_m)
+
+    def tail_logs(self, log_file=None):
+        """Print any new lines added to pipeline.log files since last call."""
+        new_lines = []
+        for pin in self.datasets:
+            pin_folder_path = next(
+                (os.path.join(self.procpath, f) for f in os.listdir(self.procpath)
+                 if pin in f and os.path.isdir(os.path.join(self.procpath, f))),
+                None
+            )
+            if pin_folder_path is None:
+                continue
+            for psf_name in self.datasets[pin]:
+                psf = os.path.join(pin_folder_path, psf_name)
+                if not os.path.isdir(psf):
+                    continue
+                for log_path in self._pipeline_logs(psf):
+                    try:
+                        with open(log_path) as fh:
+                            all_lines = fh.readlines()
+                    except OSError:
+                        continue
+                    offset = self._log_offsets.get(log_path, 0)
+                    for line in all_lines[offset:]:
+                        self._emit(line, log_file)
+                        new_lines.append(line)
+                    self._log_offsets[log_path] = len(all_lines)
+        return new_lines
+
+
+class QRefineWatcher(WatcherBase):
+
+    def get_info(self):
+        if not os.path.isdir(self.procpath):
+            sys.exit(f"Error: processing directory '{self.procpath}' does not exist.")
+        qrefine_list_path = os.path.join(self.procpath, 'qrefine_list.txt')
+        if not os.path.isfile(qrefine_list_path):
+            sys.exit(f"Error: 'qrefine_list.txt' not found in '{self.procpath}'.")
+        self.datasets = {}
+        with open(qrefine_list_path) as fh:
+            for line in fh:
+                parts = [p.strip() for p in line.strip().split(',')]
+                if len(parts) < 5:
+                    continue
+                pin, crystal_name, cell_refined, index, integration = (
+                    parts[0], parts[1], parts[2], parts[3], parts[4]
+                )
+                index_dir = index.replace(' ', '_')
+                if integration == 'integration not forced':
+                    forced = 'not_forced'
+                else:
+                    iparts = integration.split()
+                    forced = f"forced_{iparts[3]}_{iparts[4]}"
+                job_dir_name = f"{pin}_{crystal_name}_{cell_refined}_{index_dir}_{forced}"
+                if pin not in self.datasets:
+                    self.datasets[pin] = {}
+                self.datasets[pin][job_dir_name] = (None, None)
+
+    def _pipeline_logs(self, job_dir):
+        log = os.path.join(job_dir, 'pipeline.log')
+        return [log] if os.path.isfile(log) else []
+
+    def watch(self):
+        qrefine_dir = os.path.join(self.procpath, 'qrefine')
+        for pin in self.datasets:
+            for job_dir_name in self.datasets[pin]:
+                job_dir = os.path.join(qrefine_dir, job_dir_name)
+                logs = self._pipeline_logs(job_dir)
+                if not logs:
+                    continue
+                statuses = [self._read_pipeline_log(l) for l in logs]
+                statuses = [(s, m) for s, m in statuses if s is not None]
+                if not statuses:
+                    continue
+                if any(s == "FAILED" for s, _ in statuses):
+                    failed_msg = next(m for s, m in statuses if s == "FAILED")
+                    self.datasets[pin][job_dir_name] = ("FAILED", failed_msg)
+                elif all(s == "FINISHED" for s, _ in statuses):
+                    self.datasets[pin][job_dir_name] = ("FINISHED", None)
+                else:
+                    last_s, last_m = statuses[-1]
+                    self.datasets[pin][job_dir_name] = (last_s, last_m)
+
+    def tail_logs(self, log_file=None):
+        """Print any new lines added to job pipeline.log files since last call."""
+        new_lines = []
+        qrefine_dir = os.path.join(self.procpath, 'qrefine')
+        for pin in self.datasets:
+            for job_dir_name in self.datasets[pin]:
+                job_dir = os.path.join(qrefine_dir, job_dir_name)
+                for log_path in self._pipeline_logs(job_dir):
+                    try:
+                        with open(log_path) as fh:
+                            all_lines = fh.readlines()
+                    except OSError:
+                        continue
+                    offset = self._log_offsets.get(log_path, 0)
+                    for line in all_lines[offset:]:
+                        self._emit(line, log_file)
+                        new_lines.append(line)
+                    self._log_offsets[log_path] = len(all_lines)
+        return new_lines
+
+
+Watcher = ProcessingWatcher
+
+
+class ProgressBar:
+    """Displays an updating progress bar for a watcher.
+
+    Simple mode (default): two-line overwrite display — legend on top, bar below.
+    Multiline mode: one line per category (processed / failed / running / rejected),
+    each with a fill bar. Lines appear and disappear as counts change; cursor is
+    repositioned on each redraw using ANSI escape codes.
+    """
+
+    _SIMPLE_LEGEND = "# processed | ! failed | - running | X rejected"
+    _CATEGORIES = [
+        ("finished",  "finished",    "#"),
+        ("failed",    "failed",      "!"),
+        ("running",   "in_progress", "-"),
+        ("rejected",  "rejected",    "X"),
+    ]
+
+    def __init__(self, watcher, multiline=False):
+        self.watcher = watcher
+        self.multiline = multiline
+        self._drawn = False
+        self._prev_lines = 0  # lines printed on last draw (multiline mode)
+
+    def draw(self):
+        """Redraw progress in place. Returns True if any jobs still running."""
+        finished, failed, in_progress, rejected, total = self.watcher.get_counts()
+        if self.multiline:
+            return self._draw_multiline(finished, failed, in_progress, rejected, total)
+        return self._draw_simple(finished, failed, in_progress, rejected, total)
+
+    # ------------------------------------------------------------------
+    # Simple two-line mode
+    # ------------------------------------------------------------------
+
+    def _draw_simple(self, finished, failed, in_progress, rejected, total):
+        bar_width = min(total, 40) if total > 0 else 40
+        if total > 0:
+            n_failed   = round(failed      / total * bar_width)
+            n_not_proc = round(rejected    / total * bar_width)
+            n_active   = round(in_progress / total * bar_width)
+            if n_active == 0 and in_progress > 0:
+                n_active = 1
+            n_done = max(0, bar_width - n_failed - n_not_proc - n_active)
+        else:
+            n_done = n_failed = n_active = n_not_proc = 0
+
+        bar = "#" * n_done + "!" * n_failed + "-" * n_active + "X" * n_not_proc
+
+        if self._drawn:
+            print("\033[1A\r", end="")   # up 1 line, back to column 0
+
+        print(f"\033[2K{self._SIMPLE_LEGEND}")
+        print(f"\033[2K({finished + failed + rejected}/{total}) [{bar}]",
+              end="", flush=True)
+        self._drawn = True
+        return in_progress > 0
+
+    # ------------------------------------------------------------------
+    # Multiline per-category mode
+    # ------------------------------------------------------------------
+
+    def _draw_multiline(self, finished, failed, in_progress, rejected, total):
+        counts = {
+            "finished":    finished,
+            "failed":      failed,
+            "in_progress": in_progress,
+            "rejected":    rejected,
+        }
+        active = [(label, counts[key]) for label, key, _sym in self._CATEGORIES]
+
+        bar_width = 40
+        denom = total or 1
+        new_lines = len(active)
+
+        # Reposition cursor to start of our block.
+        # Cursor sits at end of last printed line (no trailing \n).
+        if self._drawn and self._prev_lines > 0:
+            if self._prev_lines > 1:
+                print(f"\033[{self._prev_lines - 1}A", end="")
+            print("\r", end="")
+
+        # Draw new content lines
+        for i, (label, count) in enumerate(active):
+            n = round(count / denom * bar_width)
+            bar = "█" * n
+            line = f"\033[2K{label:>10}: {count:>4}/{total:<4} [{bar:<{bar_width}}]"
+            if i < new_lines - 1:
+                print(line)
+            else:
+                print(line, end="", flush=True)
+
+        # Blank out any extra lines from the previous (longer) draw, then
+        # move cursor back up so it sits at the end of the last real line.
+        extra = self._prev_lines - new_lines
+        if extra > 0:
+            for _ in range(extra):
+                print()
+                print("\033[2K", end="")
+            print(f"\033[{extra}A", end="", flush=True)
+
+        self._drawn = True
+        self._prev_lines = new_lines
+        return in_progress > 0
+
+
+class QRefineWriter:
+    """
+    Scans a completed XDS pipeline output directory, then writes
+    qrefine_list.txt and qrefine_input_parameters.txt.
+
+    qrefine_list.txt             — one row per completed job (MTZ file found)
+    qrefine_input_parameters.txt — one ## crystal ## block per unique
+                                   crystal_name; mr_pdb is a placeholder.
+    """
+
+    _CELL_REFINED_SUFFIXES = ('_true', '_false', '_both')
+
+    _DEFAULT_PARAMS = [
+        ('mr_pdb',          '/path/to/reference.pdb'),
+        ('mr_cutoff',       '0.45'),
+        ('mr_water',        'both'),
+        ('mr_tncs',         'false'),
+        ('mr_copies',       '1'),
+        ('mr_mw',           '100000'),
+        ('mr_seq_id',       '1.0'),
+        ('mr_try_monomer',  'false'),
+    ]
+
+    def __init__(self, process_dir):
+        self.process_dir = pathlib.Path(process_dir).resolve()
+
+    def _find_completed(self):
+        entries = []
+        print (self.process_dir)
+
+        for mtz in sorted(self.process_dir.rglob('XDS_ASCII_ctruncate.mtz')):
+            rel = mtz.relative_to(self.process_dir).parts
+            if len(rel) == 5 and rel[3] == '11_rfree':
+                pin, crystal_dir, index_dir = rel[0], rel[1], rel[2]
+                integration = 'integration not forced'
+            elif len(rel) == 6 and rel[3].endswith('_force') and rel[4] == '11_rfree':
+                pin, crystal_dir, index_dir = rel[0], rel[1], rel[2]
+                force_base = rel[3][:-len('_force')]          # e.g. '1_P43212'
+                prefix, sg = force_base.split('_', 1)
+                integration = f'integration forced in {sg} {prefix}'
+            else:
+                continue
+
+            crystal_name = crystal_dir
+            cell_refined = ''
+            for suffix in self._CELL_REFINED_SUFFIXES:
+                if crystal_dir.endswith(suffix):
+                    crystal_name = crystal_dir[:-len(suffix)]
+                    cell_refined = suffix[1:]
+                    break
+
+            if not index_dir.startswith('index_'):
+                continue
+            index = index_dir[len('index_'):].replace('_', ' ')
+
+            entries.append((pin, crystal_name, cell_refined, index, integration))
+
+        return entries
+
+    def write_qrefine_list(self, path=None):
+        print(f"Scanning {self.process_dir} for completed jobs...")
+
+        entries = self._find_completed()
+
+        print(f"Found {len(entries)} completed jobs. Writing qrefine_list.txt...")
+
+        out = pathlib.Path(path) if path else self.process_dir / 'qrefine_list.txt'
+        with open(out, 'w') as fh:
+            for pin, crystal_name, cell_refined, index, integration in entries:
+                fh.write(f"{pin},{crystal_name},{cell_refined},{index},{integration}\n")
+        print(str(out))
+
+    def write_qrefine_input_parameters(self, path=None):
+        entries = self._find_completed()
+        seen = dict.fromkeys(e[1] for e in entries)   # unique crystal_names, insertion order
+        out = pathlib.Path(path) if path else self.process_dir / 'qrefine_input_parameters.txt'
+        with open(out, 'w') as fh:
+            for crystal_name in seen:
+                fh.write('## crystal ##\n')
+                fh.write(f'crystal_name={crystal_name}\n')
+                for key, val in self._DEFAULT_PARAMS:
+                    fh.write(f'{key}={val}\n')
+        print(str(out))
+
+    def write(self):
+        self.write_qrefine_list()
+        self.write_qrefine_input_parameters()

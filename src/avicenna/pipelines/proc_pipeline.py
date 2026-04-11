@@ -26,7 +26,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "src"))
-from avicenna.utils.utils import BRAVAIS_LATTICES
+from avicenna.utils.utils import BRAVAIS_LATTICES, QRefineWriter
 
 
 class RunBase:
@@ -759,25 +759,21 @@ class RunRfree(RunBase):
 
         if self.ref_mtz in (None, "none", ""):
             # Fresh R-free flags
-            freerflag_stdin = (
-                f"HKLIN {aimless_mtz}\n"
-                "HKLOUT XDS_ASCII_rfree.mtz\n"
-                "UNIQUE\n"
-                "END\n"
-            )
             with open(log_path, "w") as fh:
-                subprocess.run(["freerflag"], input=freerflag_stdin,
-                               text=True, stdout=fh, stderr=fh)
+                subprocess.run(
+                    ["freerflag",
+                     "HKLIN", aimless_mtz,
+                     "HKLOUT", "XDS_ASCII_rfree.mtz"],
+                    input="UNIQUE\nEND\n",
+                    text=True, stdout=fh, stderr=fh)
 
-            mtzutils_stdin = (
-                "HKLIN XDS_ASCII_rfree.mtz\n"
-                "HKLOUT XDS_ASCII.mtz\n"
-                "EXCLUDE N(+) N(-)\n"
-                "END\n"
-            )
             with open(log_path, "a") as fh:
-                subprocess.run(["mtzutils"], input=mtzutils_stdin,
-                               text=True, stdout=fh, stderr=fh)
+                subprocess.run(
+                    ["mtzutils",
+                     "HKLIN", "XDS_ASCII_rfree.mtz",
+                     "HKLOUT", "XDS_ASCII.mtz"],
+                    input="EXCLUDE N(+) N(-)\nEND\n",
+                    text=True, stdout=fh, stderr=fh)
 
         else:
             # Copy R-free flags from reference MTZ
@@ -793,9 +789,9 @@ class RunRfree(RunBase):
                                input=unique_stdin, text=True, stdout=fh, stderr=fh)
 
             cad_stdin = (
-                f"LABI FILE 1  ALLIN\n"
-                f"LABI FILE 2  ALLIN\n"
-                f"LABI FILE 3  E1=FreeR_flag\n"
+                "LABI FILE 1  ALLIN\n"
+                "LABI FILE 2  ALLIN\n"
+                "LABI FILE 3  E1=FreeR_flag\n"
                 "END\n"
             )
             with open(log_path, "a") as fh:
@@ -808,25 +804,21 @@ class RunRfree(RunBase):
                     input=cad_stdin, text=True, stdout=fh, stderr=fh,
                 )
 
-            freerflag_stdin = (
-                "HKLIN XDS_ASCII_uniq.mtz\n"
-                "HKLOUT XDS_ASCII_rfree.mtz\n"
-                "COMPLETE FREE=FreeR_flag\n"
-                "END\n"
-            )
             with open(log_path, "a") as fh:
-                subprocess.run(["freerflag"], input=freerflag_stdin,
-                               text=True, stdout=fh, stderr=fh)
+                subprocess.run(
+                    ["freerflag",
+                     "HKLIN", "XDS_ASCII_uniq.mtz",
+                     "HKLOUT", "XDS_ASCII_rfree.mtz"],
+                    input="COMPLETE FREE=FreeR_flag\nEND\n",
+                    text=True, stdout=fh, stderr=fh)
 
-            mtzutils_stdin = (
-                "HKLIN XDS_ASCII_rfree.mtz\n"
-                "HKLOUT XDS_ASCII.mtz\n"
-                "EXCLUDE FUNI SIGFUNI N(+) N(-)\n"
-                "END\n"
-            )
             with open(log_path, "a") as fh:
-                subprocess.run(["mtzutils"], input=mtzutils_stdin,
-                               text=True, stdout=fh, stderr=fh)
+                subprocess.run(
+                    ["mtzutils",
+                     "HKLIN", "XDS_ASCII_rfree.mtz",
+                     "HKLOUT", "XDS_ASCII.mtz"],
+                    input="EXCLUDE FUNI SIGFUNI N(+) N(-)\nEND\n",
+                    text=True, stdout=fh, stderr=fh)
 
         # Amplitude conversion via ctruncate (same for both branches)
         with open(log_path, "a") as fh:
@@ -1283,26 +1275,12 @@ RunProcess(params).{method}()
         params["image_dir"] = str(scratch_dir)
 
     def _log(self, pipeline_subdir, tag, message):
-        """Append a timestamped line to pipeline.log in pipeline_subdir,
-        and also to processing.log in process_dir (the omnibus log).
-        If pipeline_subdir is None, only the omnibus log is written."""
+        """Append a timestamped line to pipeline.log in pipeline_subdir."""
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         line = f"[{ts}] {tag:<10} {message}\n"
         if pipeline_subdir is not None:
             with open(Path(pipeline_subdir) / "pipeline.log", "a") as fh:
                 fh.write(line)
-        process_dir = self.params.get("process_dir")
-        if process_dir:
-            pin_id = self.params.get("pin_id", "?")
-            if tag == "ERROR":
-                display_tag = " ERROR ***"
-            elif tag == "DONE":
-                display_tag = " DONE  !!!"
-            else:
-                display_tag = f"{tag:<10}"
-            omnibus_line = f"[{ts}] {display_tag} [{pin_id}] {message}\n"
-            with open(Path(process_dir) / "processing.log", "a") as fh:
-                fh.write(omnibus_line)
 
     def _aimless_summary(self, log_path):
         """Extract SG, resolution, completeness, multiplicity, and Rpim
@@ -1540,6 +1518,7 @@ RunProcess(params).{method}()
                     )
                     summary = self._aimless_summary(last_aimless) if last_aimless else "completed"
                     self._log(pipeline_subdir, "DONE", summary)
+                    QRefineWriter(params["process_dir"]).write()
                 else:
                     self._log(pipeline_subdir, "ERROR", f"5_xds: {self._xds_error(pipeline_subdir, 5) or 'unknown error'}")
             else:
@@ -1674,3 +1653,4 @@ RunProcess(params).{method}()
         # Extract final SG and resolution
         last_aimless = pipeline_subdir / "10_aimless" / "10_aimless.log"
         self._log(pipeline_subdir, "DONE", self._aimless_summary(last_aimless))
+        QRefineWriter(params["process_dir"]).write()

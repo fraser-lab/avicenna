@@ -1,4 +1,5 @@
 [console_scripts]
 vic.process = avicenna.command_line.vic_process:main
+vic.refine = avicenna.command_line.vic_refine:main
 vic.scrape = avicenna.command_line.vic_scrape_logs:main
 vic.watch = avicenna.command_line.vic_watch:main

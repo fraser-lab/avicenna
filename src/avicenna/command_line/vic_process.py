@@ -23,10 +23,8 @@ parser.add_argument("-p", "--pinlist", type=str, help="Filename for pin list fil
 parser.add_argument("-x", "--xdsparams", type=str, help="Filename for XDS param file, usually xds_input_parameters.txt")
 parser.add_argument("--bash", action="store_true", help="Run the bash scripts instead of the Python-based processing pipeline")
 parser.add_argument("-o", "--output", type=pathlib.Path, default=pathlib.Path(os.curdir), help="Path to output folder (default: current directory)")
-_mode = parser.add_mutually_exclusive_group()
-_mode.add_argument("--watch", action="store_true", help="Watch processing progress after submission (progress bar)")
-_mode.add_argument("-l", "--print_log", action="store_true", help="Print omnibus processing.log to stdout as jobs run (no progress bar)")
 parser.add_argument("--dry_run", action="store_true", help="Create pin_list.txt and xds_input_parameters.txt without submitting jobs")
+parser.add_argument("--silent", action="store_true", help="Submit jobs without tailing the log")
 
 
 XDS_PARAM_DEFAULTS = {
@@ -138,44 +136,26 @@ def main():
         proc = RunProcess(params)
         proc.run()
 
-    if args.watch:
-        watcher = Watcher(procpath=os.path.abspath(args.output))
-        while watcher.show_progress():
-            time.sleep(1)
-        print()
-        watcher.print_summary()
-        scraper = Scraper(str(os.path.abspath(args.output)))
-        scraper.scrape_all()
-        scraper.print_info()
+    if args.silent or args.dry_run:
+        return
 
-    elif args.print_log:
-        omnibus = os.path.join(os.path.abspath(args.output), "processing.log")
-        watcher = Watcher(procpath=os.path.abspath(args.output))
-        log_offset = 0
-        while True:
-            if os.path.isfile(omnibus):
-                with open(omnibus) as fh:
-                    lines = fh.readlines()
-                for line in lines[log_offset:]:
-                    print(line, end="", flush=True)
-                log_offset = len(lines)
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                still_running = watcher.show_progress()
-            if not still_running:
-                break
-            time.sleep(1)
-        # flush any remaining log lines
-        if os.path.isfile(omnibus):
-            with open(omnibus) as fh:
-                lines = fh.readlines()
-            for line in lines[log_offset:]:
-                print(line, end="", flush=True)
-        print()
-        watcher.print_summary(omnibus=omnibus)
-        scraper = Scraper(str(os.path.abspath(args.output)))
-        scraper.scrape_all()
-        scraper.print_info()
+    procpath = os.path.abspath(args.output)
+    omnibus = os.path.join(procpath, "processing.log")
+    watcher = Watcher(procpath=procpath)
+    while True:
+        watcher.tail_logs(log_file=omnibus)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            still_running = watcher.show_progress()
+        if not still_running:
+            break
+        time.sleep(1)
+    watcher.tail_logs(log_file=omnibus)
+    print()
+    watcher.print_summary(omnibus=omnibus)
+    scraper = Scraper(str(os.path.abspath(args.output)))
+    scraper.scrape_all()
+    scraper.print_info()
 
 
 if __name__ == "__main__":

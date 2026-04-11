@@ -12,5 +12,9 @@ src/avicenna/command_line/vic_scrape_logs.py
 src/avicenna/command_line/vic_watch.py
 src/avicenna/pipelines/__init__.py
 src/avicenna/pipelines/proc_pipeline.py
+src/avicenna/pipelines/qrefine_pipeline.py
+src/avicenna/resources/__init__.py
+src/avicenna/resources/scripts/__init__.py
+src/avicenna/resources/scripts/generate_XDS.INP
 src/avicenna/utils/__init__.py
 src/avicenna/utils/utils.py
