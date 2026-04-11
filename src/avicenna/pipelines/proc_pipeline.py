@@ -26,7 +26,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "src"))
-from avicenna.utils.utils import BRAVAIS_LATTICES, QRefineWriter
+from avicenna.utils.utils import BRAVAIS_LATTICES, QRefineWriter, format_log_line
 
 
 class RunBase:
@@ -1276,8 +1276,8 @@ RunProcess(params).{method}()
 
     def _log(self, pipeline_subdir, tag, message):
         """Append a timestamped line to pipeline.log in pipeline_subdir."""
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        line = f"[{ts}] {tag:<10} {message}\n"
+        context = self.params.get("pin_id") if pipeline_subdir is not None else None
+        line = format_log_line(tag, message, context=context)
         if pipeline_subdir is not None:
             with open(Path(pipeline_subdir) / "pipeline.log", "a") as fh:
                 fh.write(line)

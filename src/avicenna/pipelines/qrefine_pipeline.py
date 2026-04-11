@@ -1,5 +1,4 @@
 import argparse
-from datetime import datetime
 import json
 import os
 import pathlib
@@ -7,6 +6,8 @@ import shutil
 import stat
 import subprocess
 import sys
+sys.path.insert(0, str(pathlib.Path(__file__).parents[2]))
+from avicenna.utils.utils import format_log_line
 
 parser = argparse.ArgumentParser(prog="vic.refine")
 parser.add_argument("-d", "--data", type=pathlib.Path,
@@ -172,8 +173,7 @@ class RunQRefineJob:
         return 1.0
 
     def _log(self, tag, message):
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        line = f"[{ts}] {tag:<10} [{self.job_id}] {message}\n"
+        line = format_log_line(tag, message, context=self.job_id)
         with open("pipeline.log", "a") as fh:
             fh.write(line)
         print(line, end="", flush=True)
@@ -373,6 +373,18 @@ class RunQRefineJob:
                 if res is not None:
                     parts.append(f"Res={res:.2f}A")
                 self._log("DONE", " ".join(parts) if parts else "completed")
+                water = self.params.get("mr_water", "false")
+                expected = []
+                if water in ("true", "both"):
+                    expected.append("hoh")
+                if water in ("false", "both"):
+                    expected.append("nohoh")
+                if all(
+                    pathlib.Path(f"final_{sx}.pdb").is_file() or
+                    pathlib.Path(f"final_monomer_{sx}.pdb").is_file()
+                    for sx in expected
+                ):
+                    self._log("COMPLETE", "all suffixes finished")
                 return
         self._log("ERROR", f"no final PDB produced for suffix={s}")
 

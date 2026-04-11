@@ -4,6 +4,27 @@ import sys
 from datetime import datetime
 # import matplotlib.pyplot as plt
 
+_LOG_DECORATIONS = {
+    "ERROR":    "***",
+    "COMPLETE": "!!!",
+}
+_TAG_WIDTH = 12
+
+
+def format_log_line(tag, message, context=None):
+    """Return a formatted pipeline log line.
+
+    The tag field is fixed-width (_TAG_WIDTH). Tags in _LOG_DECORATIONS get
+    a right-aligned decoration within that field. An optional context string
+    (e.g. a job_id) is inserted in brackets between the tag field and the
+    message.
+    """
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    decoration = _LOG_DECORATIONS.get(tag, "")
+    tag_field = f"{tag}{decoration:>{_TAG_WIDTH - len(tag)}}"
+    ctx = f"[{context}]  " if context else ""
+    return f"[{ts}] {tag_field}  {ctx}{message}\n"
+
 # Bravais lattice → list of (sg_number, sg_name) tuples.
 # Derived from xds_lattices.txt in the processing pipeline scripts directory.
 BRAVAIS_LATTICES = {
