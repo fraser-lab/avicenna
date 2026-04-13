@@ -59,103 +59,107 @@ def _read_xds_params(filepath):
 
 
 def main():
-    args = parser.parse_args()
-    if not args.pinlist and not args.data:
-        parser.error("either -d/--data or -p/--pinlist must be provided")
+    try:
+        args = parser.parse_args()
+        if not args.pinlist and not args.data:
+            parser.error("either -d/--data or -p/--pinlist must be provided")
 
-    if args.dry_run:
-        if args.pinlist or args.xdsparams:
-            parser.error("--dry_run is incompatible with --pinlist and --xdsparams")
-        if not args.data:
-            parser.error("--dry_run requires -d/--data")
-        for fname in ("pin_list.txt", "xds_input_parameters.txt"):
-            if os.path.isfile(fname):
-                os.rename(fname, fname + ".bak")
-                print(f"Backed up {fname} -> {fname}.bak")
-        _, _, data_path = DataFinder(paths=args.data).collect()
-        args.data = data_path
-        ParamWriter(args=args).build_parameters()
-        print("Dry run complete.")
-        sys.exit(0)
-
-    params = {}
-    data_path = None
-
-    # Phase 1: Resolve pin list
-    if args.pinlist and os.path.isfile(args.pinlist):
-        with open(args.pinlist) as fh:
-            lines = [line.strip() for line in fh if line.strip()]
-        # Detect deprecated format (relative paths)
-        if lines and not os.path.isabs(lines[0].split(",")[0]):
+        if args.dry_run:
+            if args.pinlist or args.xdsparams:
+                parser.error("--dry_run is incompatible with --pinlist and --xdsparams")
             if not args.data:
+                parser.error("--dry_run requires -d/--data")
+            for fname in ("pin_list.txt", "xds_input_parameters.txt"):
+                if os.path.isfile(fname):
+                    os.rename(fname, fname + ".bak")
+                    print(f"Backed up {fname} -> {fname}.bak")
+            _, _, data_path = DataFinder(paths=args.data).collect()
+            args.data = data_path
+            ParamWriter(args=args).build_parameters()
+            print("Dry run complete.")
+            sys.exit(0)
+
+        params = {}
+        data_path = None
+
+        # Phase 1: Resolve pin list
+        if args.pinlist and os.path.isfile(args.pinlist):
+            with open(args.pinlist) as fh:
+                lines = [line.strip() for line in fh if line.strip()]
+            # Detect deprecated format (relative paths)
+            if lines and not os.path.isabs(lines[0].split(",")[0]):
+                if not args.data:
+                    sys.exit(
+                        "ERROR: pin_list.txt uses deprecated relative paths. "
+                        "Provide -d/--data to reconstruct absolute paths."
+                    )
+                data_path = DataFinder(paths=args.data).paths[0]
+                image_dir = os.path.dirname(str(data_path))
+                lines = [
+                    f"{os.path.join(image_dir, l.split(',')[0])},{','.join(l.split(',')[1:])}"
+                    for l in lines
+                ]
+                with open(args.pinlist, "w") as fh:
+                    fh.write("\n".join(lines) + "\n")
+            parents = {os.path.dirname(l.split(",")[0]) for l in lines}
+            if len(parents) > 1:
                 sys.exit(
-                    "ERROR: pin_list.txt uses deprecated relative paths. "
-                    "Provide -d/--data to reconstruct absolute paths."
+                    "ERROR: pin_list.txt entries have different parent directories:\n" +
+                    "\n".join(f"  {p}" for p in sorted(parents))
                 )
-            data_path = DataFinder(paths=args.data).paths[0]
-            image_dir = os.path.dirname(str(data_path))
-            lines = [
-                f"{os.path.join(image_dir, l.split(',')[0])},{','.join(l.split(',')[1:])}"
-                for l in lines
-            ]
-            with open(args.pinlist, "w") as fh:
-                fh.write("\n".join(lines) + "\n")
-        parents = {os.path.dirname(l.split(",")[0]) for l in lines}
-        if len(parents) > 1:
-            sys.exit(
-                "ERROR: pin_list.txt entries have different parent directories:\n" +
-                "\n".join(f"  {p}" for p in sorted(parents))
-            )
-        params["image_dir"] = parents.pop()
-        params["pins"] = lines
-    else:
-        pin_list, image_dir, data_path = DataFinder(paths=args.data).collect()
-        params["pins"] = pin_list
-        params["image_dir"] = image_dir
-
-    # Phase 2: Resolve XDS params (file overrides args)
-    if args.xdsparams and os.path.isfile(args.xdsparams):
-        params.update(_read_xds_params(args.xdsparams))
-    else:
-        if data_path is None:
-            sys.exit(
-                "ERROR: -d/--data is required when using a --pinlist but not using --xdsparams"
-            )
-        args.data = data_path
-        ParamWriter(args=args).build_parameters()
-        params.update(_read_xds_params("xds_input_parameters.txt"))
-
-    if args.bash:        # run Galen's original bash scripts for XDS processing
-        if (os.path.isfile('./pin_list.txt') and os.path.isfile('./xds_input_parameters.txt')):
-            script_path = os.path.join(os.path.abspath(params["script_dir"]), 'xds_pipeline_prep.sh')
-            subprocess.run(script_path)
+            params["image_dir"] = parents.pop()
+            params["pins"] = lines
         else:
-            print("ERROR: pin_list.txt and/or xds_input_parameters.txt not found!")
-            exit()
-    else:
-        proc = RunProcess(params)
-        proc.run()
+            pin_list, image_dir, data_path = DataFinder(paths=args.data).collect()
+            params["pins"] = pin_list
+            params["image_dir"] = image_dir
 
-    if args.silent or args.dry_run:
-        return
+        # Phase 2: Resolve XDS params (file overrides args)
+        if args.xdsparams and os.path.isfile(args.xdsparams):
+            params.update(_read_xds_params(args.xdsparams))
+        else:
+            if data_path is None:
+                sys.exit(
+                    "ERROR: -d/--data is required when using a --pinlist but not using --xdsparams"
+                )
+            args.data = data_path
+            ParamWriter(args=args).build_parameters()
+            params.update(_read_xds_params("xds_input_parameters.txt"))
 
-    procpath = os.path.abspath(args.output)
-    omnibus = os.path.join(procpath, "processing.log")
-    watcher = Watcher(procpath=procpath)
-    while True:
+        if args.bash:        # run Galen's original bash scripts for XDS processing
+            if (os.path.isfile('./pin_list.txt') and os.path.isfile('./xds_input_parameters.txt')):
+                script_path = os.path.join(os.path.abspath(params["script_dir"]), 'xds_pipeline_prep.sh')
+                subprocess.run(script_path)
+            else:
+                print("ERROR: pin_list.txt and/or xds_input_parameters.txt not found!")
+                exit()
+        else:
+            proc = RunProcess(params)
+            proc.run()
+
+        if args.silent or args.dry_run:
+            return
+
+        procpath = os.path.abspath(args.output)
+        omnibus = os.path.join(procpath, "processing.log")
+        watcher = Watcher(procpath=procpath)
+        while True:
+            watcher.tail_logs(log_file=omnibus)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                still_running = watcher.show_progress()
+            if not still_running:
+                break
+            time.sleep(1)
         watcher.tail_logs(log_file=omnibus)
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            still_running = watcher.show_progress()
-        if not still_running:
-            break
-        time.sleep(1)
-    watcher.tail_logs(log_file=omnibus)
-    print()
-    watcher.print_summary(omnibus=omnibus)
-    scraper = Scraper(str(os.path.abspath(args.output)))
-    scraper.scrape_all()
-    scraper.print_info()
+        print()
+        watcher.print_summary(omnibus=omnibus)
+        scraper = Scraper(str(os.path.abspath(args.output)))
+        scraper.scrape_all()
+        scraper.print_info()
+    except KeyboardInterrupt:
+        print("\nInterrupted. Any submitted jobs are still running on the cluster.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

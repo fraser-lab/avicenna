@@ -19,12 +19,16 @@ parser.add_argument('-p', '--plot', action='store_true', help="Whether to plot u
 
 
 def main():
-    args = parser.parse_args()
-    scraper = Scraper(result_path=args.path)
-    scraper.scrape_all()
-    scraper.print_info()
-    if args.plot:
-        scraper.plot_unit_cells()
+    try:
+        args = parser.parse_args()
+        scraper = Scraper(result_path=args.path)
+        scraper.scrape_all()
+        scraper.print_info()
+        if args.plot:
+            scraper.plot_unit_cells()
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

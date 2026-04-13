@@ -156,9 +156,81 @@ class ScraperBase(object):
 
 
 class ProcessingScraper(ScraperBase):
+
+    _ERROR_PATTERNS = ('!!! ERROR', 'Error:', 'FATAL ERROR', 'Sorry:')
+
+    @staticmethod
+    def _tail(path, n=50):
+        """Read the last n lines of a file without loading the whole file."""
+        try:
+            with open(path, 'rb') as f:
+                f.seek(0, 2)
+                f.seek(max(0, f.tell() - n * 200))
+                return f.read().decode('utf-8', errors='replace').splitlines()[-n:]
+        except OSError:
+            return []
+
+    @staticmethod
+    def _find_error(lines):
+        """Scan lines in reverse for a known error pattern; return the first match or None."""
+        for line in reversed(lines):
+            for pat in ProcessingScraper._ERROR_PATTERNS:
+                if pat in line:
+                    return line.strip()
+        return None
+
+    def _diagnose(self, pipeline_subdir):
+        """
+        Verify the three success conditions for a pipeline subdir.
+        Returns (True, None) on success or (False, error_str) on failure.
+        Only called when a log was found, so conditions failing here indicate
+        a real problem (e.g. freerflag error masked by xtriage completing).
+        """
+        p = pathlib.Path(pipeline_subdir)
+
+        # Condition 1: XDS produced XDS_ASCII.HKL (8_xds for forced path, 5_xds for normal)
+        hkl_ok = any((p / d / 'XDS_ASCII.HKL').is_file() for d in ('8_xds', '5_xds'))
+        if not hkl_ok:
+            xds_dirs = sorted(
+                (d for d in p.iterdir() if d.is_dir() and d.name.endswith('_xds')),
+                key=lambda d: int(d.name.split('_')[0]), reverse=True,
+            )
+            if xds_dirs:
+                job_num = xds_dirs[0].name.split('_')[0]
+                log = xds_dirs[0] / f'{job_num}_xds.log'
+            else:
+                log = None
+            excerpt = self._find_error(self._tail(log)) if log and log.is_file() else None
+            label = xds_dirs[0].name if xds_dirs else 'xds'
+            return False, f"{label}: {excerpt or '(no error found in log)'}"
+
+        # Condition 2: rfree chain produced XDS_ASCII_ctruncate.mtz
+        if not (p / '11_rfree' / 'XDS_ASCII_ctruncate.mtz').is_file():
+            rfree_dir = p / '11_rfree'
+            logs = sorted(rfree_dir.glob('*_rfree.log')) if rfree_dir.is_dir() else []
+            excerpt = self._find_error(self._tail(logs[0])) if logs else None
+            return False, f"11_rfree: {excerpt or '(no error found in log)'}"
+
+        # Condition 3: xtriage directory was created
+        if not (p / '13_xtriage').is_dir():
+            step_dirs = sorted(
+                (d for d in p.iterdir() if d.is_dir() and d.name[0].isdigit()),
+                key=lambda d: int(d.name.split('_')[0]), reverse=True,
+            )
+            if step_dirs:
+                logs = list(step_dirs[0].glob('*.log'))
+                excerpt = self._find_error(self._tail(logs[0])) if logs else None
+                return False, f"{step_dirs[0].name}: {excerpt or '(no error found in log)'}"
+            return False, 'pipeline did not run'
+
+        return True, None
+
     def _find_aimless_log(self, index_path):
-        """Given an index_X_Y folder, return the path to the appropriate
-        10_aimless.log, or None if no completed job is found.
+        """Given an index_X_Y folder, return (aimless_log, pipeline_subdir).
+
+        aimless_log is None if no completed job is found.
+        pipeline_subdir is None only for an unresolved force-dir case where
+        no subdir succeeded and there is no single candidate to diagnose.
         """
         # Flat case: job completed directly under index_path
         if os.path.isdir(os.path.join(index_path, '13_xtriage')):
@@ -171,7 +243,8 @@ class ProcessingScraper(ScraperBase):
                             logs.append((int(d.split('_')[0]), log))
                         except ValueError:
                             pass
-            return max(logs, key=lambda x: x[0])[1] if logs else None
+            aimless_log = max(logs, key=lambda x: x[0])[1] if logs else None
+            return aimless_log, index_path
 
         # Force dir case: find *_force subdirs, sorted by integer prefix
         # (prefix encodes symmetry order: 1 = highest symmetry)
@@ -184,9 +257,10 @@ class ProcessingScraper(ScraperBase):
             force_path = os.path.join(index_path, force_dir)
             if os.path.isdir(os.path.join(force_path, '13_xtriage')):
                 log = os.path.join(force_path, '10_aimless', '10_aimless.log')
-                return log if os.path.isfile(log) else None
+                return (log if os.path.isfile(log) else None), force_path
 
-        return None
+        # No completed job found; flat case can still be diagnosed, force case cannot
+        return None, (None if force_dirs else index_path)
 
     def find_results(self):
         print(f"Looking in {self.result_path}...")
@@ -206,19 +280,27 @@ class ProcessingScraper(ScraperBase):
                     index_path = os.path.join(result_type_path, index_name)
                     if not os.path.isdir(index_path) or not index_name.startswith('index_'):
                         continue
+                    aimless_log, pipeline_subdir = self._find_aimless_log(index_path)
                     results.append({
-                        'pin_code'     : pin_code,
-                        'dataset_code' : dataset_code,
-                        'proc_path'    : dataset_path,
-                        'result_path'  : result_type_path,
-                        'aimless_log'  : self._find_aimless_log(index_path),
-                        'outcome'      : 'unprocessed',
+                        'pin_code'        : pin_code,
+                        'dataset_code'    : dataset_code,
+                        'proc_path'       : dataset_path,
+                        'result_path'     : result_type_path,
+                        'aimless_log'     : aimless_log,
+                        'pipeline_subdir' : pipeline_subdir,
+                        'outcome'         : 'unprocessed',
                     })
         return results
 
     def scrape_one_log(self, info_dict):
-        logfile = info_dict.get('aimless_log')
+        logfile          = info_dict.get('aimless_log')
+        pipeline_subdir  = info_dict.get('pipeline_subdir')
+
         if not logfile or not os.path.isfile(logfile):
+            if pipeline_subdir:
+                _, error = self._diagnose(pipeline_subdir)
+                if error:
+                    info_dict['error'] = error
             return None
 
         with open(logfile, 'r') as lf:
@@ -247,6 +329,13 @@ class ProcessingScraper(ScraperBase):
                     multi_params[key] = splits
         info_dict.update(single_params)
         info_dict.update(multi_params)
+
+        if pipeline_subdir:
+            ok, error = self._diagnose(pipeline_subdir)
+            if not ok:
+                info_dict['error'] = error
+                return None
+
         return info_dict
 
     def print_info(self):
@@ -265,7 +354,9 @@ class ProcessingScraper(ScraperBase):
                 except TypeError:
                     print (f"ERROR: {result['dataset_code']} Missing stats!")
             else:
-                print (f"{result['dataset_code']} ({os.path.basename(result['result_path'])}) FAILED")
+                error  = result.get('error', '')
+                suffix = f" — {error}" if error else ''
+                print(f"{result['dataset_code']} ({os.path.basename(result['result_path'])}) FAILED{suffix}")
 
 
 class QRefineScraper(ScraperBase):
@@ -761,8 +852,11 @@ class ProgressBar:
         # Draw new content lines
         for i, (label, count) in enumerate(active):
             n = round(count / denom * bar_width)
-            bar = "█" * n
-            line = f"\033[2K{label:>10}: {count:>4}/{total:<4} [{bar:<{bar_width}}]"
+            if count > 0 and n == 0:
+                bar = "▌"
+            else:
+                bar = "█" * n
+            line = f"\033[2K{label:>10}: {count:>4}/{total:<4} │{bar:<{bar_width}}"
             if i < new_lines - 1:
                 print(line)
             else:

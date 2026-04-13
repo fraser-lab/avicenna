@@ -48,40 +48,44 @@ _WATCHER_CLASSES = {
 
 
 def main():
-    args = parser.parse_args()
-    if args.pipeline not in _WATCHER_CLASSES:
-        known = ", ".join(sorted(_WATCHER_CLASSES))
-        parser.error(f"unknown pipeline '{args.pipeline}'; known pipelines: {known}")
-    watcher = _WATCHER_CLASSES[args.pipeline](procpath=args.procpath, pincode=args.pincode)
+    try:
+        args = parser.parse_args()
+        if args.pipeline not in _WATCHER_CLASSES:
+            known = ", ".join(sorted(_WATCHER_CLASSES))
+            parser.error(f"unknown pipeline '{args.pipeline}'; known pipelines: {known}")
+        watcher = _WATCHER_CLASSES[args.pipeline](procpath=args.procpath, pincode=args.pincode)
 
-    if args.log:
-        while True:
+        if args.log:
+            while True:
+                watcher.tail_log()
+                if not watcher.is_running():
+                    break
+                time.sleep(1)
             watcher.tail_log()
-            if not watcher.is_running():
-                break
-            time.sleep(1)
-        watcher.tail_log()
-        print()
-        _append_qrefine_paths(args.procpath)
+            print()
+            _append_qrefine_paths(args.procpath)
 
-    elif args.details:
-        while True:
-            watcher.show_details()
-            if not watcher.is_running():
-                print()
-                _append_qrefine_paths(args.procpath)
-                break
-            time.sleep(1)
+        elif args.details:
+            while True:
+                watcher.show_details()
+                if not watcher.is_running():
+                    print()
+                    _append_qrefine_paths(args.procpath)
+                    break
+                time.sleep(1)
 
-    else:
-        bar = ProgressBar(watcher, multiline=args.multiline)
-        while True:
-            still_running = bar.draw()
-            if not still_running:
-                print()
-                _append_qrefine_paths(args.procpath)
-                break
-            time.sleep(1)
+        else:
+            bar = ProgressBar(watcher, multiline=args.multiline)
+            while True:
+                still_running = bar.draw()
+                if not still_running:
+                    print()
+                    _append_qrefine_paths(args.procpath)
+                    break
+                time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nWatcher stopped. Jobs are still running on the cluster.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

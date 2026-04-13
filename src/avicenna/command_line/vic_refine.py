@@ -33,39 +33,43 @@ parser.add_argument("--silent", action="store_true",
 
 
 def main():
-    args = parser.parse_args()
+    try:
+        args = parser.parse_args()
 
-    if args.dry_run:
-        QRefineWriter(args.output).write()
-        return
+        if args.dry_run:
+            QRefineWriter(args.output).write()
+            return
 
-    RunQRefine(
-        process_dir=args.output,
-        dataset_list=args.list,
-        params_file=args.params,
-        dry_run=False,
-    ).run()
+        RunQRefine(
+            process_dir=args.output,
+            dataset_list=args.list,
+            params_file=args.params,
+            dry_run=False,
+        ).run()
 
-    if args.silent:
-        return
+        if args.silent:
+            return
 
-    procpath = os.path.abspath(args.output)
-    omnibus = os.path.join(procpath, "qrefine.log")
-    watcher = QRefineWatcher(procpath=procpath)
-    while True:
+        procpath = os.path.abspath(args.output)
+        omnibus = os.path.join(procpath, "qrefine.log")
+        watcher = QRefineWatcher(procpath=procpath)
+        while True:
+            watcher.tail_logs(log_file=omnibus)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                still_running = watcher.show_progress()
+            if not still_running:
+                break
+            time.sleep(1)
         watcher.tail_logs(log_file=omnibus)
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            still_running = watcher.show_progress()
-        if not still_running:
-            break
-        time.sleep(1)
-    watcher.tail_logs(log_file=omnibus)
-    print()
-    watcher.print_summary(omnibus=omnibus)
-    scraper = QRefineScraper(procpath)
-    scraper.scrape_all()
-    scraper.print_info()
+        print()
+        watcher.print_summary(omnibus=omnibus)
+        scraper = QRefineScraper(procpath)
+        scraper.scrape_all()
+        scraper.print_info()
+    except KeyboardInterrupt:
+        print("\nInterrupted. Any submitted jobs are still running on the cluster.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
