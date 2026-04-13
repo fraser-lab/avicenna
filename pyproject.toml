@@ -4,9 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "avicenna"
-version = "0.3.2"
+version = "0.3.3"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["h5py"]
 
 [project.scripts]
 "vic.process" = "avicenna.command_line.vic_process:main"

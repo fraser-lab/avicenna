@@ -778,11 +778,12 @@ class ProgressBar:
     """
 
     _SIMPLE_LEGEND = "# processed | ! failed | - running | X rejected"
-    _CATEGORIES = [
+    _MULTILINE_CATEGORIES = [
         ("finished",  "finished",    "#"),
         ("failed",    "failed",      "!"),
-        ("running",   "in_progress", "-"),
+        #("running",   "in_progress", "-"),
         ("rejected",  "rejected",    "X"),
+        ("total",     "no_longer_running", "*"),
     ]
 
     def __init__(self, watcher, multiline=False):
@@ -795,7 +796,7 @@ class ProgressBar:
         """Redraw progress in place. Returns True if any jobs still running."""
         finished, failed, in_progress, rejected, total = self.watcher.get_counts()
         if self.multiline:
-            return self._draw_multiline(finished, failed, in_progress, rejected, total)
+            return self._draw_multiline(in_progress, rejected, finished, failed, total)
         return self._draw_simple(finished, failed, in_progress, rejected, total)
 
     # ------------------------------------------------------------------
@@ -829,14 +830,16 @@ class ProgressBar:
     # Multiline per-category mode
     # ------------------------------------------------------------------
 
-    def _draw_multiline(self, finished, failed, in_progress, rejected, total):
+    def _draw_multiline(self, in_progress, rejected, finished, failed, total):
         counts = {
-            "finished":    finished,
-            "failed":      failed,
-            "in_progress": in_progress,
-            "rejected":    rejected,
+            "in_progress":          in_progress,
+            "rejected":             rejected,
+            "finished":             finished,
+            "failed":               failed,
+            "total":                total,
+            "no_longer_running":    finished + failed + rejected,
         }
-        active = [(label, counts[key]) for label, key, _sym in self._CATEGORIES]
+        active = [(label, counts[key]) for label, key, _sym in self._MULTILINE_CATEGORIES]
 
         bar_width = 40
         denom = total or 1

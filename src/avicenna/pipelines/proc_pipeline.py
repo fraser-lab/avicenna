@@ -29,6 +29,29 @@ sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "src"))
 from avicenna.utils.utils import BRAVAIS_LATTICES, QRefineWriter, format_log_line
 
 
+def _find_latest_xds_dir():
+    """Return the Path to the most recent dated XDS installation under SBGrid.
+
+    Versioned directories are named YYYYMMDD; lexicographic max is equivalent
+    to chronological max for that format.
+    """
+    xds_root = Path("/programs/x86_64-linux/xds")
+    candidates = [
+        d for d in xds_root.iterdir()
+        if d.is_dir() and d.name.isdigit() and len(d.name) == 8
+    ]
+    if not candidates:
+        raise FileNotFoundError(f"No dated XDS installations found under {xds_root}")
+    return max(candidates, key=lambda d: d.name)
+
+
+# TODO: HDF5 image counting is not yet implemented.
+# Eiger master files vary significantly in internal structure across firmware
+# versions and beamlines, and some future formats do not yet exist.  Until a
+# robust multi-format reader is available, the MIN_IMAGES check is skipped for
+# HDF5 datasets.  See RunProcess.run() for the skip logic.
+
+
 class RunBase:
     """
     Generic launcher for a single data processing or analysis job.
@@ -99,6 +122,8 @@ class RunXDS(RunBase):
         self.detector_edge     = float(params.get("detector_edge", 0.8))
         self.res_limit         = params.get("res_limit", "cc12")
         self.data_range        = params.get("data_range", "false").replace("-", " ")
+        self.data_format       = params.get("data_format", "cbf")
+        self._xds_dir          = self.xds_executable.parent.parent
 
     # ------------------------------------------------------------------
     # Shared helpers
@@ -141,6 +166,13 @@ class RunXDS(RunBase):
                 f"REFERENCE_DATA_SET={self.ref_hkl}",
             )
             xds_inp.write_text(text)
+
+    def _inject_lib(self, xds_inp):
+        """Prepend LIB= to XDS.INP so neggia can read HDF5 data. No-op for CBF."""
+        if self.data_format != 'hdf5':
+            return
+        neggia = self._xds_dir / "lib" / "dectris-neggia.so"
+        xds_inp.write_text(f"LIB={neggia}\n" + xds_inp.read_text())
 
     def _recycle_detector_params(self, xds_dir, xds_inp, is_job2=False):
         """
@@ -231,13 +263,21 @@ class RunXDS(RunBase):
         job_dir.mkdir(parents=True, exist_ok=True)
         os.chdir(job_dir)
 
-        # Generate XDS.INP from the bundled script
-        generate_inp = job_dir / "generate_XDS.INP"
-        template = importlib.resources.files("avicenna.resources.scripts").joinpath("generate_XDS.INP").read_text()
-        generate_inp.write_text(template.replace("sed_replace", self.image_range))
-        generate_inp.chmod(generate_inp.stat().st_mode | stat.S_IXUSR | stat.S_IRUSR | stat.S_IWUSR)
-        subprocess.run([str(generate_inp),
-                        str(self.image_dir / f"{self.image_prefix}_0????.cbf")])
+        # Generate XDS.INP from the appropriate script
+        if self.data_format == 'hdf5':
+            # SBGrid's generate_XDS.INP reads all geometry from the master file directly.
+            # SPOT_RANGE is overridden below to use the user-specified indexing subrange.
+            # If the HDF5 generate_XDS.INP calling convention changes, update here.
+            generate_inp = self._xds_dir / "bin" / "generate_XDS.INP"
+            master = self.image_dir / f"{self.image_prefix}_master.h5"
+            subprocess.run([str(generate_inp), str(master)])
+        else:
+            generate_inp = job_dir / "generate_XDS.INP"
+            template = importlib.resources.files("avicenna.resources.scripts").joinpath("generate_XDS.INP").read_text()
+            generate_inp.write_text(template.replace("sed_replace", self.image_range))
+            generate_inp.chmod(generate_inp.stat().st_mode | stat.S_IXUSR | stat.S_IRUSR | stat.S_IWUSR)
+            subprocess.run([str(generate_inp),
+                            str(self.image_dir / f"{self.image_prefix}_0????.cbf")])
 
         xds_inp = job_dir / "XDS.INP"
         text = xds_inp.read_text()
@@ -252,6 +292,13 @@ class RunXDS(RunBase):
 
         xds_inp.write_text(text)
 
+        if self.data_format == 'hdf5':
+            # SBGrid's script sets SPOT_RANGE to the full data range; override
+            # with the user-specified indexing subrange.
+            text = xds_inp.read_text()
+            text = re.sub(r"SPOT_RANGE=.*", f"SPOT_RANGE={self.image_range}", text)
+            xds_inp.write_text(text)
+
         # Seed with known symmetry for constrained indexing
         if self.known_sg_number != "none" and self.known_first_pass != "none":
             text = xds_inp.read_text()
@@ -263,6 +310,7 @@ class RunXDS(RunBase):
 
         self._apply_refine_cell_integrate(xds_inp)
         self._apply_ref_hkl(xds_inp)
+        self._inject_lib(xds_inp)
         self._run_xds()
         self._run_xdsstat()
 
@@ -300,14 +348,21 @@ class RunXDS(RunBase):
             "JOB= XYCORR INIT COLSPOT IDXREF DEFPIX INTEGRATE CORRECT",
             "JOB= DEFPIX INTEGRATE CORRECT",
         )
-        text = re.sub(r"NAME_TEMPLATE_OF_DATA_FRAMES=.*",
-                      f"NAME_TEMPLATE_OF_DATA_FRAMES={self.image_dir}/{self.image_prefix}_0????.cbf",
-                      text)
+        if self.data_format == 'hdf5':
+            master = self.image_dir / f"{self.image_prefix}_master.h5"
+            text = re.sub(r"NAME_TEMPLATE_OF_DATA_FRAMES=.*",
+                          f"NAME_TEMPLATE_OF_DATA_FRAMES={master}", text)
+        else:
+            text = re.sub(r"NAME_TEMPLATE_OF_DATA_FRAMES=.*",
+                          f"NAME_TEMPLATE_OF_DATA_FRAMES={self.image_dir}/{self.image_prefix}_0????.cbf",
+                          text)
         (job_dir / "XDS.INP").write_text(text)
+        self._inject_lib(job_dir / "XDS.INP")
 
         shutil.copy(str(xparm), "XPARM.XDS")
-        for cbf in xds_dir.glob("*.cbf"):
-            shutil.copy(str(cbf), ".")
+        if self.data_format == 'cbf':
+            for cbf in xds_dir.glob("*.cbf"):
+                shutil.copy(str(cbf), ".")
 
         self._run_xds()
         self._run_xdsstat()
@@ -332,8 +387,9 @@ class RunXDS(RunBase):
         os.chdir(job_dir)
 
         shutil.copy(str(xds_dir / "XDS.INP"), "XDS.INP")
-        for cbf in xds_dir.glob("*.cbf"):
-            shutil.copy(str(cbf), ".")
+        if self.data_format == 'cbf':
+            for cbf in xds_dir.glob("*.cbf"):
+                shutil.copy(str(cbf), ".")
         shutil.copy(str(xds_dir / "XPARM.XDS"), "XPARM.XDS")
 
         if self.recycle_xds == "true":
@@ -375,8 +431,9 @@ class RunXDS(RunBase):
         os.chdir(job_dir)
 
         shutil.copy(str(xds_dir / "XDS.INP"), "XDS.INP")
-        for cbf in xds_dir.glob("*.cbf"):
-            shutil.copy(str(cbf), ".")
+        if self.data_format == 'cbf':
+            for cbf in xds_dir.glob("*.cbf"):
+                shutil.copy(str(cbf), ".")
         shutil.copy(str(xds_dir / "XPARM.XDS"), "XPARM.XDS")
 
         xds_inp = job_dir / "XDS.INP"
@@ -947,10 +1004,11 @@ class RunProcess:
             job 13  RunXtriage
     """
 
-    #TODO: make these executable paths configurable via params; consider a settings file for the whole pipeline
-    XDS_EXECUTABLE     = Path("/programs/x86_64-linux/system/sbgrid_bin/xds_par")
+    _XDS_DIR           = _find_latest_xds_dir()
+    XDS_EXECUTABLE     = _XDS_DIR / "bin" / "xds_par"
     XDSSTAT_EXECUTABLE = Path("/programs/x86_64-linux/system/sbgrid_bin/xdsstat")
-    MIN_IMAGES = 180
+    NEGGIA_LIB         = _XDS_DIR / "lib" / "dectris-neggia.so"
+    MIN_IMAGES         = 180
 
     def __init__(self, params):
         self.params        = params
@@ -1257,7 +1315,11 @@ RunProcess(params).{method}()
         runs read from fast local storage.
 
         No-ops silently when $TMPDIR is not set (e.g. local/test runs).
+        No-ops for HDF5: data files are accessed by absolute paths embedded
+        in the master file and are typically too large to copy to scratch.
         """
+        if params.get('data_format') == 'hdf5':
+            return
         tmpdir = os.environ.get("TMPDIR")
         if not tmpdir:
             return
@@ -1358,10 +1420,20 @@ RunProcess(params).{method}()
             collection_id = Path(collection).name.replace("_transfer", "")
 
             image_dir = Path(collection) / pin_id
-            groups = {}
-            for f in image_dir.glob(f"{pin_id}_*.cbf"):
-                series_key = "_".join(f.stem.split("_")[:-1])
-                groups.setdefault(series_key, []).append(f)
+
+            # Detect data format and build per-series groups.
+            # HDF5: each master file is one series; image counting deferred (see TODO above).
+            # CBF: group files by series key (strip frame-number suffix).
+            hdf5_masters = sorted(image_dir.glob(f"{pin_id}_*_master.h5"))
+            if hdf5_masters:
+                data_format = 'hdf5'
+                groups = {m.stem[:-7]: [m] for m in hdf5_masters}  # strip "_master"
+            else:
+                data_format = 'cbf'
+                groups = {}
+                for f in image_dir.glob(f"{pin_id}_*.cbf"):
+                    series_key = "_".join(f.stem.split("_")[:-1])
+                    groups.setdefault(series_key, []).append(f)
 
             for series_key, files in sorted(groups.items()):
                 pin_dir_check = self.process_dir / f"{collection_id}_{series_key}"
@@ -1370,14 +1442,18 @@ RunProcess(params).{method}()
                     continue
 
                 if data_range == "false":
-                    image_count = len(files)
-                    first_image = 1
+                    if data_format == 'hdf5':
+                        image_count = None  # HDF5 image counting not yet implemented (see TODO)
+                        first_image = 1
+                    else:
+                        image_count = len(files)
+                        first_image = 1
                 else:
                     first_str, last_str = data_range.split("-")
                     first_image = int(first_str)
                     image_count = int(last_str)
 
-                if image_count < self.MIN_IMAGES:
+                if data_format == 'cbf' and image_count is not None and image_count < self.MIN_IMAGES:
                     print(f"Partial dataset ({image_count} images) — skipping {series_key}")
                     self.params["pin_id"] = f"{collection_id}_{series_key}"
                     self._log(None, "REJECT",
@@ -1425,6 +1501,7 @@ RunProcess(params).{method}()
                             "sg_number":             "none",
                             "cell":                  "none",
                             "data_range":            data_range,
+                            "data_format":           data_format,
                         }
                         self._write_worker_script(pipeline_subdir, per_params, method="run_single")
                         with open(qsub_list, "a") as fh:
