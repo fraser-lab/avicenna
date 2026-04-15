@@ -16,9 +16,32 @@ At the end of the installation, the install script will print out a line to add 
 
 	source $AVICENNA_INSTALL_FOLDER/vic_setup.sh
 	
+### Updating
+
+Since Avicenna is in constant development at the moment, it's likely that a new feature (or five) has been added every day and your cloned repository needs to be updated. To update, do this:
+	cd $AVICENNA_INSTALL_FOLDER
+	git pull --rebase
+
 
 
 ## Usage
+
+### Preparing the data for the pipeline
+
+Fragment screening datasets need to be consolidated in one place for AVICENNA to function properly. (This might change eventually, but either way it's good to keep your data tidy.) Also, the data have to be transferred from the beamline drive to either Wynton or the Fraser Lab cluster.
+
+**NOTE**: eventually, AVICENNA should be able to ingest already processed data (i.e. MTZs), which would reduce the amount of downloading needed. It's a work in progress now.
+
+The following scheme is strongly suggested:
+
+1. Create a folder that follows the naming scheme of `<synchrotron>_<date>_transfer`, e.g. `als_20260414_transfer`.
+2. Go to that folder: `cd <synchrotron>_<date>_transfer`
+3. You can use `scp` to transfer the data, e.g.: `scp -r <username>@<facility.address.gov>:/path/to/data/folders/ .`
+ 
+**NOTE**: Some (most) facilities have very odd data storage schemes, which frequently bury raw data under several layers of other stuff; eventually, AVICENNA will have a function to automatically create an input list and/or re-sort the data into a tidier, more sensible arrangement.
+
+**NOTE**: If you are putting together datasets collected on several days and even at different facilities, you can create a folder named after your project (e.g. `huwe1`) and create multiple transfer folders inside of it. Then give the project folder name to AVICENNA as input (see below) and it will resolve all the subfolders automatically.
+
 
 ### Processing X-ray diffraction data
 
