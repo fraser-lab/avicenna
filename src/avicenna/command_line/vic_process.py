@@ -8,7 +8,7 @@ import subprocess
 import time
 from importlib.metadata import version, PackageNotFoundError
 sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "src"))
-from avicenna.utils.utils import DataFinder, ParamWriter, Watcher, Scraper
+from avicenna.utils.utils import DataFinder, ParamWriter, Watcher, Scraper, ProcessingFilter
 from avicenna.pipelines.proc_pipeline import RunProcess
 
 try:
@@ -24,7 +24,8 @@ parser.add_argument("-x", "--xdsparams", type=str, help="Filename for XDS param 
 parser.add_argument("--bash", action="store_true", help="Run the bash scripts instead of the Python-based processing pipeline")
 parser.add_argument("-o", "--output", type=pathlib.Path, default=pathlib.Path(os.curdir), help="Path to output folder (default: current directory)")
 parser.add_argument("--dry_run", action="store_true", help="Create pin_list.txt and xds_input_parameters.txt without submitting jobs")
-parser.add_argument("--silent", action="store_true", help="Submit jobs without tailing the log")
+parser.add_argument("--silent",    action="store_true", help="Submit jobs without tailing the log")
+parser.add_argument("--no_filter", action="store_true", help="Skip quality filter when writing qrefine_list.txt; write all completed results")
 
 
 XDS_PARAM_DEFAULTS = {
@@ -157,6 +158,11 @@ def main():
         scraper = Scraper(str(os.path.abspath(args.output)))
         scraper.scrape_all()
         scraper.print_info()
+        if not args.no_filter:
+            scraper.results = ProcessingFilter().run(scraper.results)
+        scraper.write_qrefine_list(
+            path=os.path.join(os.path.abspath(args.output), 'qrefine_list.txt')
+        )
     except KeyboardInterrupt:
         print("\nInterrupted. Any submitted jobs are still running on the cluster.")
         sys.exit(1)

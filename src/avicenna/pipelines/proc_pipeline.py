@@ -1466,10 +1466,11 @@ RunProcess(params).{method}()
                 index_ranges = self._indexing_ranges(image_count, first_image)
 
                 for sym in sym_entries:
-                    crystal_number       = sym["crystal_number"]
+                    crystal_number        = sym["crystal_number"]
                     refine_cell_integrate = sym["refine_cell_integrate"]
+                    cell_suffix = "_refined" if refine_cell_integrate == "true" else ""
                     pipeline_dir = (pin_dir / "none" if crystal_number == "none"
-                                    else pin_dir / f"{crystal_number}_{sym['sg']}_{refine_cell_integrate}")
+                                    else pin_dir / f"{crystal_number}_{sym['sg']}{cell_suffix}")
                     pipeline_dir.mkdir(exist_ok=True)
 
                     for start, end in index_ranges:

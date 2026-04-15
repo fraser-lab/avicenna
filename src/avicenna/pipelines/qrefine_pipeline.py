@@ -82,11 +82,13 @@ class QRefineDataset:
         self.job_dir = None
 
     def resolve(self):
+        crystal_dir = (f"{self.crystal_name}_{self.cell_refined}"
+                       if self.cell_refined else self.crystal_name)
         if self.integration == 'integration not forced':
             self.forced = 'not_forced'
             self.mtz_path = (
                 self.process_dir / self.pin /
-                f"{self.crystal_name}_{self.cell_refined}" /
+                crystal_dir /
                 f"index_{self.index}" / "11_rfree" / "XDS_ASCII_ctruncate.mtz"
             )
         else:
@@ -96,13 +98,14 @@ class QRefineDataset:
             self.forced = f"forced_{forced_sg}_{forced_prefix}"
             self.mtz_path = (
                 self.process_dir / self.pin /
-                f"{self.crystal_name}_{self.cell_refined}" /
+                crystal_dir /
                 f"index_{self.index}" /
                 f"{forced_prefix}_{forced_sg}_force" / "11_rfree" / "XDS_ASCII_ctruncate.mtz"
             )
+        cell_refined_part = f"_{self.cell_refined}" if self.cell_refined else ""
         self.job_dir = (
             self.process_dir / "qrefine" /
-            f"{self.pin}_{self.crystal_name}_{self.cell_refined}_{self.index}_{self.forced}"
+            f"{self.pin}_{self.crystal_name}{cell_refined_part}_{self.index}_{self.forced}"
         )
 
 

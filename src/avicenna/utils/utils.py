@@ -4,6 +4,11 @@ import sys
 from datetime import datetime
 # import matplotlib.pyplot as plt
 
+# Suffixes appended to crystal directory names to indicate cell-refinement mode.
+# New data uses '_refined'; older data on disk may carry '_true', '_false', or '_both'.
+# Listed longest-first so the stripping loop matches the most-specific suffix.
+_CELL_REFINED_SUFFIXES = ('_refined', '_true', '_false', '_both')
+
 _LOG_DECORATIONS = {
     "ERROR":    "***",
     "COMPLETE": "!!!",
@@ -154,6 +159,26 @@ class ScraperBase(object):
     def print_info(self):
         raise NotImplementedError
 
+    @staticmethod
+    def _print_table(rows, headers):
+        """Print rows as an aligned fixed-width table. The last column is never padded."""
+        if not rows:
+            return
+        n = len(headers)
+        widths = [
+            max(len(str(headers[i])), max(len(str(r[i])) for r in rows))
+            for i in range(n - 1)
+        ]
+        def fmt_row(row):
+            parts = [f'{str(row[i]):<{widths[i]}}' for i in range(n - 1)]
+            parts.append(str(row[n - 1]))
+            return '  '.join(parts).rstrip()
+        header = fmt_row(headers)
+        print(header)
+        print('-' * len(header))
+        for row in rows:
+            print(fmt_row(row))
+
 
 class ProcessingScraper(ScraperBase):
 
@@ -270,6 +295,8 @@ class ProcessingScraper(ScraperBase):
             if not os.path.isdir(dataset_path):
                 continue
             parts = dataset_name.split('_')
+            if len(parts) < 3:
+                continue
             pin_code     = parts[-3]
             dataset_code = '_'.join(parts[-3:-1])
             for result_type in os.listdir(dataset_path):
@@ -322,7 +349,7 @@ class ProcessingScraper(ScraperBase):
         for c in contents[-100:]:
             for key, value in single_params.items():
                 if key in c:
-                    single_params[key] = c.replace(key, '').replace(" ", "").strip()
+                    single_params[key] = c.replace(key, '').replace(" ", "").strip().lstrip(':')
             for key, value in multi_params.items():
                 if key in c:
                     splits = [sp for sp in c.strip().split(' ') if sp != '' and (sp.strip().isdigit() or sp.replace('.','',1).isdigit())]
@@ -339,24 +366,71 @@ class ProcessingScraper(ScraperBase):
         return info_dict
 
     def print_info(self):
+        HEADERS = ('Dataset', 'Type', 'SG', 'Cell', 'Res', 'Comp', 'Mult', 'CC1/2', 'Rpim', 'Note')
+        rows = []
         for result in self.results:
+            code  = result['dataset_code']
+            rtype = os.path.basename(result['result_path'])
             if result['outcome'] == 'completed':
                 try:
-                    comp = f"{result['Completeness'][0]:>5} ({result['Completeness'][-1]})"
-                    mult = f"{result['Multiplicity'][0]:>5} ({result['Multiplicity'][-1]})"
-                    rpim = f"{result['Rpim (within I+/I-)' ][0]:>5} ({result['Rpim (within I+/I-)' ][-1]})"
-                    cell = f"{' '.join(result['Average unit cell'])}"
-                    print (
-                        f"{result['dataset_code']:10} ({os.path.basename(result['result_path'])}) SG: {result['Space group']:<10} CELL: {cell:22} RES: {result['High resolution limit'][-1]:8} COMP: {comp:<14} MULT: {mult:<14} RPIM: {rpim:<14}"
-                    )
-                except KeyError as e:
-                    print (f"ERROR: {result['dataset_code']} Missing item: {str(e)}")
-                except TypeError:
-                    print (f"ERROR: {result['dataset_code']} Missing stats!")
+                    comp  = f"{result['Completeness'][0]} ({result['Completeness'][-1]})"
+                    mult  = f"{result['Multiplicity'][0]} ({result['Multiplicity'][-1]})"
+                    cc12  = f"{result['Mn(I) half-set correlation CC(1/2)'][0]} ({result['Mn(I) half-set correlation CC(1/2)'][-1]})"
+                    rpim  = f"{result['Rpim (within I+/I-)'][0]} ({result['Rpim (within I+/I-)'][-1]})"
+                    cell  = ' '.join(result['Average unit cell'])
+                    res   = result['High resolution limit'][-1]
+                    sg    = result['Space group']
+                    rows.append((code, rtype, sg, cell, res, comp, mult, cc12, rpim, ''))
+                except (KeyError, TypeError):
+                    rows.append((code, rtype, '?', '?', '?', '?', '?', '?', '?', 'missing stats'))
             else:
-                error  = result.get('error', '')
-                suffix = f" — {error}" if error else ''
-                print(f"{result['dataset_code']} ({os.path.basename(result['result_path'])}) FAILED{suffix}")
+                error = result.get('error', '')
+                rows.append((code, rtype, 'FAILED', '', '', '', '', '', '', error))
+        self._print_table(rows, HEADERS)
+
+    def write_qrefine_list(self, path=None):
+        """Write a qrefine_list.txt from the current results list.
+
+        Each completed result is converted back to the
+        pin,crystal_name,cell_refined,index,integration format consumed by
+        QRefineWriter and qrefine_pipeline.py.  Skips failed/unprocessed results.
+        """
+        out = pathlib.Path(path) if path else pathlib.Path(os.curdir) / 'qrefine_list.txt'
+        lines = []
+        for r in self.results:
+            if r.get('outcome') != 'completed' or not r.get('pipeline_subdir'):
+                continue
+            pin         = os.path.basename(r['proc_path'])
+            crystal_dir  = os.path.basename(r['result_path'])
+            crystal_name = crystal_dir
+            cell_refined = ''
+            for suffix in _CELL_REFINED_SUFFIXES:
+                if crystal_dir.endswith(suffix):
+                    crystal_name = crystal_dir[:-len(suffix)]
+                    cell_refined = suffix[1:]
+                    break
+            try:
+                rel_parts = (pathlib.Path(r['pipeline_subdir'])
+                             .relative_to(r['result_path']).parts)
+            except ValueError:
+                continue
+            if len(rel_parts) == 1:
+                index_dir   = rel_parts[0]
+                integration = 'integration not forced'
+            elif len(rel_parts) == 2:
+                index_dir  = rel_parts[0]
+                force_base = rel_parts[1][:-len('_force')]
+                prefix, sg = force_base.split('_', 1)
+                integration = f'integration forced in {sg} {prefix}'
+            else:
+                continue
+            if not index_dir.startswith('index_'):
+                continue
+            index = index_dir[len('index_'):].replace('_', ' ')
+            lines.append(f"{pin},{crystal_name},{cell_refined},{index},{integration}\n")
+        with open(out, 'w') as fh:
+            fh.writelines(lines)
+        print(f"Wrote {len(lines)} entries to {out}")
 
 
 class QRefineScraper(ScraperBase):
@@ -431,20 +505,112 @@ class QRefineScraper(ScraperBase):
         return info_dict
 
     def print_info(self):
+        HEADERS = ('Job', 'Rwork', 'Rfree', 'Res', 'Phaser', 'Model', 'Note')
+        rows = []
         for result in self.results:
+            name = result['job_dir_name']
             if result['outcome'] == 'completed':
-                rwork  = f"{result['rwork']:.4f}"  if result['rwork']      is not None else 'n/a'
-                rfree  = f"{result['rfree']:.4f}"  if result['rfree']      is not None else 'n/a'
+                rwork  = f"{result['rwork']:.4f}"       if result['rwork']      is not None else 'n/a'
+                rfree  = f"{result['rfree']:.4f}"       if result['rfree']      is not None else 'n/a'
                 res    = f"{result['resolution']:.2f}A" if result['resolution'] is not None else 'n/a'
                 phaser = 'phaser' if result.get('phaser') else 'no_phaser'
                 suffix = result.get('suffix', 'n/a')
-                print(f"{result['job_dir_name']}  Rwork: {rwork}  Rfree: {rfree}  Res: {res}  {phaser}  {suffix}")
+                rows.append((name, rwork, rfree, res, phaser, suffix, ''))
             else:
-                print(f"{result['job_dir_name']}  FAILED")
+                rows.append((name, '', '', '', '', '', 'FAILED'))
+        self._print_table(rows, HEADERS)
 
 
 Scraper = ProcessingScraper
 
+
+class FilterBase:
+    """Base class for pipeline result filters.
+
+    Subclasses must implement filter_quality() and select_best().
+    run() orchestrates the full two-step filter: quality rejection,
+    then per-folder deduplication (one result per top-level proc_path).
+    """
+
+    def filter_quality(self, results):
+        """Return the subset of results that meet quality thresholds."""
+        raise NotImplementedError
+
+    def select_best(self, group):
+        """Given a list of results from the same proc_path, return the single best one."""
+        raise NotImplementedError
+
+    def run(self, results):
+        """Apply quality filter, group by proc_path, and select the best per group."""
+        passed = self.filter_quality(results)
+        groups = {}
+        for r in passed:
+            groups.setdefault(r['proc_path'], []).append(r)
+        return [self.select_best(group) for group in groups.values()]
+
+
+class ProcessingFilter(FilterBase):
+    """Filter and deduplicate ProcessingScraper results.
+
+    Quality thresholds (Step 1):
+      - overall completeness >= 80 %
+      - overall multiplicity >= 3
+      - overall CC½ >= 0.70
+      - outer-shell CC½ >= 0.30
+      - overall Rpim <= 0.20
+
+    Deduplication (Step 3): within each proc_path group, prefer lowest
+    overall Rpim; break ties by highest overall CC½; break further ties by
+    highest resolution (smallest outer-shell limit); fall back to list order.
+    """
+
+    COMPLETENESS_MIN = 80.0
+    MULTIPLICITY_MIN = 3.0
+    CC12_OVERALL_MIN = 0.70
+    CC12_OUTER_MIN   = 0.30
+    RPIM_MAX         = 0.20
+
+    def filter_quality(self, results):
+        passed = []
+        for r in results:
+            if r.get('outcome') != 'completed':
+                continue
+            try:
+                comp  = float(r['Completeness'][0])
+                mult  = float(r['Multiplicity'][0])
+                cc12  = float(r['Mn(I) half-set correlation CC(1/2)'][0])
+                cc12o = float(r['Mn(I) half-set correlation CC(1/2)'][-1])
+                rpim  = float(r['Rpim (within I+/I-)'][0])
+            except (KeyError, TypeError, ValueError, IndexError):
+                continue
+            if (comp  >= self.COMPLETENESS_MIN and
+                mult  >= self.MULTIPLICITY_MIN  and
+                cc12  >= self.CC12_OVERALL_MIN  and
+                cc12o >= self.CC12_OUTER_MIN    and
+                rpim  <= self.RPIM_MAX):
+                passed.append(r)
+        return passed
+
+    def select_best(self, group):
+        def sort_key(r):
+            try:
+                rpim = float(r['Rpim (within I+/I-)'][0])
+                cc12 = float(r['Mn(I) half-set correlation CC(1/2)'][0])
+                res  = float(r['High resolution limit'][-1])
+            except (KeyError, TypeError, ValueError, IndexError):
+                return (float('inf'), float('-inf'), float('inf'))
+            return (rpim, -cc12, res)
+        return min(group, key=sort_key)
+
+
+class RefinementFilter(FilterBase):
+    """Filter and deduplicate refinement results. (Not yet implemented.)"""
+
+    def filter_quality(self, results):
+        raise NotImplementedError
+
+    def select_best(self, group):
+        raise NotImplementedError
 
 
 class WatcherBase(object):
@@ -889,8 +1055,6 @@ class QRefineWriter:
                                    crystal_name; mr_pdb is a placeholder.
     """
 
-    _CELL_REFINED_SUFFIXES = ('_true', '_false', '_both')
-
     _DEFAULT_PARAMS = [
         ('mr_pdb',          '/path/to/reference.pdb'),
         ('mr_cutoff',       '0.45'),
@@ -924,7 +1088,7 @@ class QRefineWriter:
 
             crystal_name = crystal_dir
             cell_refined = ''
-            for suffix in self._CELL_REFINED_SUFFIXES:
+            for suffix in _CELL_REFINED_SUFFIXES:
                 if crystal_dir.endswith(suffix):
                     crystal_name = crystal_dir[:-len(suffix)]
                     cell_refined = suffix[1:]
