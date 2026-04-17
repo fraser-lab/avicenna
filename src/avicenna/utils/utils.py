@@ -16,18 +16,23 @@ _LOG_DECORATIONS = {
 _TAG_WIDTH = 12
 
 
-def format_log_line(tag, message, context=None):
+def format_log_line(tag, message, context=None, context_width=None):
     """Return a formatted pipeline log line.
 
     The tag field is fixed-width (_TAG_WIDTH). Tags in _LOG_DECORATIONS get
     a right-aligned decoration within that field. An optional context string
     (e.g. a job_id) is inserted in brackets between the tag field and the
-    message.
+    message. If context_width is given, the context is left-padded to that
+    width so the message column stays aligned across all log lines.
     """
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     decoration = _LOG_DECORATIONS.get(tag, "")
     tag_field = f"{tag}{decoration:>{_TAG_WIDTH - len(tag)}}"
-    ctx = f"[{context}]  " if context else ""
+    if context is not None:
+        ctx_str = f"{context:<{context_width}}" if context_width else context
+        ctx = f"[ {ctx_str} ]  "
+    else:
+        ctx = ""
     return f"[{ts}] {tag_field}  {ctx}{message}\n"
 
 # Bravais lattice → list of (sg_number, sg_name) tuples.
@@ -160,24 +165,43 @@ class ScraperBase(object):
         raise NotImplementedError
 
     @staticmethod
-    def _print_table(rows, headers):
-        """Print rows as an aligned fixed-width table. The last column is never padded."""
-        if not rows:
+    def _print_table_mixed(tagged_rows, headers):
+        """Print rows as an aligned fixed-width table with two row formats.
+
+        tagged_rows is a list of (is_error, row) pairs:
+          - ok rows (is_error=False): full n-tuple matching headers
+          - error rows (is_error=True): (*id_cols, msg) where id_cols are the
+            leading columns to pad and msg is the error string (may be empty)
+
+        Column widths are computed from headers and ok rows only, so error rows
+        do not inflate the column widths. Error rows print their id columns
+        padded to the same widths as ok rows, then 'FAILED' and the message
+        directly — skipping the empty middle columns entirely.
+        """
+        if not tagged_rows:
             return
         n = len(headers)
+        ok_rows = [row for is_err, row in tagged_rows if not is_err]
         widths = [
-            max(len(str(headers[i])), max(len(str(r[i])) for r in rows))
+            max(len(str(headers[i])), max((len(str(r[i])) for r in ok_rows), default=0))
             for i in range(n - 1)
         ]
-        def fmt_row(row):
+        def fmt_ok(row):
             parts = [f'{str(row[i]):<{widths[i]}}' for i in range(n - 1)]
             parts.append(str(row[n - 1]))
             return '  '.join(parts).rstrip()
-        header = fmt_row(headers)
+        def fmt_err(row):
+            n_ids = len(row) - 1
+            parts = [f'{str(row[i]):<{widths[i]}}' for i in range(n_ids)]
+            parts.append('FAILED')
+            if row[-1]:
+                parts.append(str(row[-1]))
+            return '  '.join(parts).rstrip()
+        header = fmt_ok(headers)
         print(header)
         print('-' * len(header))
-        for row in rows:
-            print(fmt_row(row))
+        for is_err, row in tagged_rows:
+            print(fmt_err(row) if is_err else fmt_ok(row))
 
 
 class ProcessingScraper(ScraperBase):
@@ -367,7 +391,7 @@ class ProcessingScraper(ScraperBase):
 
     def print_info(self):
         HEADERS = ('Dataset', 'Type', 'SG', 'Cell', 'Res', 'Comp', 'Mult', 'CC1/2', 'Rpim', 'Note')
-        rows = []
+        tagged_rows = []
         for result in self.results:
             code  = result['dataset_code']
             rtype = os.path.basename(result['result_path'])
@@ -380,13 +404,13 @@ class ProcessingScraper(ScraperBase):
                     cell  = ' '.join(result['Average unit cell'])
                     res   = result['High resolution limit'][-1]
                     sg    = result['Space group']
-                    rows.append((code, rtype, sg, cell, res, comp, mult, cc12, rpim, ''))
+                    tagged_rows.append((False, (code, rtype, sg, cell, res, comp, mult, cc12, rpim, '')))
                 except (KeyError, TypeError):
-                    rows.append((code, rtype, '?', '?', '?', '?', '?', '?', '?', 'missing stats'))
+                    tagged_rows.append((False, (code, rtype, '?', '?', '?', '?', '?', '?', '?', 'missing stats')))
             else:
                 error = result.get('error', '')
-                rows.append((code, rtype, 'FAILED', '', '', '', '', '', '', error))
-        self._print_table(rows, HEADERS)
+                tagged_rows.append((True, (code, rtype, error)))
+        self._print_table_mixed(tagged_rows, HEADERS)
 
     def write_qrefine_list(self, path=None):
         """Write a qrefine_list.txt from the current results list.
@@ -506,7 +530,7 @@ class QRefineScraper(ScraperBase):
 
     def print_info(self):
         HEADERS = ('Job', 'Rwork', 'Rfree', 'Res', 'Phaser', 'Model', 'Note')
-        rows = []
+        tagged_rows = []
         for result in self.results:
             name = result['job_dir_name']
             if result['outcome'] == 'completed':
@@ -515,13 +539,10 @@ class QRefineScraper(ScraperBase):
                 res    = f"{result['resolution']:.2f}A" if result['resolution'] is not None else 'n/a'
                 phaser = 'phaser' if result.get('phaser') else 'no_phaser'
                 suffix = result.get('suffix', 'n/a')
-                rows.append((name, rwork, rfree, res, phaser, suffix, ''))
+                tagged_rows.append((False, (name, rwork, rfree, res, phaser, suffix, '')))
             else:
-                rows.append((name, '', '', '', '', '', 'FAILED'))
-        self._print_table(rows, HEADERS)
-
-
-Scraper = ProcessingScraper
+                tagged_rows.append((True, (name, '')))
+        self._print_table_mixed(tagged_rows, HEADERS)
 
 
 class FilterBase:
@@ -615,6 +636,8 @@ class RefinementFilter(FilterBase):
 
 class WatcherBase(object):
 
+    _OMNIBUS_LOG = "processing.log"
+
     TAG_STATUS = {
         "START"  : "RUNNING",
         "PREP"   : "PREPARING",
@@ -633,6 +656,15 @@ class WatcherBase(object):
 
     def get_info(self):
         raise NotImplementedError
+
+    @property
+    def context_width(self):
+        """Max width of the context string written to log lines by this pipeline.
+
+        Subclasses should override when the log context contains more than just
+        the dataset key (e.g. QRefineWatcher adds the fixed job_id suffix).
+        """
+        return max((len(k) for k in self.datasets), default=0)
 
     def _pipeline_logs(self, *_):
         raise NotImplementedError
@@ -692,8 +724,8 @@ class WatcherBase(object):
         return in_progress > 0
 
     def tail_log(self):
-        """Print any new lines added to processing.log since the last call."""
-        omnibus = os.path.join(self.procpath, "processing.log")
+        """Print any new lines added to the omnibus log since the last call."""
+        omnibus = os.path.join(self.procpath, self._OMNIBUS_LOG)
         new_lines = []
         if not os.path.isfile(omnibus):
             return new_lines
@@ -858,6 +890,13 @@ class ProcessingWatcher(WatcherBase):
 
 
 class QRefineWatcher(WatcherBase):
+
+    _OMNIBUS_LOG = "qrefine.log"
+    _JOB_ID_FIXED = 18  # len(" | {forced_tag:<7} | {suffix:<5}")
+
+    @property
+    def context_width(self):
+        return max((len(pin) for pin in self.datasets), default=0) + self._JOB_ID_FIXED
 
     def get_info(self):
         if not os.path.isdir(self.procpath):

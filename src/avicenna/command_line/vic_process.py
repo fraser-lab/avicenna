@@ -8,7 +8,7 @@ import subprocess
 import time
 from importlib.metadata import version, PackageNotFoundError
 sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "src"))
-from avicenna.utils.utils import DataFinder, ParamWriter, Watcher, Scraper, ProcessingFilter
+from avicenna.utils.utils import DataFinder, ParamWriter, Watcher, ProcessingScraper, ProcessingFilter
 from avicenna.pipelines.proc_pipeline import RunProcess
 
 try:
@@ -155,7 +155,7 @@ def main():
         watcher.tail_logs(log_file=omnibus)
         print()
         watcher.print_summary(omnibus=omnibus)
-        scraper = Scraper(str(os.path.abspath(args.output)))
+        scraper = ProcessingScraper(str(os.path.abspath(args.output)))
         scraper.scrape_all()
         scraper.print_info()
         if not args.no_filter:

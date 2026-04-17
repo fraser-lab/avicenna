@@ -7,7 +7,7 @@ import stat
 import subprocess
 import sys
 sys.path.insert(0, str(pathlib.Path(__file__).parents[2]))
-from avicenna.utils.utils import format_log_line
+from avicenna.utils.utils import format_log_line, QRefineWatcher
 
 parser = argparse.ArgumentParser(prog="vic.refine")
 parser.add_argument("-d", "--data", type=pathlib.Path,
@@ -84,12 +84,13 @@ class QRefineDataset:
     def resolve(self):
         crystal_dir = (f"{self.crystal_name}_{self.cell_refined}"
                        if self.cell_refined else self.crystal_name)
+        index_dir = self.index.replace(' ', '_')
         if self.integration == 'integration not forced':
             self.forced = 'not_forced'
             self.mtz_path = (
                 self.process_dir / self.pin /
                 crystal_dir /
-                f"index_{self.index}" / "11_rfree" / "XDS_ASCII_ctruncate.mtz"
+                f"index_{index_dir}" / "11_rfree" / "XDS_ASCII_ctruncate.mtz"
             )
         else:
             parts = self.integration.split()
@@ -99,13 +100,13 @@ class QRefineDataset:
             self.mtz_path = (
                 self.process_dir / self.pin /
                 crystal_dir /
-                f"index_{self.index}" /
+                f"index_{index_dir}" /
                 f"{forced_prefix}_{forced_sg}_force" / "11_rfree" / "XDS_ASCII_ctruncate.mtz"
             )
         cell_refined_part = f"_{self.cell_refined}" if self.cell_refined else ""
         self.job_dir = (
             self.process_dir / "qrefine" /
-            f"{self.pin}_{self.crystal_name}{cell_refined_part}_{self.index}_{self.forced}"
+            f"{self.pin}_{self.crystal_name}{cell_refined_part}_{index_dir}_{self.forced}"
         )
 
 
@@ -176,7 +177,8 @@ class RunQRefineJob:
         return 1.0
 
     def _log(self, tag, message):
-        line = format_log_line(tag, message, context=self.job_id)
+        line = format_log_line(tag, message, context=self.job_id,
+                               context_width=self.params.get("context_width"))
         with open("pipeline.log", "a") as fh:
             fh.write(line)
         print(line, end="", flush=True)
@@ -400,9 +402,10 @@ class QRefineWorker:
     Returns a list of paths to the generated scripts.
     """
 
-    def __init__(self, dataset, mr_params):
-        self.dataset   = dataset
-        self.mr_params = mr_params
+    def __init__(self, dataset, mr_params, context_width=None):
+        self.dataset       = dataset
+        self.mr_params     = mr_params
+        self.context_width = context_width
 
     def write(self):
         d = self.dataset
@@ -420,7 +423,8 @@ class QRefineWorker:
             forced_tag = "nf" if d.forced == "not_forced" else d.forced.split("_")[1]
             job_id = f"{d.pin} | {forced_tag:<7} | {suffix:<5}"
             per_params = {**p, "mtz": str(d.mtz_path), "suffix": suffix,
-                          "pin": d.pin, "job_id": job_id}
+                          "pin": d.pin, "job_id": job_id,
+                          "context_width": self.context_width}
             script_path = d.job_dir / f"run_qrefine_{suffix}.py"
 
             pathlib.Path(d.job_dir / f"params_{suffix}.json").write_text(
@@ -557,8 +561,9 @@ class RunQRefine:
         datasets  = self._read_dataset_list()
         qsub_list = self.process_dir / "qrefine_qsub_list.txt"
 
+        context_width = QRefineWatcher(procpath=self.process_dir).context_width
+
         for dataset in datasets:
-            dataset.resolve()
             print(f"{dataset.pin} {dataset.crystal_name} {dataset.cell_refined} "
                   f"{dataset.index} {dataset.forced}")
 
@@ -569,7 +574,7 @@ class RunQRefine:
             dataset.job_dir.mkdir(parents=True)
 
             params = mr_params.get(dataset.crystal_name)
-            scripts = QRefineWorker(dataset, params).write()
+            scripts = QRefineWorker(dataset, params, context_width=context_width).write()
 
             with open(qsub_list, 'a') as fh:
                 for script in scripts:

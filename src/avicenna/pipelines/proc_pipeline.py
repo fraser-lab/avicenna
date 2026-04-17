@@ -26,7 +26,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "src"))
-from avicenna.utils.utils import BRAVAIS_LATTICES, QRefineWriter, format_log_line
+from avicenna.utils.utils import BRAVAIS_LATTICES, QRefineWriter, format_log_line, ProcessingWatcher
 
 
 def _find_latest_xds_dir():
@@ -1339,7 +1339,8 @@ RunProcess(params).{method}()
     def _log(self, pipeline_subdir, tag, message):
         """Append a timestamped line to pipeline.log in pipeline_subdir."""
         context = self.params.get("pin_id") if pipeline_subdir is not None else None
-        line = format_log_line(tag, message, context=context)
+        line = format_log_line(tag, message, context=context,
+                               context_width=self.params.get("context_width"))
         if pipeline_subdir is not None:
             with open(Path(pipeline_subdir) / "pipeline.log", "a") as fh:
                 fh.write(line)
@@ -1409,6 +1410,8 @@ RunProcess(params).{method}()
                 f.unlink()
 
         sym_entries = self._known_symmetry_entries()
+
+        self._context_width = ProcessingWatcher(procpath=self.process_dir).context_width
 
         for pin_line in self.params.get("pins", []):
             parts       = pin_line.strip().split(",")
@@ -1485,6 +1488,7 @@ RunProcess(params).{method}()
                         per_params = {
                             **self.params,
                             "pin_id":                f"{collection_id}_{series_key}",
+                            "context_width":         self._context_width,
                             "image_prefix":          series_key,
                             "image_dir":             str(image_dir),
                             "pipeline_subdir":       str(pipeline_subdir),

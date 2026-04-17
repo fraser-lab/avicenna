@@ -5,9 +5,12 @@ src/avicenna.egg-info/PKG-INFO
 src/avicenna.egg-info/SOURCES.txt
 src/avicenna.egg-info/dependency_links.txt
 src/avicenna.egg-info/entry_points.txt
+src/avicenna.egg-info/requires.txt
 src/avicenna.egg-info/top_level.txt
 src/avicenna/command_line/__init__.py
+src/avicenna/command_line/vic_pandda_prepare.py
 src/avicenna/command_line/vic_process.py
+src/avicenna/command_line/vic_refine.py
 src/avicenna/command_line/vic_scrape_logs.py
 src/avicenna/command_line/vic_watch.py
 src/avicenna/pipelines/__init__.py
