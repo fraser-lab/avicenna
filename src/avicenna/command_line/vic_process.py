@@ -26,6 +26,7 @@ parser.add_argument("-o", "--output", type=pathlib.Path, default=pathlib.Path(os
 parser.add_argument("--dry_run", action="store_true", help="Create pin_list.txt and xds_input_parameters.txt without submitting jobs")
 parser.add_argument("--silent",    action="store_true", help="Submit jobs without tailing the log")
 parser.add_argument("--no_filter", action="store_true", help="Skip quality filter when writing qrefine_list.txt; write all completed results")
+parser.add_argument("--xds_root", type=pathlib.Path, help="Path to the XDS install folder, default is an SBGrid install (/programs/<OS>/xds)")
 
 
 XDS_PARAM_DEFAULTS = {
@@ -135,6 +136,8 @@ def main():
                 print("ERROR: pin_list.txt and/or xds_input_parameters.txt not found!")
                 exit()
         else:
+            if args.xds_root:
+                params["xds_root"] = args.xds_root
             proc = RunProcess(params)
             proc.run()
 

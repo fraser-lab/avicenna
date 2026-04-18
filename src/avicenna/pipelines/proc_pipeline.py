@@ -16,6 +16,7 @@ RunProcess    -- orchestrator that drives the full pipeline
 import importlib.resources
 import json
 import os
+import platform
 import sys
 import pathlib
 import re
@@ -29,20 +30,45 @@ sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "src"))
 from avicenna.utils.utils import BRAVAIS_LATTICES, QRefineWriter, format_log_line, ProcessingWatcher
 
 
-def _find_latest_xds_dir():
-    """Return the Path to the most recent dated XDS installation under SBGrid.
+def _find_latest_xds_dir(explicit_root=None):
+    """Return the Path to the XDS installation root containing bin/ and lib/.
 
-    Versioned directories are named YYYYMMDD; lexicographic max is equivalent
-    to chronological max for that format.
+    If explicit_root is provided it takes precedence over all auto-detection.
+    Otherwise tries in order:
+    1. SBGrid with $SBG_PROGRAMS set: construct path from env var + platform.
+    2. Standard SBGrid filesystem path under /programs (works without sourcing).
+    3. Non-SBGrid bare install: xds_par is the actual binary; go two levels up.
     """
-    xds_root = Path("/programs/x86_64-linux/xds")
-    candidates = [
-        d for d in xds_root.iterdir()
-        if d.is_dir() and d.name.isdigit() and len(d.name) == 8
-    ]
-    if not candidates:
-        raise FileNotFoundError(f"No dated XDS installations found under {xds_root}")
-    return max(candidates, key=lambda d: d.name)
+    if explicit_root:
+        explicit_root = Path(explicit_root)
+        if (explicit_root / "bin" / "xds_par").is_file():
+            return explicit_root
+        raise FileNotFoundError(f"No valid XDS installation found at {explicit_root}")
+
+    arch = f"{platform.machine()}-{'darwin' if sys.platform == 'darwin' else 'linux'}"
+
+    for xds_root in (
+        Path(os.environ["SBG_PROGRAMS"]) / arch / "xds" if os.environ.get("SBG_PROGRAMS") else None,
+        Path("/programs") / arch / "xds",
+    ):
+        if xds_root and xds_root.is_dir():
+            candidates = [
+                d for d in xds_root.iterdir()
+                if d.is_dir() and d.name.isdigit() and len(d.name) == 8
+            ]
+            if candidates:
+                return max(candidates, key=lambda d: d.name)
+
+    xds_par = shutil.which("xds_par")
+    if xds_par:
+        candidate = Path(xds_par).resolve().parents[1]
+        if (candidate / "bin" / "xds_par").is_file():
+            return candidate
+
+    raise FileNotFoundError(
+        "XDS installation not found. "
+        "Source SBGrid, ensure xds_par is on PATH, or pass --xds_root."
+    )
 
 
 # TODO: HDF5 image counting is not yet implemented.
@@ -1004,13 +1030,12 @@ class RunProcess:
             job 13  RunXtriage
     """
 
-    _XDS_DIR           = _find_latest_xds_dir()
-    XDS_EXECUTABLE     = _XDS_DIR / "bin" / "xds_par"
     XDSSTAT_EXECUTABLE = Path("/programs/x86_64-linux/system/sbgrid_bin/xdsstat")
-    NEGGIA_LIB         = _XDS_DIR / "lib" / "dectris-neggia.so"
     MIN_IMAGES         = 180
 
     def __init__(self, params):
+        _xds_dir           = _find_latest_xds_dir(params.get("xds_root"))
+        self.XDS_EXECUTABLE = _xds_dir / "bin" / "xds_par"
         self.params        = params
         self.process_dir   = Path(params.get("process_dir", os.getcwd()))
         self.transfer_dir  = Path(params.get("image_dir", ""))
