@@ -73,11 +73,11 @@ Whenever `vic_process.py` runs, it outputs its own `pin_list.txt` and `xds_input
 
 Basic run with defaults and no prior crystal information:
   
-  `vic_process.py -d /path/to/image/files/first_sweep/ /path/to/image/files/second_sweep -l`
+  `vic_process.py -d /path/to/image/files/first_sweep/ /path/to/image/files/second_sweep`
 
 Run with pre-written `pin_list.txt` and `xds_input_parameters.txt` files (see below for examples)
 
-  `vic_process.py -p pin_list.txt -x xds_input_parameters.txt -l`
+  `vic_process.py -p pin_list.txt -x xds_input_parameters.txt`
 
 
 ### Sample pin_list.txt
@@ -122,7 +122,7 @@ Run with pre-written `pin_list.txt` and `xds_input_parameters.txt` files (see be
 AVICENNA will create a `processing` folder, in which it will store the processing software (`XDS`) output and the queue logs. Two programs can give some information about the results of the processing pipeline's work.
 
 	`vic.watch . -m`  -- issued from the root folder for this AVICENNA run, `vic.watch` will track progress in real time. **NOTE**: to run this (optional) program, open a new terminal and log in through there.
-	`vic.scrape . -f -l` -- issued from the root folder _after_ the run concludes, `vic.scrape` will scrape the logfiles and show a summary of the results. The `-f` option will throw out failed jobs and, if each dataset was processed in multiple ways, will pick the best processing outcome. The `-l` option will use this filtered output to create a submission list for the QRefine pipeline.
+	`vic.scrape .` -- issued from the root folder _after_ the run concludes, `vic.scrape` will scrape the logfiles and show a summary of the results.
 
 
 ## Running the structure solution / refinement pipeline
@@ -144,6 +144,8 @@ You can monitor the in-progress run by opening a new terminal window, logging in
 	vic.watch . -m --pipeline qrefine
 
 ### Sample `qrefine_list.txt` file
+
+**NOTE**: The file _must_ be called `qrefine_list.txt` at this time.
 
 als_20251121_QCR005_02_1,1_P43212,,1 900,integration not forced
 als_20251121_QCR005_02_1,1_P43212,refined,1 900,integration not forced
@@ -180,6 +182,8 @@ als_20251121_QCR006_16_1,1_P43212,refined,1 900,integration not forced
 
 ## Sample `qrefine_input_parameters.txt` file
 
+**NOTE**: the file _must_ be called `qrefine_input_parameters.txt` at this time.
+
 ## crystal ##
 crystal_name=1_P43212
 mr_pdb=/path/to/reference.pdb
@@ -192,4 +196,7 @@ mr_seq_id=1.0
 mr_try_monomer=false
 
 ## Accessing output
-AVICENNA creates a folder called `qrefine` under the root folder. It will have solved / refined structures that can serve as input into panDDA suite.
+AVICENNA creates a folder called `qrefine` under the root folder. It will have solved / refined structures that can serve as input into panDDA suite. As above, you can use two programs to monitor / analyze the output:
+
+	`vic.watch . -m --pipeline qrefine` - in a separate terminal window, can be used to monitor the run in progress
+	`vic.scrape . --pipeline qrefine` - after the run concludes, can be used to see the table of results
