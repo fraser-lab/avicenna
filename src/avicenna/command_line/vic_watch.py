@@ -42,8 +42,8 @@ def _append_qrefine_paths(procpath):
 
 
 _WATCHER_CLASSES = {
-    "processing" : ProcessingWatcher,
-    "qrefine"    : QRefineWatcher,
+    "processing" : (ProcessingWatcher, "processing"),
+    "qrefine"    : (QRefineWatcher,    None),
 }
 
 
@@ -53,7 +53,9 @@ def main():
         if args.pipeline not in _WATCHER_CLASSES:
             known = ", ".join(sorted(_WATCHER_CLASSES))
             parser.error(f"unknown pipeline '{args.pipeline}'; known pipelines: {known}")
-        watcher = _WATCHER_CLASSES[args.pipeline](procpath=args.procpath, pincode=args.pincode)
+        watcher_cls, subdir = _WATCHER_CLASSES[args.pipeline]
+        procpath = args.procpath / subdir if subdir else args.procpath
+        watcher = watcher_cls(procpath=procpath, pincode=args.pincode)
 
         if args.log:
             while True:

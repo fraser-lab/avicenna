@@ -88,7 +88,7 @@ class QRefineDataset:
         if self.integration == 'integration not forced':
             self.forced = 'not_forced'
             self.mtz_path = (
-                self.process_dir / self.pin /
+                self.process_dir / "processing" / self.pin /
                 crystal_dir /
                 f"index_{index_dir}" / "11_rfree" / "XDS_ASCII_ctruncate.mtz"
             )
@@ -98,7 +98,7 @@ class QRefineDataset:
             forced_prefix = parts[4]
             self.forced = f"forced_{forced_sg}_{forced_prefix}"
             self.mtz_path = (
-                self.process_dir / self.pin /
+                self.process_dir / "processing" / self.pin /
                 crystal_dir /
                 f"index_{index_dir}" /
                 f"{forced_prefix}_{forced_sg}_force" / "11_rfree" / "XDS_ASCII_ctruncate.mtz"
@@ -521,6 +521,8 @@ class RunQRefine:
 
     def _write_qsub_submit(self, qsub_list, njob):
         submit_path = self.process_dir / "qrefine_qsub_submit.sh"
+        logs_dir = self.process_dir / "qrefine_logs"
+        logs_dir.mkdir(exist_ok=True)
         submit_path.write_text(
             "#!/bin/bash\n"
             "#$ -S /bin/bash\n"
@@ -529,7 +531,8 @@ class RunQRefine:
             "#$ -j y\n"
             "#$ -pe smp 1\n"
             "#$ -l mem_free=2G\n"
-            "#$ -l h_rt=02:00:00\n\n"
+            "#$ -l h_rt=02:00:00\n"
+            f"#$ -o {logs_dir}\n\n"
             f'script=$(sed "${{SGE_TASK_ID}}q;d" {qsub_list})\n'
             "cd $(dirname ${script})\n"
             "./$(basename ${script})\n"
@@ -564,6 +567,7 @@ class RunQRefine:
         context_width = QRefineWatcher(procpath=self.process_dir).context_width
 
         for dataset in datasets:
+            dataset.resolve()
             print(f"{dataset.pin} {dataset.crystal_name} {dataset.cell_refined} "
                   f"{dataset.index} {dataset.forced}")
 

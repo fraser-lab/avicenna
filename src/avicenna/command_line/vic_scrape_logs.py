@@ -20,16 +20,19 @@ parser.add_argument('-f', '--filter',     action='store_true', help="Filter resu
 parser.add_argument('-l', '--list_write', action='store_true', help="Write a qrefine_list.txt from the (optionally filtered) results")
 parser.add_argument('--pipeline', choices=['processing', 'qrefine'], default='processing', help="Whether to write the qrefine_list.txt for the processing pipeline (default) or the qrefine pipeline")
 
+_SCRAPER_CLASSES = {
+    "processing": (ProcessingScraper, ProcessingFilter, "processing"),
+    "qrefine":    (QRefineScraper,    RefinementFilter, None),
+}
+
 
 def main():
     try:
         args = parser.parse_args()
-        if args.pipeline == 'processing':
-            scraper = ProcessingScraper(result_path=args.path)
-            filter_cls = ProcessingFilter() if args.filter else None
-        elif args.pipeline == 'qrefine':
-            scraper = QRefineScraper(result_path=args.path)
-            filter_cls = RefinementFilter() if args.filter else None
+        scraper_cls, filter_cls_factory, subdir = _SCRAPER_CLASSES[args.pipeline]
+        result_path = args.path / subdir if subdir else args.path
+        scraper = scraper_cls(result_path=result_path)
+        filter_cls = filter_cls_factory() if args.filter else None
         scraper.scrape_all()
         if filter_cls is not None:
             scraper.results = filter_cls.run(results=scraper.results)

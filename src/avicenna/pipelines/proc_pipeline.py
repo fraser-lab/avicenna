@@ -1038,6 +1038,8 @@ class RunProcess:
         self.XDS_EXECUTABLE = _xds_dir / "bin" / "xds_par"
         self.params        = params
         self.process_dir   = Path(params.get("process_dir", os.getcwd()))
+        self._output_dir   = self.process_dir / "processing"
+        self._logs_dir     = self.process_dir / "processing_logs"
         self.transfer_dir  = Path(params.get("image_dir", ""))
         self.ncpu          = int(params.get("ncpu", 8))
         self.indexing_images = params.get("indexing_images", "first_half")
@@ -1281,7 +1283,7 @@ RunProcess(params).{method}()
 """)
         script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IRUSR | stat.S_IWUSR)
 
-    def _submit_sge_array(self, job_list_path, submit_script_path, h_rt="06:00:00"):
+    def _submit_sge_array(self, job_list_path, submit_script_path, h_rt="06:00:00", logs_dir=None):
         """Write and qsub an SGE array job over the paths listed in job_list_path."""
         if not Path(job_list_path).is_file():
             print(f"No jobs found — {job_list_path} was not created. Check that datasets exist and have >= {self.MIN_IMAGES} images.")
@@ -1290,6 +1292,7 @@ RunProcess(params).{method}()
         njob  = len(lines)
         if njob == 0:
             return
+        logs_line = f"#$ -o {logs_dir}\n" if logs_dir else ""
         submit_script_path.write_text(
             "#!/bin/bash\n"
             "#$ -S /bin/bash\n"
@@ -1299,7 +1302,8 @@ RunProcess(params).{method}()
             f"#$ -pe smp {self.ncpu}\n"
             "#$ -l mem_free=2G\n"
             f"#$ -l h_rt={h_rt}\n"
-            "#$ -l scratch=20G\n\n"
+            "#$ -l scratch=20G\n"
+            f"{logs_line}\n"
             f'input_dir=$(sed "${{SGE_TASK_ID}}q;d" {job_list_path})\n'
             "cd ${input_dir}\n"
             "./run_pipeline.py\n"
@@ -1434,9 +1438,12 @@ RunProcess(params).{method}()
             if f.is_file():
                 f.unlink()
 
+        self._output_dir.mkdir(exist_ok=True)
+        self._logs_dir.mkdir(exist_ok=True)
+
         sym_entries = self._known_symmetry_entries()
 
-        self._context_width = ProcessingWatcher(procpath=self.process_dir).context_width
+        self._context_width = ProcessingWatcher(procpath=self._output_dir).context_width
 
         for pin_line in self.params.get("pins", []):
             parts       = pin_line.strip().split(",")
@@ -1464,7 +1471,7 @@ RunProcess(params).{method}()
                     groups.setdefault(series_key, []).append(f)
 
             for series_key, files in sorted(groups.items()):
-                pin_dir_check = self.process_dir / f"{collection_id}_{series_key}"
+                pin_dir_check = self._output_dir / f"{collection_id}_{series_key}"
                 if pin_dir_check.is_dir():
                     print(f"Output folder already exists — skipping {series_key}")
                     continue
@@ -1488,7 +1495,7 @@ RunProcess(params).{method}()
                               f"partial dataset ({image_count} images, minimum is {self.MIN_IMAGES})")
                     continue
 
-                pin_dir = self.process_dir / f"{collection_id}_{series_key}"
+                pin_dir = self._output_dir / f"{collection_id}_{series_key}"
                 pin_dir.mkdir(exist_ok=True)
 
                 index_ranges = self._indexing_ranges(image_count, first_image)
@@ -1541,7 +1548,7 @@ RunProcess(params).{method}()
                     fh.write(f"{collection_id}_{series_key}\n")
 
         submit_sh = self.process_dir / "xds_pipeline_index_qsub_submit.sh"
-        self._submit_sge_array(qsub_list, submit_sh, h_rt="06:00:00")
+        self._submit_sge_array(qsub_list, submit_sh, h_rt="06:00:00", logs_dir=self._logs_dir)
         print(f"Done in {time.time() - _run_start:.1f}s")
 
     def run_single(self):
@@ -1684,7 +1691,7 @@ RunProcess(params).{method}()
         self._log(pipeline_subdir, "FORCE",
                   f"submitting {len(sg_list)} job(s): {', '.join(sg_list)}")
         submit_sh = pipeline_subdir / "xds_pipeline_lattice_qsub_submit.sh"
-        self._submit_sge_array(lattice_list, submit_sh, h_rt="02:00:00")
+        self._submit_sge_array(lattice_list, submit_sh, h_rt="02:00:00", logs_dir=self._logs_dir)
 
     def run_single_forced(self):
         """

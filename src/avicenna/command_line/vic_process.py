@@ -45,6 +45,19 @@ XDS_PARAM_DEFAULTS = {
     "ref_mtz":               "none",
 }
 
+class _Tee:
+    """Write to both the underlying stream and a log file simultaneously."""
+    def __init__(self, stream, path):
+        self._stream = stream
+        self._path   = path
+    def write(self, data):
+        self._stream.write(data)
+        with open(self._path, 'a') as f:
+            f.write(data)
+    def flush(self):
+        self._stream.flush()
+
+
 def _read_xds_params(filepath):
     """Read XDS params from a params file, falling back to defaults for missing keys."""
     result = dict(XDS_PARAM_DEFAULTS)
@@ -128,6 +141,10 @@ def main():
             ParamWriter(args=args).build_parameters()
             params.update(_read_xds_params("xds_input_parameters.txt"))
 
+        project_dir = os.path.abspath(args.output)
+        procpath    = os.path.join(project_dir, "processing")
+        omnibus     = os.path.join(project_dir, "processing.log")
+
         if args.bash:        # run Galen's original bash scripts for XDS processing
             if (os.path.isfile('./pin_list.txt') and os.path.isfile('./xds_input_parameters.txt')):
                 script_path = os.path.join(os.path.abspath(params["script_dir"]), 'xds_pipeline_prep.sh')
@@ -138,14 +155,13 @@ def main():
         else:
             if args.xds_root:
                 params["xds_root"] = args.xds_root
-            proc = RunProcess(params)
-            proc.run()
+            with contextlib.redirect_stdout(_Tee(sys.stdout, omnibus)):
+                proc = RunProcess(params)
+                proc.run()
 
         if args.silent or args.dry_run:
             return
 
-        procpath = os.path.abspath(args.output)
-        omnibus = os.path.join(procpath, "processing.log")
         watcher = Watcher(procpath=procpath)
         while True:
             watcher.tail_logs(log_file=omnibus)
@@ -158,14 +174,15 @@ def main():
         watcher.tail_logs(log_file=omnibus)
         print()
         watcher.print_summary(omnibus=omnibus)
-        scraper = ProcessingScraper(str(os.path.abspath(args.output)))
-        scraper.scrape_all()
-        scraper.print_info()
-        if not args.no_filter:
-            scraper.results = ProcessingFilter().run(scraper.results)
-        scraper.write_qrefine_list(
-            path=os.path.join(os.path.abspath(args.output), 'qrefine_list.txt')
-        )
+        with contextlib.redirect_stdout(_Tee(sys.stdout, omnibus)):
+            scraper = ProcessingScraper(procpath)
+            scraper.scrape_all()
+            scraper.print_info()
+            if not args.no_filter:
+                scraper.results = ProcessingFilter().run(scraper.results)
+            scraper.write_qrefine_list(
+                path=os.path.join(os.path.abspath(args.output), 'qrefine_list.txt')
+            )
     except KeyboardInterrupt:
         print("\nInterrupted. Any submitted jobs are still running on the cluster.")
         sys.exit(1)

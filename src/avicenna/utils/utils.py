@@ -1,6 +1,9 @@
+import math
 import os
 import pathlib
 import sys
+import threading
+import time
 from datetime import datetime
 # import matplotlib.pyplot as plt
 
@@ -791,6 +794,8 @@ class ProcessingWatcher(WatcherBase):
             sys.exit(f"Error: processing directory '{self.procpath}' does not exist.")
         pin_list_path = os.path.join(self.procpath, "pin_list.txt")
         if not os.path.isfile(pin_list_path):
+            pin_list_path = os.path.join(os.path.dirname(self.procpath), "pin_list.txt")
+        if not os.path.isfile(pin_list_path):
             sys.exit(f"Error: 'pin_list.txt' not found in '{self.procpath}'.")
         self.datasets = {}
         with open(pin_list_path, 'r') as f:
@@ -978,8 +983,9 @@ class ProgressBar:
 
     Simple mode (default): two-line overwrite display — legend on top, bar below.
     Multiline mode: one line per category (processed / failed / running / rejected),
-    each with a fill bar. Lines appear and disappear as counts change; cursor is
-    repositioned on each redraw using ANSI escape codes.
+    each with a fill bar, preceded by a spinner title line. Lines appear and
+    disappear as counts change; cursor is repositioned on each redraw using ANSI
+    escape codes.
     """
 
     _SIMPLE_LEGEND = "# processed | ! failed | - running | X rejected"
@@ -991,11 +997,31 @@ class ProgressBar:
         ("total",     "no_longer_running", "*"),
     ]
 
-    def __init__(self, watcher, multiline=False):
+    _SPINNER_CHARS  = ["⠉", "⠛", "⠶", "⣤", "⣀", "⣤", "⠶", "⠛"]
+    _SPINNER_PERIOD = 0.6  # full cycle duration in seconds
+
+    _PIPELINE_TITLES = {
+        "ProcessingWatcher" : lambda path: f"Processing data in {path}",
+        "QRefineWatcher"    : lambda path: f"Modeling structures from data in {path}",
+        "PanDDAWatcher"     : lambda path: "Running panDDA",
+    }
+
+    def __init__(self, watcher, multiline=False, title=None):
         self.watcher = watcher
         self.multiline = multiline
         self._drawn = False
         self._prev_lines = 0  # lines printed on last draw (multiline mode)
+        if title is not None:
+            self._title = title
+        else:
+            path = getattr(watcher, 'procpath', '')
+            make = self._PIPELINE_TITLES.get(type(watcher).__name__)
+            self._title = make(path) if make else f"Running pipeline in {path}"
+
+    def _spinner_char(self):
+        n   = len(self._SPINNER_CHARS)
+        idx = int((time.time() % self._SPINNER_PERIOD) / self._SPINNER_PERIOD * n)
+        return self._SPINNER_CHARS[idx % n]
 
     def draw(self):
         """Redraw progress in place. Returns True if any jobs still running."""
@@ -1048,7 +1074,7 @@ class ProgressBar:
 
         bar_width = 40
         denom = total or 1
-        new_lines = len(active)
+        new_lines = len(active) + 1  # +1 for title line
 
         # Reposition cursor to start of our block.
         # Cursor sits at end of last printed line (no trailing \n).
@@ -1057,7 +1083,10 @@ class ProgressBar:
                 print(f"\033[{self._prev_lines - 1}A", end="")
             print("\r", end="")
 
-        # Draw new content lines
+        # Title line with spinner
+        print(f"\033[2K {self._spinner_char()}  {self._title}")
+
+        # Draw per-category lines
         for i, (label, count) in enumerate(active):
             n = round(count / denom * bar_width)
             if count > 0 and n == 0:
@@ -1065,7 +1094,7 @@ class ProgressBar:
             else:
                 bar = "█" * n
             line = f"\033[2K{label:>10}: {count:>4}/{total:<4} │{bar:<{bar_width}}"
-            if i < new_lines - 1:
+            if i < len(active) - 1:
                 print(line)
             else:
                 print(line, end="", flush=True)
@@ -1082,6 +1111,96 @@ class ProgressBar:
         self._drawn = True
         self._prev_lines = new_lines
         return in_progress > 0
+
+
+class Spinner:
+    """Bouncing-ball terminal spinner.
+
+    HEIGHT=1 uses braille sub-positions to animate within a single line.
+    HEIGHT>1 moves the ball physically across HEIGHT rows.
+    The message is pinned to the vertical centre of the spinner area.
+
+    Usage::
+
+        with Spinner(height=3, message="Processing..."):
+            do_work()
+
+        # or manually:
+        s = Spinner(height=1, message="Working")
+        s.start()
+        ...
+        s.stop()
+    """
+
+    _BASE_DELAY = 0.06
+
+    def __init__(self, height=1, message=""):
+        self.height  = max(1, height)
+        self.message = message
+        self._stop   = threading.Event()
+        self._thread = None
+        self._rows, self._chars, self._delays = self._make_sequence()
+        self._msg_row = self.height // 2
+        self._pad     = " " * (len(self.message) + 2)
+
+    def _make_sequence(self):
+        h = self.height
+        if h == 1:
+            chars  = ["⠉", "⠛", "⠶", "⣤", "⣀", "⣤", "⠶", "⠛"]
+            delays = [0.12, 0.07, 0.05, 0.07, 0.12, 0.07, 0.05, 0.07]
+            rows   = [0] * len(chars)
+        else:
+            N    = max(8, 4 * h)
+            half = [round((h - 1) * math.sin(math.pi * i / (N - 1))) for i in range(N)]
+            rows = half + half[-2:0:-1]
+            def _char(pos):
+                if pos == 0:     return "⠉"
+                if pos == h - 1: return "⣀"
+                return "⠶"
+            chars  = [_char(r) for r in rows]
+            delays = [self._BASE_DELAY * h] * len(rows)
+        return rows, chars, delays
+
+    def _draw(self, row, char):
+        lines = []
+        for r in range(self.height):
+            ball = f" {char}" if r == row else "  "
+            msg  = f"  {self.message}" if r == self._msg_row else self._pad
+            lines.append(ball + msg + "\n")
+        return "".join(lines)
+
+    def _run(self):
+        n = len(self._rows)
+        sys.stdout.write(self._draw(self._rows[0], self._chars[0]))
+        sys.stdout.flush()
+        i = 0
+        while not self._stop.is_set():
+            time.sleep(self._delays[i % n])
+            if self._stop.is_set():
+                break
+            i += 1
+            j = i % n
+            sys.stdout.write(f"\033[{self.height}A" + self._draw(self._rows[j], self._chars[j]))
+            sys.stdout.flush()
+        sys.stdout.write(f"\033[{self.height}A" + "   \n" * self.height)
+        sys.stdout.flush()
+
+    def start(self):
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join()
+
+    def __enter__(self):
+        return self.start()
+
+    def __exit__(self, *_):
+        self.stop()
 
 
 class QRefineWriter:
@@ -1114,12 +1233,12 @@ class QRefineWriter:
 
         for mtz in sorted(self.process_dir.rglob('XDS_ASCII_ctruncate.mtz')):
             rel = mtz.relative_to(self.process_dir).parts
-            if len(rel) == 5 and rel[3] == '11_rfree':
-                pin, crystal_dir, index_dir = rel[0], rel[1], rel[2]
+            if len(rel) == 6 and rel[0] == 'processing' and rel[4] == '11_rfree':
+                pin, crystal_dir, index_dir = rel[1], rel[2], rel[3]
                 integration = 'integration not forced'
-            elif len(rel) == 6 and rel[3].endswith('_force') and rel[4] == '11_rfree':
-                pin, crystal_dir, index_dir = rel[0], rel[1], rel[2]
-                force_base = rel[3][:-len('_force')]          # e.g. '1_P43212'
+            elif len(rel) == 7 and rel[0] == 'processing' and rel[4].endswith('_force') and rel[5] == '11_rfree':
+                pin, crystal_dir, index_dir = rel[1], rel[2], rel[3]
+                force_base = rel[4][:-len('_force')]          # e.g. '1_P43212'
                 prefix, sg = force_base.split('_', 1)
                 integration = f'integration forced in {sg} {prefix}'
             else:
