@@ -4,5 +4,6 @@ __pycache__/
 # pixi environments
 .pixi/*
 !.pixi/config.toml
+# Claude Code local memory
+.claude/
 .gitattributes
-pixi.toml
