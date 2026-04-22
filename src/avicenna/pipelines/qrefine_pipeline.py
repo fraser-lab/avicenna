@@ -140,6 +140,7 @@ class RunQRefineJob:
         self.mr_mw_monomer   = params.get("mr_mw_monomer", "na")
         self.suffix          = params["suffix"]
         self.job_id          = params.get("job_id", params.get("pin", "?"))
+        self.fill            = params.get("fill", True)
 
     def _run(self, cmd, stdin=None, log=None):
         result = subprocess.run(
@@ -206,6 +207,58 @@ class RunQRefineJob:
         except OSError:
             pass
         return rwork, rfree, res
+
+    def _fill_reflections(self, final_pdb, final_mtz):
+        """Populate missing/invalid reflections using uniqueify → CAD → phenix.maps.
+
+        Produces final_{suffix}_filled.mtz with 2FOFCWT_fill / PH2FOFCWT_fill
+        columns ready for direct panDDA input.  Strategy follows the panDDA
+        documentation recommendation (phenix.maps is preferred over
+        phenix.refine / dimple because it fills without re-refining the model).
+        """
+        s = self.suffix
+        self._log("RUN", "fill: uniqueify → CAD → phenix.maps")
+
+        # Step 1: uniqueify — generate the complete unique reflection set.
+        self._run(
+            ["uniqueify", "-f", "FreeR_flag", final_mtz, "fill_01_unique.mtz"],
+            log="fill_01_unique.log",
+        )
+        if not pathlib.Path("fill_01_unique.mtz").is_file():
+            self._log("WARN", "fill: uniqueify failed — skipping reflection fill")
+            return
+
+        # Step 2: CAD — populate missing reflections across the full resolution range.
+        # 999.0 as the low-resolution limit ensures all shells are included.
+        self._run(
+            ["cad", "hklin1", "fill_01_unique.mtz", "hklout", "fill_02_cad.mtz"],
+            stdin=(
+                "monitor BRIEF\n"
+                "labin file 1 ALL\n"
+                "resolution file 1 999.0 HIGHRES\n"
+                "END\n"
+            ),
+            log="fill_02_cad.log",
+        )
+        if not pathlib.Path("fill_02_cad.mtz").is_file():
+            self._log("WARN", "fill: CAD failed — skipping reflection fill")
+            return
+
+        # Step 3: phenix.maps — compute 2mFo-DFc with filled coefficients.
+        # Output is named <input_base>_map_coeffs.mtz by phenix.maps convention.
+        self._run(
+            ["phenix.maps", final_pdb, "fill_02_cad.mtz"],
+            log="fill_03_maps.log",
+        )
+        dest = pathlib.Path(f"final_{s}_filled.mtz")
+        for candidate in ("fill_02_cad_map_coeffs.mtz",
+                           "fill_02_cad_map_coefficients.mtz"):
+            src = pathlib.Path(candidate)
+            if src.is_file():
+                src.rename(dest)
+                self._log("RUN", f"fill: {dest.name} written")
+                return
+        self._log("WARN", "fill: phenix.maps output not found — reflection fill incomplete")
 
     def run(self):
         s = self.suffix
@@ -313,6 +366,7 @@ class RunQRefineJob:
         # ------------------------------------------------------------------
         # Step 6: Optional monomer retry
         # ------------------------------------------------------------------
+
         if self.mr_try_monomer:
             final_rfree = self._final_rfree_from_log(f"04-refmac_{s}.log")
             if not phaser_pdb.is_file() or final_rfree > 0.4:
@@ -365,6 +419,17 @@ class RunQRefineJob:
                     self._log("RUN", "07-refmac-monomer: completed")
 
         # ------------------------------------------------------------------
+        # Step 7: Populate missing reflections for panDDA input
+        # ------------------------------------------------------------------
+        if self.fill:
+            for pdb_prefix in (f"final_monomer_{s}", f"final_{s}"):
+                pdb_path = pathlib.Path(f"{pdb_prefix}.pdb")
+                mtz_path = pathlib.Path(f"{pdb_prefix}.mtz")
+                if pdb_path.is_file() and mtz_path.is_file():
+                    self._fill_reflections(str(pdb_path), str(mtz_path))
+                    break
+
+        # ------------------------------------------------------------------
         # Final status
         # ------------------------------------------------------------------
         for pdb in (f"final_monomer_{s}.pdb", f"final_{s}.pdb"):
@@ -402,10 +467,11 @@ class QRefineWorker:
     Returns a list of paths to the generated scripts.
     """
 
-    def __init__(self, dataset, mr_params, context_width=None):
+    def __init__(self, dataset, mr_params, context_width=None, fill=True):
         self.dataset       = dataset
         self.mr_params     = mr_params
         self.context_width = context_width
+        self.fill          = fill
 
     def write(self):
         d = self.dataset
@@ -424,7 +490,8 @@ class QRefineWorker:
             job_id = f"{d.pin} | {forced_tag:<7} | {suffix:<5}"
             per_params = {**p, "mtz": str(d.mtz_path), "suffix": suffix,
                           "pin": d.pin, "job_id": job_id,
-                          "context_width": self.context_width}
+                          "context_width": self.context_width,
+                          "fill": self.fill}
             script_path = d.job_dir / f"run_qrefine_{suffix}.py"
 
             pathlib.Path(d.job_dir / f"params_{suffix}.json").write_text(
@@ -476,13 +543,14 @@ class RunQRefine:
     Also ensures CCP4 7.0 is pinned in ~/.sbgrid.conf before job generation.
     """
 
-    def __init__(self, process_dir, dataset_list, params_file, data=None, model=None, dry_run=False):
+    def __init__(self, process_dir, dataset_list, params_file, data=None, model=None, dry_run=False, fill=True):
         self.process_dir  = pathlib.Path(process_dir).resolve()
         self.dataset_list = pathlib.Path(dataset_list)
         self.params_file  = pathlib.Path(params_file)
         self.data         = pathlib.Path(data) if data else None
         self.model        = pathlib.Path(model) if model else None
         self.dry_run      = dry_run
+        self.fill         = fill
 
     def _pin_ccp4_version(self):
         sbgrid_conf = pathlib.Path.home() / ".sbgrid.conf"
@@ -540,6 +608,75 @@ class RunQRefine:
         submit_path.chmod(submit_path.stat().st_mode | stat.S_IXUSR | stat.S_IRUSR | stat.S_IWUSR)
         return submit_path
 
+    def _infer_pandda_suffix(self, mr_params):
+        """Return the suffix most appropriate for panDDA from the qrefine params.
+
+        If every crystal was run without waters (mr_water=false) the suffix is
+        'nohoh'; in all other cases (hoh, both, or mixed) it is 'hoh'.
+        """
+        waters = {p.get("mr_water", "false") for p in mr_params._crystals.values()}
+        return "nohoh" if waters == {"false"} else "hoh"
+
+    def _write_pandda_template(self, mr_params):
+        """Write pandda_template.sh in process_dir after jobs are submitted.
+
+        The script is a complete, submittable pandda.analyse SGE job with
+        FILL_IN placeholders for the three values that cannot be inferred from
+        qrefine output (dataset prefix, reference PDB, reference MTZ).
+        Optional arguments (ground_state_datasets, low-res completeness check)
+        are included as commented-out lines.
+        """
+        suffix   = self._infer_pandda_suffix(mr_params)
+        pdir     = self.process_dir
+        pandda   = pdir / "pandda"
+        data_dir = pandda / "data"
+        logs_dir = pdir / "pandda_logs"
+
+        script = pathlib.Path(pdir / "pandda_template.sh")
+        script.write_text(f"""\
+#!/bin/bash
+# pandda_template.sh — generated by vic.refine
+#
+# Edit the three FILL_IN values below, then submit with:
+#   qsub pandda_template.sh
+#
+# Required edits:
+#   FILL_IN_PREFIX        — dataset name prefix, e.g. FRS
+#   FILL_IN_REFERENCE_PDB — absolute path to reference PDB
+#   FILL_IN_REFERENCE_MTZ — absolute path to reference MTZ
+#
+#$ -S /bin/bash
+#$ -cwd
+#$ -j y
+#$ -pe smp 32
+#$ -l mem_free=8G
+#$ -l h_rt=24:00:00
+#$ -o {logs_dir}
+
+source /programs/sbgrid.shrc
+export CCP4_X=7.0
+
+cd {pandda}
+
+pandda.analyse \\
+  output.out_dir="{pandda}" \\
+  input.data_dirs="{data_dir}/FILL_IN_PREFIX_*" \\
+  input.pdb_style="final_{suffix}.pdb" \\
+  input.mtz_style="final_{suffix}.mtz" \\
+  input.reference.pdb="FILL_IN_REFERENCE_PDB" \\
+  input.reference.mtz="FILL_IN_REFERENCE_MTZ" \\
+  min_build_datasets="30" \\
+  max_build_datasets="50" \\
+  max_new_datasets="1500" \\
+  cpus="32" \\
+  high_res_increment="0.05"
+  # ground_state_datasets="x0001,x0002,..."  # uncomment and fill in if needed
+  # checks.low_resolution_completeness=None   # uncomment to disable LR completeness check
+""")
+        script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IRUSR | stat.S_IWUSR)
+        print(f"Written: {script}")
+        print("Edit the three FILL_IN values in that file before submitting.")
+
     def run(self):
         self._pin_ccp4_version()
         self._setup_output_dir()
@@ -578,7 +715,7 @@ class RunQRefine:
             dataset.job_dir.mkdir(parents=True)
 
             params = mr_params.get(dataset.crystal_name)
-            scripts = QRefineWorker(dataset, params, context_width=context_width).write()
+            scripts = QRefineWorker(dataset, params, context_width=context_width, fill=self.fill).write()
 
             with open(qsub_list, 'a') as fh:
                 for script in scripts:
@@ -595,6 +732,7 @@ class RunQRefine:
 
         if not self.dry_run:
             subprocess.run(["qsub", str(submit_path)])
+            self._write_pandda_template(mr_params)
 
 
 def main():

@@ -30,6 +30,8 @@ parser.add_argument("--dry_run", action="store_true",
                     help="Scan processing output and write qrefine_list.txt and qrefine_input_parameters.txt without submitting jobs")
 parser.add_argument("--silent", action="store_true",
                     help="Submit jobs without tailing the log")
+parser.add_argument("--no_fill", action="store_true",
+                    help="Skip populating missing/invalid reflections in the final MTZ (not recommended for panDDA input)")
 
 
 def main():
@@ -45,6 +47,7 @@ def main():
             dataset_list=args.list,
             params_file=args.params,
             dry_run=False,
+            fill=not args.no_fill,
         ).run()
 
         if args.silent:
