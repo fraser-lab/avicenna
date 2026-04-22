@@ -121,8 +121,8 @@ Run with pre-written `pin_list.txt` and `xds_input_parameters.txt` files (see be
 ### Accessing output
 AVICENNA will create a `processing` folder, in which it will store the processing software (`XDS`) output and the queue logs. Two programs can give some information about the results of the processing pipeline's work.
 
-	`vic.watch . -m`  -- issued from the root folder for this AVICENNA run, `vic.watch` will track progress in real time. **NOTE**: to run this (optional) program, open a new terminal and log in through there.
-	`vic.scrape .` -- issued from the root folder _after_ the run concludes, `vic.scrape` will scrape the logfiles and show a summary of the results.
+- `vic.watch . -m`  -- issued from the root folder for this AVICENNA run, `vic.watch` will track progress in real time. **NOTE**: to run this (optional) program, open a new terminal and log in through there.
+- `vic.scrape .` -- issued from the root folder _after_ the run concludes, `vic.scrape` will scrape the logfiles and show a summary of the results.
 
 
 ## Running the structure solution / refinement pipeline
@@ -147,56 +147,56 @@ You can monitor the in-progress run by opening a new terminal window, logging in
 
 **NOTE**: The file _must_ be called `qrefine_list.txt` at this time.
 
-als_20251121_QCR005_02_1,1_P43212,,1 900,integration not forced
-als_20251121_QCR005_02_1,1_P43212,refined,1 900,integration not forced
-als_20251121_QCR005_03_1,1_P43212,,1 900,integration not forced
-als_20251121_QCR005_03_1,1_P43212,refined,1 900,integration not forced
-als_20251121_QCR005_04_1,1_P43212,,1 900,integration not forced
-als_20251121_QCR005_04_1,1_P43212,refined,1 900,integration not forced
-als_20251121_QCR005_05_1,1_P43212,,1 900,integration not forced
-als_20251121_QCR005_05_1,1_P43212,refined,1 900,integration not forced
-als_20251121_QCR005_06_1,1_P43212,,1 900,integration not forced
-als_20251121_QCR005_06_1,1_P43212,refined,1 900,integration not forced
-als_20251121_QCR005_07_1,1_P43212,,1 900,integration not forced
-als_20251121_QCR005_07_1,1_P43212,refined,1 900,integration not forced
-als_20251121_QCR005_08_1,1_P43212,,1 900,integration not forced
-als_20251121_QCR005_08_1,1_P43212,refined,1 900,integration not forced
-als_20251121_QCR005_10_1,1_P43212,,1 900,integration not forced
-als_20251121_QCR005_10_1,1_P43212,refined,1 900,integration not forced
-als_20251121_QCR005_11_1,1_P43212,,1 900,integration forced in P43212 1
-als_20251121_QCR005_12_1,1_P43212,,1 900,integration not forced
-als_20251121_QCR005_12_1,1_P43212,refined,1 900,integration not forced
-als_20251121_QCR005_13_1,1_P43212,,1 900,integration not forced
-als_20251121_QCR005_13_1,1_P43212,refined,1 900,integration not forced
-als_20251121_QCR005_14_1,1_P43212,,1 900,integration not forced
-als_20251121_QCR005_14_1,1_P43212,refined,1 900,integration not forced
-als_20251121_QCR005_15_1,1_P43212,,1 900,integration not forced
-als_20251121_QCR005_15_1,1_P43212,refined,1 900,integration not forced
-als_20251121_QCR005_16_1,1_P43212,,1 900,integration forced in P43212 1
-als_20251121_QCR006_01_1,1_P43212,,1 900,integration not forced
-als_20251121_QCR006_01_1,1_P43212,refined,1 900,integration not forced
-als_20251121_QCR006_02_1,1_P43212,,1 900,integration not forced
-als_20251121_QCR006_02_1,1_P43212,refined,1 900,integration not forced
-als_20251121_QCR006_16_1,1_P43212,,1 900,integration not forced
-als_20251121_QCR006_16_1,1_P43212,refined,1 900,integration not forced
+	als_20251121_QCR005_02_1,1_P43212,,1 900,integration not forced
+	als_20251121_QCR005_02_1,1_P43212,refined,1 900,integration not forced
+	als_20251121_QCR005_03_1,1_P43212,,1 900,integration not forced
+	als_20251121_QCR005_03_1,1_P43212,refined,1 900,integration not forced
+	als_20251121_QCR005_04_1,1_P43212,,1 900,integration not forced
+	als_20251121_QCR005_04_1,1_P43212,refined,1 900,integration not forced
+	als_20251121_QCR005_05_1,1_P43212,,1 900,integration not forced
+	als_20251121_QCR005_05_1,1_P43212,refined,1 900,integration not forced
+	als_20251121_QCR005_06_1,1_P43212,,1 900,integration not forced
+	als_20251121_QCR005_06_1,1_P43212,refined,1 900,integration not forced
+	als_20251121_QCR005_07_1,1_P43212,,1 900,integration not forced
+	als_20251121_QCR005_07_1,1_P43212,refined,1 900,integration not forced
+	als_20251121_QCR005_08_1,1_P43212,,1 900,integration not forced
+	als_20251121_QCR005_08_1,1_P43212,refined,1 900,integration not forced
+	als_20251121_QCR005_10_1,1_P43212,,1 900,integration not forced
+	als_20251121_QCR005_10_1,1_P43212,refined,1 900,integration not forced
+	als_20251121_QCR005_11_1,1_P43212,,1 900,integration forced in P43212 1
+	als_20251121_QCR005_12_1,1_P43212,,1 900,integration not forced
+	als_20251121_QCR005_12_1,1_P43212,refined,1 900,integration not forced
+	als_20251121_QCR005_13_1,1_P43212,,1 900,integration not forced
+	als_20251121_QCR005_13_1,1_P43212,refined,1 900,integration not forced
+	als_20251121_QCR005_14_1,1_P43212,,1 900,integration not forced
+	als_20251121_QCR005_14_1,1_P43212,refined,1 900,integration not forced
+	als_20251121_QCR005_15_1,1_P43212,,1 900,integration not forced
+	als_20251121_QCR005_15_1,1_P43212,refined,1 900,integration not forced
+	als_20251121_QCR005_16_1,1_P43212,,1 900,integration forced in P43212 1
+	als_20251121_QCR006_01_1,1_P43212,,1 900,integration not forced
+	als_20251121_QCR006_01_1,1_P43212,refined,1 900,integration not forced
+	als_20251121_QCR006_02_1,1_P43212,,1 900,integration not forced
+	als_20251121_QCR006_02_1,1_P43212,refined,1 900,integration not forced
+	als_20251121_QCR006_16_1,1_P43212,,1 900,integration not forced
+	als_20251121_QCR006_16_1,1_P43212,refined,1 900,integration not forced
 
 ## Sample `qrefine_input_parameters.txt` file
 
 **NOTE**: the file _must_ be called `qrefine_input_parameters.txt` at this time.
 
-## crystal ##
-crystal_name=1_P43212
-mr_pdb=/path/to/reference.pdb
-mr_cutoff=0.45
-mr_water=both
-mr_tncs=false
-mr_copies=1
-mr_mw=100000
-mr_seq_id=1.0
-mr_try_monomer=false
+	## crystal ##
+	crystal_name=1_P43212
+	mr_pdb=/path/to/reference.pdb
+	mr_cutoff=0.45
+	mr_water=both
+	mr_tncs=false
+	mr_copies=1
+	mr_mw=100000
+	mr_seq_id=1.0
+	mr_try_monomer=false
 
 ## Accessing output
 AVICENNA creates a folder called `qrefine` under the root folder. It will have solved / refined structures that can serve as input into panDDA suite. As above, you can use two programs to monitor / analyze the output:
 
-	`vic.watch . -m --pipeline qrefine` - in a separate terminal window, can be used to monitor the run in progress
-	`vic.scrape . --pipeline qrefine` - after the run concludes, can be used to see the table of results
+- `vic.watch . -m --pipeline qrefine` - in a separate terminal window, can be used to monitor the run in progress
+- `vic.scrape . --pipeline qrefine` - after the run concludes, can be used to see the table of results
