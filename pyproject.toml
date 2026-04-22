@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "avicenna"
-version = "0.3.7"
+version = "0.4.0"
 requires-python = ">=3.11"
 dependencies = ["h5py"]
 
@@ -13,7 +13,7 @@ dependencies = ["h5py"]
 "vic.refine"            = "avicenna.command_line.vic_refine:main"
 "vic.watch"             = "avicenna.command_line.vic_watch:main"
 "vic.scrape"            = "avicenna.command_line.vic_scrape_logs:main"
-"vic.pandda_prepare"    = "avicenna.command_line.vic_pandda_prepare:main"
+"vic.pandda"            = "avicenna.command_line.vic_pandda:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

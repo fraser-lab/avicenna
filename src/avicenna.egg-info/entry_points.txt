@@ -1,5 +1,5 @@
 [console_scripts]
-vic.pandda_prepare = avicenna.command_line.vic_pandda_prepare:main
+vic.pandda = avicenna.command_line.vic_pandda:main
 vic.process = avicenna.command_line.vic_process:main
 vic.refine = avicenna.command_line.vic_refine:main
 vic.scrape = avicenna.command_line.vic_scrape_logs:main

@@ -1,5 +1,5 @@
 Metadata-Version: 2.4
 Name: avicenna
-Version: 0.3.4
+Version: 0.3.7
 Requires-Python: >=3.11
 Requires-Dist: h5py

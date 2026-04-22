@@ -36,9 +36,9 @@ parser.add_argument("--dry_run", action="store_true",
                     help="Show what would be done without copying or submitting")
 
 
-def _parse_ground_state_range(prefix, range_str):
+def _parse_ground_state_range(range_str):
     start, _, end = range_str.partition('-')
-    return [f"{prefix}_x{i:04d}" for i in range(int(start), int(end) + 1)]
+    return [f"x{i:04d}" for i in range(int(start), int(end) + 1)]
 
 
 def main():
@@ -46,9 +46,7 @@ def main():
         args = parser.parse_args()
         ground_state_datasets = []
         if args.ground_state_range:
-            ground_state_datasets = _parse_ground_state_range(
-                args.prefix, args.ground_state_range
-            )
+            ground_state_datasets = _parse_ground_state_range(args.ground_state_range)
         PanDDAPreparer(
             process_dirs=list(args.sources),
             prefix=args.prefix,

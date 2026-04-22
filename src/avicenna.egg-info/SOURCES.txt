@@ -8,12 +8,13 @@ src/avicenna.egg-info/entry_points.txt
 src/avicenna.egg-info/requires.txt
 src/avicenna.egg-info/top_level.txt
 src/avicenna/command_line/__init__.py
-src/avicenna/command_line/vic_pandda_prepare.py
+src/avicenna/command_line/vic_pandda.py
 src/avicenna/command_line/vic_process.py
 src/avicenna/command_line/vic_refine.py
 src/avicenna/command_line/vic_scrape_logs.py
 src/avicenna/command_line/vic_watch.py
 src/avicenna/pipelines/__init__.py
+src/avicenna/pipelines/pandda_pipeline.py
 src/avicenna/pipelines/proc_pipeline.py
 src/avicenna/pipelines/qrefine_pipeline.py
 src/avicenna/resources/__init__.py

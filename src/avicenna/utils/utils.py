@@ -924,7 +924,8 @@ class QRefineWatcher(WatcherBase):
                 else:
                     iparts = integration.split()
                     forced = f"forced_{iparts[3]}_{iparts[4]}"
-                job_dir_name = f"{pin}_{crystal_name}_{cell_refined}_{index_dir}_{forced}"
+                cr = f"_{cell_refined}" if cell_refined else ""
+                job_dir_name = f"{pin}_{crystal_name}{cr}_{index_dir}_{forced}"
                 if pin not in self.datasets:
                     self.datasets[pin] = {}
                 self.datasets[pin][job_dir_name] = (None, None)
