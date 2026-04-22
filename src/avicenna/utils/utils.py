@@ -976,6 +976,93 @@ class QRefineWatcher(WatcherBase):
         return new_lines
 
 
+class PanDDAWatcher(WatcherBase):
+    """Watches a PanDDA run via processed_datasets/ .log files, masks CSV, and sentinel files."""
+
+    def get_info(self):
+        if not os.path.isdir(self.procpath):
+            sys.exit(f"Error: pandda output directory '{self.procpath}' does not exist.")
+        self._datasets_dir  = pathlib.Path(self.procpath) / 'processed_datasets'
+        self._done_file     = pathlib.Path(self.procpath) / 'pandda.done'
+        self._masks_csv     = pathlib.Path(self.procpath) / 'analyses' / 'all_datasets_info_masks.csv'
+        self._rejected      = set()
+        self.datasets       = {}
+
+    def _read_masks(self):
+        if not self._masks_csv.is_file():
+            return
+        try:
+            with open(self._masks_csv) as fh:
+                header = fh.readline().strip().split(',')
+                try:
+                    col = header.index('rejected - total')
+                except ValueError:
+                    return
+                for line in fh:
+                    parts = line.strip().split(',')
+                    if len(parts) > col and parts[col].strip().lower() == 'true':
+                        self._rejected.add(parts[0].strip())
+        except OSError:
+            pass
+
+    def _pipeline_logs(self, *_):
+        return []
+
+    def watch(self):
+        self._read_masks()
+        if not self._datasets_dir.is_dir():
+            return
+        for entry in sorted(self._datasets_dir.iterdir()):
+            if not entry.is_dir():
+                continue
+            name = entry.name
+            if name in self._rejected:
+                self.datasets[name] = ('REJECTED', None)
+            elif (entry / f'{name}.log').is_file():
+                self.datasets[name] = ('FINISHED', None)
+            elif name not in self.datasets:
+                self.datasets[name] = ('RUNNING', None)
+
+    def get_counts(self):
+        self.watch()
+        done        = self._done_file.is_file()
+        finished    = sum(1 for s, _ in self.datasets.values() if s == 'FINISHED')
+        rejected    = sum(1 for s, _ in self.datasets.values() if s == 'REJECTED')
+        total       = len(self.datasets)
+        in_progress = 0 if done else 1
+        return finished, 0, in_progress, rejected, total
+
+    def show_details(self):
+        self.watch()
+        lines = [
+            f"{name}: {status}" + (f" ({err})" if err else "")
+            for name, (status, err) in self.datasets.items()
+        ]
+        print("\n".join(lines) + "\n*************\n")
+
+    def tail_log(self):
+        logs_dir = pathlib.Path(self.procpath) / 'logs'
+        logs = sorted(logs_dir.glob('*.log')) if logs_dir.is_dir() else []
+        if not logs:
+            return []
+        log_path = str(logs[-1])
+        new_lines = []
+        try:
+            with open(log_path) as fh:
+                all_lines = fh.readlines()
+        except OSError:
+            return []
+        offset = self._log_offsets.get(log_path, 0)
+        for line in all_lines[offset:]:
+            print(line, end='', flush=True)
+            new_lines.append(line)
+        self._log_offsets[log_path] = len(all_lines)
+        return new_lines
+
+    def tail_logs(self, log_file=None):
+        return self.tail_log()
+
+
 Watcher = ProcessingWatcher
 
 

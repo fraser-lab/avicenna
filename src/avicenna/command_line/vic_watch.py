@@ -5,7 +5,7 @@ import argparse
 import pathlib
 from importlib.metadata import version, PackageNotFoundError
 sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "src"))
-from avicenna.utils.utils import ProcessingWatcher, QRefineWatcher, QRefineWriter, ProgressBar
+from avicenna.utils.utils import ProcessingWatcher, QRefineWatcher, PanDDAWatcher, QRefineWriter, ProgressBar
 
 try:
     _version = version("avicenna")
@@ -20,7 +20,8 @@ parser.add_argument("--pipeline", default="processing", help="Which pipeline to 
 _mode = parser.add_mutually_exclusive_group()
 _mode.add_argument("-d", "--details", action="store_true", default=False, help="Show detailed status for each pin code")
 _mode.add_argument("-l", "--log", action="store_true", default=False, help="Print omnibus log to stdout as jobs run (no progress bar)")
-_mode.add_argument("-m", "--multiline", action="store_true", default=False, help="Show per-category progress bars, one line each")
+_mode.add_argument("-m", "--multiline", action="store_true", default=False, help="Show per-category progress bars, one line each (default)")
+_mode.add_argument("-s", "--simple", action="store_true", default=False, help="Show compact single-line progress bar")
 
 
 def _append_qrefine_paths(procpath):
@@ -44,6 +45,7 @@ def _append_qrefine_paths(procpath):
 _WATCHER_CLASSES = {
     "processing" : (ProcessingWatcher, "processing"),
     "qrefine"    : (QRefineWatcher,    None),
+    "pandda"     : (PanDDAWatcher,     None),
 }
 
 
@@ -77,7 +79,7 @@ def main():
                 time.sleep(1)
 
         else:
-            bar = ProgressBar(watcher, multiline=args.multiline)
+            bar = ProgressBar(watcher, multiline=not args.simple)
             while True:
                 still_running = bar.draw()
                 if not still_running:
