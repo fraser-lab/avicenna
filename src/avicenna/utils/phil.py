@@ -19,7 +19,7 @@ import freephil
 _PROCESSING_PHIL = """\
 processing
   .short_caption = Data Processing
-  .help = Parameters for the XDS/Aimless data-processing sub-pipeline.
+  .help = Parameters for the data-processing sub-pipeline.
 {
   input
     .short_caption = Input
@@ -36,18 +36,6 @@ processing
       .short_caption = Pin list
       .help = Path to an existing pin_list.txt -- skips data discovery if provided.
       .expert_level = 0
-    xdsparams = None
-      .type = path
-      .short_caption = XDS parameter file
-      .help = Path to an existing xds_input_parameters.txt -- \
-              overrides all xds.* parameters below if provided.
-      .expert_level = 0
-    xds_root = None
-      .type = path
-      .short_caption = XDS installation root
-      .help = Explicit path to the XDS installation directory \
-              (containing bin/xds_par). Defaults to the SBGrid install.
-      .expert_level = 2
   }
   output
     .short_caption = Output
@@ -59,15 +47,21 @@ processing
       .help = Root directory for all processing output.
       .expert_level = 0
   }
+  backend = *xds dials
+    .type = choice
+    .short_caption = Processing backend
+    .help = Which data-processing backend to use (default is a custom xds implementation).
+    .expert_level = 0
   xds
     .short_caption = XDS Parameters
     .help = Parameters forwarded to the XDS processing worker script.
   {
-    script_dir = "../scripts"
-      .type = str
-      .short_caption = Script directory
-      .help = Directory containing the XDS pipeline shell scripts.
-      .expert_level = 2
+    xds_inp = None
+      .type = path
+      .short_caption = XDS.INP file
+      .help = Path to an existing XDS.INP file -- overrides all xds.* \
+              parameters below if provided.
+      .expert_level = 0
     detector_edge = 0.8
       .type = float
       .short_caption = Detector edge fraction
@@ -135,6 +129,12 @@ processing
       .short_caption = Reference MTZ
       .help = Path to a reference MTZ file for reindexing (optional).
       .expert_level = 2
+  }
+  dials
+    .short_caption = DIALS Parameters
+    .help = Parameters forwarded to the DIALS/xia2 processing backend \
+            (not yet implemented).
+  {
   }
 }
 """

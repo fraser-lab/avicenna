@@ -14,6 +14,7 @@ dependencies = ["h5py", "freephil"]
 "vic.watch"             = "avicenna.command_line.vic_watch:main"
 "vic.scrape"            = "avicenna.command_line.vic_scrape_logs:main"
 "vic.pandda"            = "avicenna.command_line.vic_pandda:main"
+"vic.settings"          = "avicenna.command_line.vic_settings:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

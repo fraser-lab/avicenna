@@ -10,23 +10,31 @@ from importlib.metadata import version, PackageNotFoundError
 sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "src"))
 from avicenna.utils.utils import DataFinder, ParamWriter, Watcher, ProcessingScraper, ProcessingFilter
 from avicenna.pipelines.proc_pipeline import RunProcess
+from avicenna.utils.phil import ProcessingPHIL
 
 try:
     _version = version("avicenna")
 except PackageNotFoundError:
     _version = "unknown"
 
-parser = argparse.ArgumentParser(prog="xds_starter")
+parser = argparse.ArgumentParser(prog="vic.process")
 parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {_version}")
 parser.add_argument("-d", "--data", type=pathlib.Path, nargs="+", help="Path(s) to data; each should have the format <synchrotron>_<date_YYYYMMDD>_transfer")
 parser.add_argument("-p", "--pinlist", type=str, help="Filename for pin list file, typically pin_list.txt")
 parser.add_argument("-x", "--xdsparams", type=str, help="Filename for XDS param file, usually xds_input_parameters.txt")
 parser.add_argument("--bash", action="store_true", help="Run the bash scripts instead of the Python-based processing pipeline")
 parser.add_argument("-o", "--output", type=pathlib.Path, default=pathlib.Path(os.curdir), help="Path to output folder (default: current directory)")
-parser.add_argument("--dry_run", action="store_true", help="Create pin_list.txt and xds_input_parameters.txt without submitting jobs")
+parser.add_argument("--dry_run", action="store_true", help="Create pin_list.txt and avicenna.phil without submitting jobs")
 parser.add_argument("--silent",    action="store_true", help="Submit jobs without tailing the log")
 parser.add_argument("--no_filter", action="store_true", help="Skip quality filter when writing qrefine_list.txt; write all completed results")
 parser.add_argument("--xds_root", type=pathlib.Path, help="Path to the XDS install folder, default is an SBGrid install (/programs/<OS>/xds)")
+_phil_group = parser.add_mutually_exclusive_group()
+_phil_group.add_argument("-c", dest="phil", action="store_true",
+                         help="Print processing PHIL parameters and exit")
+_phil_group.add_argument("-e", dest="phil_expert_level", type=int, metavar="LEVEL",
+                         help="Print processing PHIL parameters up to expert level LEVEL and exit")
+parser.add_argument("-a", dest="phil_attrs", action="store_true",
+                    help="Show PHIL parameter attributes (use with -c or -e)")
 
 
 XDS_PARAM_DEFAULTS = {
@@ -76,6 +84,15 @@ def _read_xds_params(filepath):
 def main():
     try:
         args = parser.parse_args()
+
+        if args.phil or args.phil_expert_level is not None or args.phil_attrs:
+            ProcessingPHIL()._master.format(ProcessingPHIL()._params).show(
+                out=sys.stdout,
+                attributes_level=2 if args.phil_attrs else 0,
+                expert_level=args.phil_expert_level,
+            )
+            sys.exit(0)
+
         if not args.pinlist and not args.data:
             parser.error("either -d/--data or -p/--pinlist must be provided")
 
@@ -84,13 +101,19 @@ def main():
                 parser.error("--dry_run is incompatible with --pinlist and --xdsparams")
             if not args.data:
                 parser.error("--dry_run requires -d/--data")
-            for fname in ("pin_list.txt", "xds_input_parameters.txt"):
+            for fname in ("pin_list.txt", "avicenna.phil"):
                 if os.path.isfile(fname):
                     os.rename(fname, fname + ".bak")
                     print(f"Backed up {fname} -> {fname}.bak")
             _, _, data_path = DataFinder(paths=args.data).collect()
-            args.data = data_path
-            ParamWriter(args=args).build_parameters()
+            p = ProcessingPHIL()
+            data_str = " ".join(f'"{d}"' for d in args.data)
+            p.adopt_phil_string(f"processing.input.data = {data_str}")
+            p.adopt_phil_string('processing.input.pinlist = "pin_list.txt"')
+            output_str = str(pathlib.Path(args.output).resolve())
+            p.adopt_phil_string(f'processing.output.directory = "{output_str}"')
+            p.to_file("avicenna.phil")
+            print("Written: avicenna.phil")
             print("Dry run complete.")
             sys.exit(0)
 
