@@ -71,6 +71,118 @@ def _find_latest_xds_dir(explicit_root=None):
     )
 
 
+def _find_xdsstat():
+    """Return Path to the xdsstat binary.
+
+    Tries in order:
+    1. SBGrid with $SBG_PROGRAMS set.
+    2. Standard SBGrid filesystem path under /programs.
+    3. xdsstat on PATH.
+    """
+    arch = f"{platform.machine()}-{'darwin' if sys.platform == 'darwin' else 'linux'}"
+
+    for xdsstat_root in (
+        Path(os.environ["SBG_PROGRAMS"]) / arch / "xdsstat" if os.environ.get("SBG_PROGRAMS") else None,
+        Path("/programs") / arch / "xdsstat",
+    ):
+        if xdsstat_root and xdsstat_root.is_dir():
+            candidates = [d for d in xdsstat_root.iterdir()
+                          if d.is_dir() and (d / "xdsstat").is_file()]
+            if candidates:
+                return max(candidates, key=lambda d: d.stat().st_mtime) / "xdsstat"
+
+    xdsstat = shutil.which("xdsstat")
+    if xdsstat:
+        return Path(xdsstat)
+
+    raise FileNotFoundError(
+        "xdsstat not found. Source SBGrid or ensure xdsstat is on PATH."
+    )
+
+
+def _find_ccp4_bin():
+    """Return Path to the CCP4 bin/ directory.
+
+    Tries in order:
+    1. SBGrid with $SBG_PROGRAMS set.
+    2. Standard SBGrid filesystem path under /programs.
+    3. pointless on PATH; use its parent directory.
+
+    Within the CCP4 installation root, versions are sorted by parsed version
+    tuple so that 9.0.014 > 9.0.008 > 8.0, etc.  The actual bin/ lives one
+    level deeper inside a directory named ccp4-<variant>.
+    """
+    arch = f"{platform.machine()}-{'darwin' if sys.platform == 'darwin' else 'linux'}"
+
+    for ccp4_root in (
+        Path(os.environ["SBG_PROGRAMS"]) / arch / "ccp4" if os.environ.get("SBG_PROGRAMS") else None,
+        Path("/programs") / arch / "ccp4",
+    ):
+        if not (ccp4_root and ccp4_root.is_dir()):
+            continue
+        candidates = []
+        for d in ccp4_root.iterdir():
+            if not d.is_dir():
+                continue
+            parts = re.findall(r"\d+", d.name)
+            if parts:
+                candidates.append((tuple(int(x) for x in parts), d))
+        for _, version_dir in sorted(candidates, key=lambda x: x[0], reverse=True):
+            for subdir in version_dir.iterdir():
+                if subdir.name.startswith("ccp4-") and (subdir / "bin" / "pointless").is_file():
+                    return subdir / "bin"
+
+    pointless = shutil.which("pointless")
+    if pointless:
+        return Path(pointless).parent
+
+    raise FileNotFoundError(
+        "CCP4 installation not found. "
+        "Source SBGrid or ensure pointless is on PATH."
+    )
+
+
+def _find_phenix_bin():
+    """Return Path to the Phenix bin directory (phenix_bin/ or build/bin/).
+
+    Tries in order:
+    1. SBGrid with $SBG_PROGRAMS set.
+    2. Standard SBGrid filesystem path under /programs.
+    3. phenix.xtriage on PATH; use its parent directory.
+    """
+    arch = f"{platform.machine()}-{'darwin' if sys.platform == 'darwin' else 'linux'}"
+
+    for phenix_root in (
+        Path(os.environ["SBG_PROGRAMS"]) / arch / "phenix" if os.environ.get("SBG_PROGRAMS") else None,
+        Path("/programs") / arch / "phenix",
+    ):
+        if not (phenix_root and phenix_root.is_dir()):
+            continue
+        candidates = []
+        for d in phenix_root.iterdir():
+            if not d.is_dir():
+                continue
+            parts = re.findall(r"\d+", d.name)
+            if not parts:
+                continue
+            for bin_subdir in ("phenix_bin", "build/bin"):
+                bin_dir = d / bin_subdir
+                if bin_dir.is_dir() and (bin_dir / "phenix.xtriage").is_file():
+                    candidates.append((tuple(int(x) for x in parts), bin_dir))
+                    break
+        if candidates:
+            return max(candidates, key=lambda x: x[0])[1]
+
+    xtriage = shutil.which("phenix.xtriage")
+    if xtriage:
+        return Path(xtriage).parent
+
+    raise FileNotFoundError(
+        "Phenix installation not found. "
+        "Source SBGrid or ensure phenix.xtriage is on PATH."
+    )
+
+
 # TODO: HDF5 image counting is not yet implemented.
 # Eiger master files vary significantly in internal structure across firmware
 # versions and beamlines, and some future formats do not yet exist.  Until a
@@ -555,7 +667,7 @@ class RunPointless(RunBase):
     Aimless run.
     """
 
-    def __init__(self, params, job):
+    def __init__(self, params, job, ccp4_bin):
         """
         Parameters
         ----------
@@ -563,6 +675,8 @@ class RunPointless(RunBase):
             Pipeline parameters from RunProcess.
         job : int
             Sequential job number within the pipeline (e.g. 3, 6, 9).
+        ccp4_bin : Path
+            Path to the CCP4 bin/ directory (from _find_ccp4_bin()).
         """
         self.params      = params
         self.job         = job
@@ -571,6 +685,7 @@ class RunPointless(RunBase):
         self.scaling     = params.get("scaling", "correct")
         self.recycle_xds = params.get("recycle_xds", "false")
         self.pipeline_subdir = Path(params.get("pipeline_subdir"))
+        self.pointless   = Path(ccp4_bin) / "pointless"
 
     def run(self):
         """
@@ -643,7 +758,7 @@ class RunPointless(RunBase):
 
 
         with open(log_path, "w") as fh:
-            subprocess.run(["pointless"], input=stdin, text=True, stdout=fh, stderr=fh)
+            subprocess.run([str(self.pointless)], input=stdin, text=True, stdout=fh, stderr=fh)
 
 
 class RunAimless(RunBase):
@@ -657,7 +772,7 @@ class RunAimless(RunBase):
     user-supplied limits.
     """
 
-    def __init__(self, params, job):
+    def __init__(self, params, job, ccp4_bin):
         """
         Parameters
         ----------
@@ -665,6 +780,8 @@ class RunAimless(RunBase):
             Pipeline parameters from RunProcess.
         job : int
             Sequential job number within the pipeline (e.g. 4, 7, 10).
+        ccp4_bin : Path
+            Path to the CCP4 bin/ directory (from _find_ccp4_bin()).
         """
         self.params          = params
         self.job             = job
@@ -672,6 +789,7 @@ class RunAimless(RunBase):
         self.res_limit       = params.get("res_limit", "cc12")
         self.custom_res      = params.get("custom_res", "false")
         self.pipeline_subdir = Path(params.get("pipeline_subdir"))
+        self.aimless         = Path(ccp4_bin) / "aimless"
 
     def run(self):
         """
@@ -765,7 +883,7 @@ class RunAimless(RunBase):
             )
 
         with open(log_path, "w") as fh:
-            subprocess.run(["aimless"], input=stdin, text=True, stdout=fh, stderr=fh)
+            subprocess.run([str(self.aimless)], input=stdin, text=True, stdout=fh, stderr=fh)
 
 
 class RunRfree(RunBase):
@@ -777,7 +895,7 @@ class RunRfree(RunBase):
     (freerflag COMPLETE).  Amplitude conversion is performed by ctruncate.
     """
 
-    def __init__(self, params, job):
+    def __init__(self, params, job, ccp4_bin):
         """
         Parameters
         ----------
@@ -785,11 +903,19 @@ class RunRfree(RunBase):
             Pipeline parameters from RunProcess.
         job : int
             Sequential job number within the pipeline.
+        ccp4_bin : Path
+            Path to the CCP4 bin/ directory (from _find_ccp4_bin()).
         """
         self.params          = params
         self.job             = job
         self.ref_mtz         = params.get("ref_mtz", "none")
         self.pipeline_subdir = Path(params.get("pipeline_subdir"))
+        ccp4_bin             = Path(ccp4_bin)
+        self.freerflag       = ccp4_bin / "freerflag"
+        self.mtzutils        = ccp4_bin / "mtzutils"
+        self.unique          = ccp4_bin / "unique"
+        self.cad             = ccp4_bin / "cad"
+        self.ctruncate       = ccp4_bin / "ctruncate"
 
     def run(self):
         """
@@ -844,7 +970,7 @@ class RunRfree(RunBase):
             # Fresh R-free flags
             with open(log_path, "w") as fh:
                 subprocess.run(
-                    ["freerflag",
+                    [str(self.freerflag),
                      "HKLIN", aimless_mtz,
                      "HKLOUT", "XDS_ASCII_rfree.mtz"],
                     input="UNIQUE\nEND\n",
@@ -852,7 +978,7 @@ class RunRfree(RunBase):
 
             with open(log_path, "a") as fh:
                 subprocess.run(
-                    ["mtzutils",
+                    [str(self.mtzutils),
                      "HKLIN", "XDS_ASCII_rfree.mtz",
                      "HKLOUT", "XDS_ASCII.mtz"],
                     input="EXCLUDE N(+) N(-)\nEND\n",
@@ -868,7 +994,7 @@ class RunRfree(RunBase):
                 "END\n"
             )
             with open(log_path, "w") as fh:
-                subprocess.run(["unique", "hklout", "unq.mtz"],
+                subprocess.run([str(self.unique), "hklout", "unq.mtz"],
                                input=unique_stdin, text=True, stdout=fh, stderr=fh)
 
             cad_stdin = (
@@ -879,7 +1005,7 @@ class RunRfree(RunBase):
             )
             with open(log_path, "a") as fh:
                 subprocess.run(
-                    ["cad",
+                    [str(self.cad),
                      "HKLIN1", aimless_mtz,
                      "HKLIN2", "unq.mtz",
                      "HKLIN3", str(self.ref_mtz),
@@ -889,7 +1015,7 @@ class RunRfree(RunBase):
 
             with open(log_path, "a") as fh:
                 subprocess.run(
-                    ["freerflag",
+                    [str(self.freerflag),
                      "HKLIN", "XDS_ASCII_uniq.mtz",
                      "HKLOUT", "XDS_ASCII_rfree.mtz"],
                     input="COMPLETE FREE=FreeR_flag\nEND\n",
@@ -897,7 +1023,7 @@ class RunRfree(RunBase):
 
             with open(log_path, "a") as fh:
                 subprocess.run(
-                    ["mtzutils",
+                    [str(self.mtzutils),
                      "HKLIN", "XDS_ASCII_rfree.mtz",
                      "HKLOUT", "XDS_ASCII.mtz"],
                     input="EXCLUDE FUNI SIGFUNI N(+) N(-)\nEND\n",
@@ -907,7 +1033,7 @@ class RunRfree(RunBase):
         with open(log_path, "a") as fh:
             subprocess.run(
                 [
-                    "ctruncate",
+                    str(self.ctruncate),
                     "-mtzin",  "XDS_ASCII.mtz",
                     "-mtzout", "XDS_ASCII_ctruncate.mtz",
                     "-colin",  "/*/*/[IMEAN,SIGIMEAN]",
@@ -927,7 +1053,7 @@ class RunXtriage(RunBase):
     other data pathologies.
     """
 
-    def __init__(self, params, job):
+    def __init__(self, params, job, phenix_bin):
         """
         Parameters
         ----------
@@ -935,10 +1061,13 @@ class RunXtriage(RunBase):
             Pipeline parameters from RunProcess.
         job : int
             Sequential job number within the pipeline.
+        phenix_bin : Path
+            Path to the Phenix bin directory (from _find_phenix_bin()).
         """
         self.params          = params
         self.job             = job
         self.pipeline_subdir = Path(params.get("pipeline_subdir"))
+        self.xtriage         = Path(phenix_bin) / "phenix.xtriage"
 
     def run(self):
         """
@@ -959,7 +1088,7 @@ class RunXtriage(RunBase):
         log_path  = job_dir / f"{self.job}_xtriage.log"
 
         with open(log_path, "w") as fh:
-            subprocess.run(["phenix.xtriage", hkl_input], stdout=fh, stderr=fh)
+            subprocess.run([str(self.xtriage), hkl_input], stdout=fh, stderr=fh)
 
 
 class RunProcess:
@@ -1030,12 +1159,14 @@ class RunProcess:
             job 13  RunXtriage
     """
 
-    XDSSTAT_EXECUTABLE = Path("/programs/x86_64-linux/system/sbgrid_bin/xdsstat")
     MIN_IMAGES         = 180
 
     def __init__(self, params):
-        _xds_dir           = _find_latest_xds_dir(params.get("xds_root"))
-        self.XDS_EXECUTABLE = _xds_dir / "bin" / "xds_par"
+        _xds_dir              = _find_latest_xds_dir(params.get("xds_root"))
+        self.XDS_EXECUTABLE   = _xds_dir / "bin" / "xds_par"
+        self.XDSSTAT_EXECUTABLE = _find_xdsstat()
+        self.CCP4_BIN         = _find_ccp4_bin()
+        self.PHENIX_BIN       = _find_phenix_bin()
         self.params        = params
         self.process_dir   = Path(params.get("process_dir", os.getcwd()))
         self._output_dir   = self.process_dir / "processing"
@@ -1321,16 +1452,16 @@ RunProcess(params).{method}()
         RunXDS(params, job, self.XDS_EXECUTABLE, self.XDSSTAT_EXECUTABLE).__getattribute__(scenario)()
 
     def _pointless(self, job, params):
-        RunPointless(params, job).run()
+        RunPointless(params, job, self.CCP4_BIN).run()
 
     def _aimless(self, job, params):
-        RunAimless(params, job).run()
+        RunAimless(params, job, self.CCP4_BIN).run()
 
     def _rfree(self, job, params):
-        RunRfree(params, job).run()
+        RunRfree(params, job, self.CCP4_BIN).run()
 
     def _xtriage(self, job, params):
-        RunXtriage(params, job).run()
+        RunXtriage(params, job, self.PHENIX_BIN).run()
 
     def _xds_ascii_ok(self, pipeline_subdir, job):
         return (Path(pipeline_subdir) / f"{job}_xds" / "XDS_ASCII.HKL").is_file()

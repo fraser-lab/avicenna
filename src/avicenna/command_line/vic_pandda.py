@@ -41,6 +41,23 @@ def _parse_ground_state_range(range_str):
     return [f"x{i:04d}" for i in range(int(start), int(end) + 1)]
 
 
+def _build_pin_map(sources):
+    pin_map = {}
+    for src in sources:
+        list_file = pathlib.Path(src) / "qrefine_list.txt"
+        if not list_file.is_file():
+            continue
+        for line in list_file.read_text().splitlines():
+            parts = line.strip().split(',')
+            if not parts or not parts[0]:
+                continue
+            full_pin = parts[0]
+            p = full_pin.split('_')
+            if len(p) >= 3:
+                pin_map[full_pin] = '_'.join(p[-3:-1])
+    return pin_map
+
+
 def main():
     try:
         args = parser.parse_args()
@@ -62,6 +79,7 @@ def main():
             no_lr_comp_check=args.no_lr_comp_check,
             log_time_out=args.log_time_out,
             dry_run=args.dry_run,
+            pin_map=_build_pin_map(args.sources),
         ).run()
     except KeyboardInterrupt:
         print("\nInterrupted.")

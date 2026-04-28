@@ -20,7 +20,8 @@ class PanDDAPreparer:
                  ground_state_datasets=None, cpus=32,
                  min_build_datasets=30, max_build_datasets=50,
                  max_new_datasets=1500, high_res_increment=0.05,
-                 no_lr_comp_check=False, log_time_out=0, dry_run=False):
+                 no_lr_comp_check=False, log_time_out=0, dry_run=False,
+                 pin_map=None):
         self.process_dirs          = [pathlib.Path(p).resolve() for p in process_dirs]
         self.pandda_dir            = pathlib.Path.cwd() / "pandda"
         self.prefix                = prefix
@@ -37,6 +38,7 @@ class PanDDAPreparer:
         self.no_lr_comp_check      = no_lr_comp_check
         self.log_time_out          = log_time_out
         self.dry_run               = dry_run
+        self.pin_map               = pin_map or {}
 
     def _scan_qrefine(self, process_dir):
         """Return sorted list of (job_dir, pdb_path, mtz_path) for completed jobs."""
@@ -71,15 +73,20 @@ class PanDDAPreparer:
                 dest.mkdir(exist_ok=True)
                 shutil.copy2(pdb, dest / pdb.name)
                 shutil.copy2(mtz, dest / mtz.name)
-            mapping.append((dataset_name, str(job_dir), tag))
+            pin_code = next(
+                (code for full_pin, code in self.pin_map.items()
+                 if job_dir.name.startswith(full_pin + '_')),
+                job_dir.name
+            )
+            mapping.append((dataset_name, str(job_dir), tag, pin_code))
             idx += 1
         return mapping
 
     def _write_info_csv(self, mapping):
         csv_path = self.pandda_dir / "info.csv"
         with open(csv_path, "w") as fh:
-            for dataset_name, job_dir, _ in mapping:
-                fh.write(f"{dataset_name},{job_dir}\n")
+            for dataset_name, job_dir, _, pin_code in mapping:
+                fh.write(f"{pin_code},{dataset_name},{job_dir}\n")
 
     def _pandda_args(self):
         data_dir = self.pandda_dir / "data"
@@ -144,8 +151,8 @@ class PanDDAPreparer:
 
         if self.dry_run:
             gs_set = set(self.ground_state_datasets)
-            gs = [(name, job) for name, job, tag in mapping if tag in gs_set]
-            lb = [(name, job) for name, job, tag in mapping if tag not in gs_set]
+            gs = [(name, job) for name, job, tag, _ in mapping if tag in gs_set]
+            lb = [(name, job) for name, job, tag, _ in mapping if tag not in gs_set]
             if gs:
                 print(f"\nGround state datasets ({len(gs)}):")
                 for name, job in gs:
