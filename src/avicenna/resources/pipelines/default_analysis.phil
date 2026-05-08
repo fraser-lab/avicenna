@@ -1,0 +1,10 @@
+avicenna {
+  analysis {
+    steps {
+      step {
+        id = pandda1
+        program = pandda
+      }
+    }
+  }
+}

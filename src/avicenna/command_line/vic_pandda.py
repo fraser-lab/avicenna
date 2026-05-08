@@ -3,7 +3,7 @@ import argparse
 import pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "src"))
 from avicenna.pipelines.pandda_pipeline import PanDDAPreparer
-from avicenna.utils.phil import PanDDAPHIL
+from avicenna.utils.phil import AnalysisPHIL
 
 parser = argparse.ArgumentParser(prog="vic.pandda_prepare")
 parser.add_argument("--sources", nargs='+', type=pathlib.Path,
@@ -67,35 +67,42 @@ def _build_pin_map(sources):
 
 
 def _write_pandda_phil(args):
-    p = PanDDAPHIL()
-    lines = ["pandda {", "  input {"]
+    p = AnalysisPHIL()
+    lines = [
+        "analysis {", "  steps {", "    step {",
+        "      id = pandda1", "      program = pandda",
+        "      pandda {", "        input {",
+    ]
     if args.sources:
         sources_str = " ".join(f'"{s.resolve()}"' for s in args.sources)
-        lines.append(f"    sources = {sources_str}")
+        lines.append(f"          sources = {sources_str}")
     if args.reference_pdb:
-        lines.append(f'    reference_pdb = "{args.reference_pdb.resolve()}"')
+        lines.append(f'          reference_pdb = "{args.reference_pdb.resolve()}"')
     if args.reference_mtz:
-        lines.append(f'    reference_mtz = "{args.reference_mtz.resolve()}"')
+        lines.append(f'          reference_mtz = "{args.reference_mtz.resolve()}"')
     lines += [
-        "  }",
-        "  dataset {",
-        f'    prefix = "{args.prefix}"',
-        f"    offset = {args.offset}",
-        f"    suffix = {args.suffix}",
+        "        }",
+        "        dataset {",
+        f'          prefix = "{args.prefix}"',
+        f"          offset = {args.offset}",
+        f"          suffix = {args.suffix}",
     ]
     if args.ground_state_range:
-        lines.append(f'    ground_state_range = "{args.ground_state_range}"')
+        lines.append(f'          ground_state_range = "{args.ground_state_range}"')
     lines += [
-        "  }",
-        "  analyse {",
-        f"    cpus = {args.cpus}",
-        f"    min_build_datasets = {args.min_build}",
-        f"    max_build_datasets = {args.max_build}",
-        f"    max_new_datasets = {args.max_new}",
-        f"    no_lr_comp_check = {args.no_lr_comp_check}",
-        "  }",
-        "  run {",
-        f"    log_time_out = {args.log_time_out}",
+        "        }",
+        "        analyse {",
+        f"          cpus = {args.cpus}",
+        f"          min_build_datasets = {args.min_build}",
+        f"          max_build_datasets = {args.max_build}",
+        f"          max_new_datasets = {args.max_new}",
+        f"          no_lr_comp_check = {args.no_lr_comp_check}",
+        "        }",
+        "        run {",
+        f"          log_time_out = {args.log_time_out}",
+        "        }",
+        "      }",
+        "    }",
         "  }",
         "}",
     ]
@@ -109,7 +116,7 @@ def main():
         args = parser.parse_args()
 
         if args.phil or args.phil_expert_level is not None or args.phil_attrs:
-            PanDDAPHIL()._master.format(PanDDAPHIL()._params).show(
+            AnalysisPHIL()._master.format(AnalysisPHIL()._params).show(
                 out=sys.stdout,
                 attributes_level=2 if args.phil_attrs else 0,
                 expert_level=args.phil_expert_level,

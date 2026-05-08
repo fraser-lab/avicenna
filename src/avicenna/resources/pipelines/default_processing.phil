@@ -1,0 +1,57 @@
+avicenna {
+  processing {
+    steps {
+      step {
+        id = xds1
+        program = xds
+        xds.scenario = initial_indexing
+      }
+      step {
+        id = ptl1
+        program = pointless
+      }
+      step {
+        id = aim1
+        program = aimless
+        aimless.apply_res_cutoff = False
+      }
+      step {
+        id = xds2
+        program = xds
+        xds.scenario = refine_symmetry
+      }
+      step {
+        id = ptl2
+        program = pointless
+      }
+      step {
+        id = aim2
+        program = aimless
+        aimless.apply_res_cutoff = True
+      }
+      step {
+        id = xds3
+        program = xds
+        xds.scenario = refine_symmetry
+        xds.skip_if_no_improvement = True
+      }
+      step {
+        id = ptl3
+        program = pointless
+      }
+      step {
+        id = aim3
+        program = aimless
+        aimless.apply_res_cutoff = True
+      }
+      step {
+        id = rfree1
+        program = rfree
+      }
+      step {
+        id = xtriage1
+        program = xtriage
+      }
+    }
+  }
+}

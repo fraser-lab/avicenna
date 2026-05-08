@@ -1,0 +1,10 @@
+avicenna {
+  refine {
+    steps {
+      step {
+        id = qrefine1
+        program = qrefine
+      }
+    }
+  }
+}
