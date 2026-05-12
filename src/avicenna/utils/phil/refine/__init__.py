@@ -11,7 +11,11 @@ import importlib
 import pkgutil
 from pathlib import Path
 
+import freephil
+
 from avicenna.utils.phil._base import PhilBase
+
+_PIPELINES_DIR = Path(__file__).parents[3] / "resources" / "pipelines"
 
 # ---------------------------------------------------------------------------
 # Fixed sub-pipeline header
@@ -42,6 +46,68 @@ refine
       .short_caption = MR parameter file
       .help = File containing qRefine/MR parameters.
       .expert_level = 0
+    reference_mtz = None
+      .type = path
+      .short_caption = Reference MTZ
+      .help = Reference MTZ dataset for the refinement run.
+      .expert_level = 0
+    reference_pdb = None
+      .type = path
+      .short_caption = Reference PDB
+      .help = Reference coordinate file for molecular replacement.
+      .expert_level = 0
+  }
+  output
+    .short_caption = Output
+    .help = Where refinement results are written.
+  {
+    directory = "."
+      .type = path
+      .short_caption = Output directory
+      .help = Root directory for all refinement output.
+      .expert_level = 0
+    log_folder = None
+      .type = path
+      .short_caption = Log folder
+      .help = Directory for SGE job logs.  Defaults to <directory>/refinement_logs if None.
+      .expert_level = 1
+  }
+  programs
+    .short_caption = Software
+    .help = Software required for the refinement sub-pipeline.  Checked at \
+            CLI invocation before any jobs are submitted.
+  {
+    ccp4
+      .short_caption = CCP4
+      .help = CCP4 suite -- used for MTZ manipulation utilities.
+    {
+      root = None
+        .type = path
+        .short_caption = Installation root
+        .help = CCP4 installation root.  Auto-detected from SBGrid or PATH if None.
+        .expert_level = 1
+      version = latest
+        .type = str
+        .short_caption = Version
+        .help = CCP4 version to use (e.g. "9.0", "7.0").  "latest" selects \
+                the newest installed version.
+        .expert_level = 0
+    }
+    phenix
+      .short_caption = Phenix
+      .help = Phenix suite -- used for phenix.phaser (MR) and phenix.refine.
+    {
+      root = None
+        .type = path
+        .short_caption = Installation root
+        .help = Phenix installation root.  Auto-detected from SBGrid or PATH if None.
+        .expert_level = 1
+      version = latest
+        .type = str
+        .short_caption = Version
+        .help = Phenix version to use.  "latest" selects the newest installed version.
+        .expert_level = 0
+    }
   }
   steps
     .short_caption = Pipeline steps
@@ -63,6 +129,16 @@ _STEP_HEADER = """\
         .short_caption = Program
         .help = Which program to run at this step.
         .expert_level = 0
+      run_if_succeeded = None
+        .type = str
+        .short_caption = Run if step succeeded
+        .help = Step ID that must have completed successfully for this step to run.  Skipped otherwise.
+        .expert_level = 1
+      run_if_failed = None
+        .type = str
+        .short_caption = Run if step failed
+        .help = Step ID that must have failed or been skipped for this step to run.  Skipped otherwise.
+        .expert_level = 1
 """
 
 _FOOTER = """\
@@ -112,3 +188,21 @@ PHIL_DEF = _build_refine_phil()
 class RefinePHIL(PhilBase):
     """PHIL parameters for the refinement sub-pipeline (vic.refine)."""
     phil_def = PHIL_DEF
+    _resource_file = "default_refine.phil"
+
+    def __init__(self, load_defaults: bool = True):
+        self._master = freephil.parse(self.phil_def)
+        if load_defaults:
+            resource = _PIPELINES_DIR / self._resource_file
+            self._default_sources = [freephil.parse(resource.read_text())] if resource.exists() else []
+        else:
+            self._default_sources = []
+        self._params = self._master.fetch(sources=self._default_sources).extract()
+
+    def adopt_phil_string(self, phil_string: str):
+        user_phil = freephil.parse(phil_string)
+        self._params = self._master.fetch(sources=[*self._default_sources, user_phil]).extract()
+
+    def from_file(self, path: str):
+        with open(path) as fh:
+            self.adopt_phil_string(fh.read())

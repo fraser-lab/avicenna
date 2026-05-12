@@ -1,0 +1,44 @@
+software_registry
+  .help = "Registry of crystallographic software packages known to Avicenna. Power users may extend this registry by placing a software_registry.phil file in ~/.avicenna/ or the current working directory."
+{
+  suite
+    .multiple = True
+    .help = "One installable software suite or standalone program."
+  {
+    name = None
+      .type = str
+      .help = "Unique identifier used as the key in programs{} scopes and in output messages (e.g. ccp4, xds)."
+
+    sbgrid_name = None
+      .type = str
+      .help = "Subdirectory name under /programs/{arch}/ on SBGrid systems. Defaults to the value of name when None."
+
+    sentinel = None
+      .type = str
+      .help = "Relative path from the version directory to a file whose presence proves the installation is usable (e.g. bin/pointless, bin/xds_par)."
+
+    subdir_prefix = None
+      .type = str
+      .help = "If set, the finder descends into the first subdirectory whose name starts with this string before looking for the sentinel (e.g. ccp4- for CCP4)."
+
+    search_subdirs = None
+      .type = strings
+      .help = "If set, the finder tries each listed subdir name in order and looks for the sentinel within it (e.g. Phenix uses phenix_bin or build/bin)."
+
+    path_fallback = None
+      .type = strings
+      .help = "Binary names to attempt via PATH (shutil.which) as a last resort, tried in order."
+
+    version_pinnable = False
+      .type = bool
+      .help = "True if the user can request a specific version prefix in the programs{} scope. License-locked software such as XDS should be False."
+
+    version_style = *numeric date
+      .type = choice
+      .help = "How version directories are named on SBGrid. numeric means dotted version numbers; date means 8-digit dates (20231015)."
+
+    companion = None
+      .type = str
+      .help = "Name of another suite entry that is always checked alongside this one (e.g. xdsstat is a companion of xds)."
+  }
+}

@@ -1,57 +1,126 @@
-avicenna {
-  processing {
-    steps {
-      step {
-        id = xds1
-        program = xds
-        xds.scenario = initial_indexing
+processing {
+  input {
+    data = None
+    reference_mtz = None
+  }
+  output {
+    directory = "."
+    log_folder = None
+  }
+  known_symmetry {
+    enabled = False
+    isoform {
+      id = isoform_1
+      space_group = None
+      space_group_number = None
+      unit_cell = None
+      reference_hkl = None
+    }
+  }
+  steps {
+    step {
+      id = xds1
+      program = xds
+      xds {
+        generate_inp = True
+        recycle_geometry = False
+        update_symmetry = False
+        skip_if_no_improvement = False
+        ncpu = 8
+        xds_inp = None
+        detector_edge = 0.8
+        indexing_images = first_half
+        try_alt_sym = all
+        no_symmetry = False
+        res_limit = cc12
+        cleanup = partial
+        refine_cell_integrate = both
+        ref_hkl = None
+        ref_mtz = None
       }
-      step {
-        id = ptl1
-        program = pointless
+    }
+    step {
+      id = ptl1
+      program = pointless
+    }
+    step {
+      id = aim1
+      program = aimless
+      aimless {
+        apply_res_cutoff = False
       }
-      step {
-        id = aim1
-        program = aimless
-        aimless.apply_res_cutoff = False
+    }
+    step {
+      id = xds2
+      program = xds
+      xds {
+        generate_inp = False
+        recycle_geometry = True
+        update_symmetry = False
+        skip_if_no_improvement = False
+        ncpu = 8
+        xds_inp = None
+        detector_edge = 0.8
+        indexing_images = first_half
+        try_alt_sym = all
+        no_symmetry = False
+        res_limit = cc12
+        cleanup = partial
+        refine_cell_integrate = both
+        ref_hkl = None
+        ref_mtz = None
       }
-      step {
-        id = xds2
-        program = xds
-        xds.scenario = refine_symmetry
+    }
+    step {
+      id = ptl2
+      program = pointless
+    }
+    step {
+      id = aim2
+      program = aimless
+      aimless {
+        apply_res_cutoff = True
       }
-      step {
-        id = ptl2
-        program = pointless
+    }
+    step {
+      id = xds3
+      program = xds
+      xds {
+        generate_inp = False
+        recycle_geometry = True
+        update_symmetry = True
+        skip_if_no_improvement = True
+        ncpu = 8
+        xds_inp = None
+        detector_edge = 0.8
+        indexing_images = first_half
+        try_alt_sym = all
+        no_symmetry = False
+        res_limit = cc12
+        cleanup = partial
+        refine_cell_integrate = both
+        ref_hkl = None
+        ref_mtz = None
       }
-      step {
-        id = aim2
-        program = aimless
-        aimless.apply_res_cutoff = True
+    }
+    step {
+      id = ptl3
+      program = pointless
+    }
+    step {
+      id = aim3
+      program = aimless
+      aimless {
+        apply_res_cutoff = True
       }
-      step {
-        id = xds3
-        program = xds
-        xds.scenario = refine_symmetry
-        xds.skip_if_no_improvement = True
-      }
-      step {
-        id = ptl3
-        program = pointless
-      }
-      step {
-        id = aim3
-        program = aimless
-        aimless.apply_res_cutoff = True
-      }
-      step {
-        id = rfree1
-        program = rfree
-      }
-      step {
-        id = xtriage1
-        program = xtriage
-      }
+    }
+    step {
+      id = rfree1
+      program = rfree
+    }
+    step {
+      id = xtriage1
+      program = xtriage
     }
   }
 }

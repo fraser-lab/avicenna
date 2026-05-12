@@ -1,9 +1,93 @@
-avicenna {
-  refine {
-    steps {
-      step {
-        id = qrefine1
-        program = qrefine
+refine {
+  input {
+    output_dir = "."
+    dataset_list = "qrefine_list.txt"
+    params_file = "qrefine_input_parameters.txt"
+    reference_mtz = None
+    reference_pdb = None
+  }
+  output {
+    directory = "."
+    log_folder = None
+  }
+  steps {
+    step {
+      id = rigid_body1
+      program = phenix.refine
+    }
+    step {
+      id = phaser1
+      program = phenix.phaser
+      phaser {
+        mr_cutoff = 0.45
+        mr_copies = 1
+        mr_mw = 0.0
+        mr_seq_id = 90.0
+        mr_tncs = False
+        monomer = False
+        mr_try_monomer = False
+        monomer_rfree_cutoff = 0.4
+        mr_copies_monomer = 1
+        mr_mw_monomer = 0.0
+      }
+    }
+    step {
+      id = jelly1
+      program = refmac5
+      refmac {
+        ncycles = 4
+        jelly = True
+        monomer = False
+      }
+    }
+    step {
+      id = refmac5_1
+      program = refmac5
+      refmac {
+        ncycles = 8
+        jelly = False
+        monomer = False
+      }
+    }
+    step {
+      id = phaser_mono1
+      program = phenix.phaser
+      phaser {
+        mr_cutoff = 0.45
+        mr_copies = 1
+        mr_mw = 0.0
+        mr_seq_id = 90.0
+        mr_tncs = False
+        monomer = True
+        mr_try_monomer = False
+        monomer_rfree_cutoff = 0.4
+        mr_copies_monomer = 1
+        mr_mw_monomer = 0.0
+      }
+    }
+    step {
+      id = jelly_mono1
+      program = refmac5
+      refmac {
+        ncycles = 4
+        jelly = True
+        monomer = True
+      }
+    }
+    step {
+      id = refmac5_mono1
+      program = refmac5
+      refmac {
+        ncycles = 8
+        jelly = False
+        monomer = True
+      }
+    }
+    step {
+      id = fill1
+      program = fill
+      fill {
+        enabled = True
       }
     }
   }

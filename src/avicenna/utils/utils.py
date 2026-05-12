@@ -240,16 +240,19 @@ class ProcessingScraper(ScraperBase):
         """
         p = pathlib.Path(pipeline_subdir)
 
-        # Condition 1: XDS produced XDS_ASCII.HKL (8_xds for forced path, 5_xds for normal)
-        hkl_ok = any((p / d / 'XDS_ASCII.HKL').is_file() for d in ('8_xds', '5_xds'))
+        # Condition 1: XDS produced XDS_ASCII.HKL in any *_xds step directory
+        hkl_ok = any(
+            (d / 'XDS_ASCII.HKL').is_file()
+            for d in p.iterdir()
+            if d.is_dir() and d.name.endswith('_xds')
+        )
         if not hkl_ok:
             xds_dirs = sorted(
                 (d for d in p.iterdir() if d.is_dir() and d.name.endswith('_xds')),
                 key=lambda d: int(d.name.split('_')[0]), reverse=True,
             )
             if xds_dirs:
-                job_num = xds_dirs[0].name.split('_')[0]
-                log = xds_dirs[0] / f'{job_num}_xds.log'
+                log = xds_dirs[0] / f'{xds_dirs[0].name}.log'
             else:
                 log = None
             excerpt = self._find_error(self._tail(log)) if log and log.is_file() else None
@@ -257,14 +260,20 @@ class ProcessingScraper(ScraperBase):
             return False, f"{label}: {excerpt or '(no error found in log)'}"
 
         # Condition 2: rfree chain produced XDS_ASCII_ctruncate.mtz
-        if not (p / '11_rfree' / 'XDS_ASCII_ctruncate.mtz').is_file():
-            rfree_dir = p / '11_rfree'
-            logs = sorted(rfree_dir.glob('*_rfree.log')) if rfree_dir.is_dir() else []
+        rfree_dirs = [d for d in p.iterdir() if d.is_dir() and d.name.endswith('_rfree')]
+        rfree_ok = any((d / 'XDS_ASCII_ctruncate.mtz').is_file() for d in rfree_dirs)
+        if not rfree_ok:
+            rfree_dir = rfree_dirs[0] if rfree_dirs else None
+            logs = sorted(rfree_dir.glob('*_rfree.log')) if rfree_dir else []
             excerpt = self._find_error(self._tail(logs[0])) if logs else None
-            return False, f"11_rfree: {excerpt or '(no error found in log)'}"
+            label = rfree_dir.name if rfree_dir else 'rfree'
+            return False, f"{label}: {excerpt or '(no error found in log)'}"
 
         # Condition 3: xtriage directory was created
-        if not (p / '13_xtriage').is_dir():
+        xtriage_exists = any(
+            d.is_dir() and d.name.endswith('_xtriage') for d in p.iterdir()
+        )
+        if not xtriage_exists:
             step_dirs = sorted(
                 (d for d in p.iterdir() if d.is_dir() and d.name[0].isdigit()),
                 key=lambda d: int(d.name.split('_')[0]), reverse=True,
@@ -285,7 +294,10 @@ class ProcessingScraper(ScraperBase):
         no subdir succeeded and there is no single candidate to diagnose.
         """
         # Flat case: job completed directly under index_path
-        if os.path.isdir(os.path.join(index_path, '13_xtriage')):
+        if any(
+            d.endswith('_xtriage') and os.path.isdir(os.path.join(index_path, d))
+            for d in os.listdir(index_path)
+        ):
             logs = []
             for d in os.listdir(index_path):
                 if d.endswith('_aimless') and os.path.isdir(os.path.join(index_path, d)):
@@ -307,9 +319,19 @@ class ProcessingScraper(ScraperBase):
         )
         for force_dir in force_dirs:
             force_path = os.path.join(index_path, force_dir)
-            if os.path.isdir(os.path.join(force_path, '13_xtriage')):
-                log = os.path.join(force_path, '10_aimless', '10_aimless.log')
-                return (log if os.path.isfile(log) else None), force_path
+            if any(
+                d.endswith('_xtriage') and os.path.isdir(os.path.join(force_path, d))
+                for d in os.listdir(force_path)
+            ):
+                # Find the highest-numbered aimless log in this force dir
+                aimless_logs = sorted(
+                    [(int(d.split('_')[0]), os.path.join(force_path, d, f'{d}.log'))
+                     for d in os.listdir(force_path)
+                     if d.endswith('_aimless') and os.path.isdir(os.path.join(force_path, d))],
+                    key=lambda x: x[0],
+                )
+                log = aimless_logs[-1][1] if aimless_logs else None
+                return (log if log and os.path.isfile(log) else None), force_path
 
         # No completed job found; flat case can still be diagnosed, force case cannot
         return None, (None if force_dirs else index_path)
@@ -1321,10 +1343,10 @@ class QRefineWriter:
 
         for mtz in sorted(self.process_dir.rglob('XDS_ASCII_ctruncate.mtz')):
             rel = mtz.relative_to(self.process_dir).parts
-            if len(rel) == 6 and rel[0] == 'processing' and rel[4] == '11_rfree':
+            if len(rel) == 6 and rel[0] == 'processing' and rel[4].endswith('_rfree'):
                 pin, crystal_dir, index_dir = rel[1], rel[2], rel[3]
                 integration = 'integration not forced'
-            elif len(rel) == 7 and rel[0] == 'processing' and rel[4].endswith('_force') and rel[5] == '11_rfree':
+            elif len(rel) == 7 and rel[0] == 'processing' and rel[4].endswith('_force') and rel[5].endswith('_rfree'):
                 pin, crystal_dir, index_dir = rel[1], rel[2], rel[3]
                 force_base = rel[4][:-len('_force')]          # e.g. '1_P43212'
                 prefix, sg = force_base.split('_', 1)

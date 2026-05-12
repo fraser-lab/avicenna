@@ -1,4 +1,9 @@
-"""PanDDA event-map analysis backend for the analysis sub-pipeline."""
+"""PanDDA event-map analysis backend for the analysis sub-pipeline.
+
+Supports pandda.analyse (PanDDA 1, bundled with CCP4 7.0) and
+pandda2.analyse (PanDDA 2, standalone install).  Select with the
+``analyser`` parameter in the step scope.
+"""
 
 SCOPE_NAME = "pandda"
 
@@ -8,6 +13,11 @@ pandda
   .short_caption = PanDDA Parameters
   .help = Parameters for the PanDDA event-map analysis step.
 {
+  analyser = *pandda pandda2
+    .type = choice
+    .short_caption = PanDDA version
+    .help = Which PanDDA program to run: pandda (pandda.analyse, requires CCP4 7.0) or pandda2 (pandda2.analyse, standalone install).
+    .expert_level = 0
   input
     .short_caption = Input
     .help = Source directories and reference structures.
@@ -15,8 +25,7 @@ pandda
     sources = None
       .type = strings
       .short_caption = Source directories
-      .help = One or more directories of completed qRefine jobs to \
-              collect into the panDDA dataset.
+      .help = One or more directories of completed qRefine jobs to collect into the panDDA dataset.
       .expert_level = 0
     reference_pdb = None
       .type = path
@@ -36,7 +45,7 @@ pandda
     prefix = "FRS"
       .type = str
       .short_caption = Dataset prefix
-      .help = Prefix applied to panDDA dataset names (e.g. FRS -> FRS-x0001).
+      .help = Prefix applied to panDDA dataset names (e.g. FRS -> FRS_x0001).
       .expert_level = 0
     offset = 0
       .type = int
@@ -56,12 +65,12 @@ pandda
   }
   analyse
     .short_caption = pandda.analyse options
-    .help = Resource and quality parameters passed to pandda.analyse.
+    .help = Resource and quality parameters passed to pandda.analyse or pandda2.analyse.
   {
     cpus = 32
       .type = int
       .short_caption = CPUs
-      .help = Number of CPUs for pandda.analyse.
+      .help = Number of CPUs.
       .expert_level = 1
     min_build_datasets = 30
       .type = int
@@ -81,7 +90,7 @@ pandda
     no_lr_comp_check = False
       .type = bool
       .short_caption = Skip low-res completeness check
-      .help = Disable the low-resolution completeness check in pandda.analyse.
+      .help = Disable the low-resolution completeness check.
       .expert_level = 2
   }
   run
@@ -91,10 +100,84 @@ pandda
     log_time_out = 0
       .type = int
       .short_caption = Log timeout (minutes)
-      .help = Stop waiting for the pandda log after this many minutes \
-              (0 = no timeout).
+      .help = Stop waiting for the pandda log after this many minutes (0 = no timeout).
+      .expert_level = 1
+    dry_run = False
+      .type = bool
+      .short_caption = Dry run
+      .help = Prepare directories and write scripts without running pandda.
       .expert_level = 1
   }
 }
 """,
 }
+
+
+# ---------------------------------------------------------------------------
+# Step execution
+# ---------------------------------------------------------------------------
+
+def _run_pandda(step, ctx):
+    """Run pandda.analyse via PanDDAPreparer."""
+    from avicenna.pipelines.pandda_pipeline import PanDDAPreparer
+
+    p = step.pandda
+    sources = list(p.input.sources or [])
+    if not sources:
+        return {"status": "error", "fatal": True,
+                "message": "pandda: input.sources is empty"}
+
+    ground_state = []
+    if p.dataset.ground_state_range:
+        try:
+            lo, hi = (int(x) for x in p.dataset.ground_state_range.split("-"))
+            ground_state = list(range(lo, hi + 1))
+        except (ValueError, AttributeError):
+            pass
+
+    preparer = PanDDAPreparer(
+        process_dirs=sources,
+        prefix=p.dataset.prefix,
+        offset=p.dataset.offset,
+        suffix=p.dataset.suffix,
+        reference_pdb=p.input.reference_pdb,
+        reference_mtz=p.input.reference_mtz,
+        ground_state_datasets=ground_state,
+        cpus=p.analyse.cpus,
+        min_build_datasets=p.analyse.min_build_datasets,
+        max_build_datasets=p.analyse.max_build_datasets,
+        max_new_datasets=p.analyse.max_new_datasets,
+        no_lr_comp_check=p.analyse.no_lr_comp_check,
+        log_time_out=p.run.log_time_out,
+        dry_run=p.run.dry_run,
+    )
+    preparer.run()
+    return {"status": "completed", "message": "pandda: pandda.analyse finished"}
+
+
+def _run_pandda2(step, ctx):
+    """Run pandda2.analyse.
+
+    pandda2.analyse has a different CLI from pandda.analyse.
+    This handler is a placeholder; parameter mapping needs verification
+    against the installed pandda2 version before use.
+    """
+    raise NotImplementedError(
+        "pandda2.analyse support is not yet implemented. "
+        "Run pandda2.analyse manually or set analyser=pandda."
+    )
+
+
+_HANDLERS = {
+    "pandda":  _run_pandda,
+    "pandda2": _run_pandda2,
+}
+
+
+def run_step(step, ctx):
+    analyser = step.pandda.analyser
+    handler  = _HANDLERS.get(analyser)
+    if handler is None:
+        return {"status": "error", "fatal": True,
+                "message": f"pandda: unknown analyser '{analyser}'"}
+    return handler(step, ctx)

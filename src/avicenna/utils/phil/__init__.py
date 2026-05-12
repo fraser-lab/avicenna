@@ -95,11 +95,15 @@ _PIPELINES_DIR = Path(__file__).parent.parent.parent / "resources" / "pipelines"
 
 def _load_default_phils() -> list:
     """Parse all *.phil files from resources/pipelines/ and return a list of
-    freephil scope objects suitable for passing to master.fetch(sources=...)."""
+    freephil scope objects suitable for passing to master.fetch(sources=...).
+
+    Resource files use sub-pipeline scope (e.g. ``processing { steps { } }``).
+    They are wrapped in ``avicenna { }`` here so they match the master scope."""
     sources = []
     if _PIPELINES_DIR.is_dir():
         for phil_file in sorted(_PIPELINES_DIR.glob("*.phil")):
-            sources.append(freephil.parse(phil_file.read_text()))
+            content = phil_file.read_text()
+            sources.append(freephil.parse(f"avicenna {{\n{content}\n}}\n"))
     return sources
 
 # ---------------------------------------------------------------------------

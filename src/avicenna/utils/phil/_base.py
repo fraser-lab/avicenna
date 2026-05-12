@@ -1,6 +1,14 @@
 """PhilBase: abstract base class for all Avicenna PHIL parameter objects."""
 
+import re
 import freephil
+
+
+def _simplify_choices(s: str) -> str:
+    """Collapse freephil choice params from 'word *selected word' to 'selected'."""
+    s = re.sub(r'[ \t]*\\\n[ \t]*', ' ', s)  # join explicit continuation lines first
+    # Use [ \t] (not \s) so the pattern never crosses a newline into the next param
+    return re.sub(r'(=[ \t]*)(?:\w+[ \t]+)*\*(\w+)(?:[ \t]+\w+)*', r'\1\2', s)
 
 
 class PhilBase:
@@ -37,7 +45,8 @@ class PhilBase:
     def adopt_phil_string(self, phil_string: str):
         """Merge a PHIL-formatted string into the current params."""
         user_phil = freephil.parse(phil_string)
-        self._params = self._master.fetch(sources=[user_phil]).extract()
+        current_phil = freephil.parse(self.as_phil_string())
+        self._params = self._master.fetch(sources=[current_phil, user_phil]).extract()
 
     def from_file(self, path: str):
         """Read a .phil file and merge it into the current params."""
@@ -79,11 +88,14 @@ class PhilBase:
         return self._master.format(self._params).as_str()
 
     def diff_phil_string(self) -> str:
-        """Return only parameters that differ from their defaults."""
+        """Return only parameters that differ from their defaults.
+
+        Choice parameters are rendered as single selected values rather than
+        the full ``*selected other1 other2`` freephil notation."""
         diff = self._master.fetch_diff(
             sources=[freephil.parse(self.as_phil_string())],
         )
-        return diff.as_str()
+        return _simplify_choices(diff.as_str())
 
     def show(self, attributes_level: int = 0):
         """Print the current params (attributes_level controls annotation verbosity)."""

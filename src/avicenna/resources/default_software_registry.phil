@@ -1,0 +1,56 @@
+software_registry {
+
+  suite {
+    name           = xds
+    sbgrid_name    = xds
+    sentinel       = bin/xds_par
+    path_fallback  = xds_par
+    version_pinnable = False
+    version_style  = date
+    companion      = xdsstat
+  }
+
+  suite {
+    name           = xdsstat
+    sbgrid_name    = xdsstat
+    sentinel       = xdsstat
+    path_fallback  = xdsstat
+    version_pinnable = False
+    version_style  = date
+  }
+
+  suite {
+    name           = ccp4
+    sbgrid_name    = ccp4
+    sentinel       = bin/pointless
+    subdir_prefix  = ccp4-
+    path_fallback  = pointless
+    version_pinnable = True
+    version_style  = numeric
+  }
+
+  suite {
+    name           = phenix
+    sbgrid_name    = phenix
+    sentinel       = phenix.xtriage
+    search_subdirs = phenix_bin build/bin
+    path_fallback  = phenix.xtriage
+    version_pinnable = True
+    version_style  = numeric
+  }
+
+  suite {
+    name           = pandda
+    sentinel       = pandda.analyse
+    path_fallback  = pandda.analyse
+    version_pinnable = False
+  }
+
+  suite {
+    name           = pandda2
+    sentinel       = pandda2.analyse
+    path_fallback  = pandda2.analyse
+    version_pinnable = False
+  }
+
+}

@@ -1,9 +1,39 @@
-avicenna {
-  analysis {
-    steps {
-      step {
-        id = pandda1
-        program = pandda
+analysis {
+  input {
+    data_directory = None
+  }
+  output {
+    directory = "."
+    log_folder = None
+  }
+  steps {
+    step {
+      id = pandda1
+      program = pandda
+      pandda {
+        analyser = pandda
+        input {
+          sources = None
+          reference_pdb = None
+          reference_mtz = None
+        }
+        dataset {
+          prefix = "FRS"
+          offset = 0
+          suffix = hoh
+          ground_state_range = None
+        }
+        analyse {
+          cpus = 32
+          min_build_datasets = 30
+          max_build_datasets = 50
+          max_new_datasets = 1500
+          no_lr_comp_check = False
+        }
+        run {
+          log_time_out = 0
+          dry_run = False
+        }
       }
     }
   }

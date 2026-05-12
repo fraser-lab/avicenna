@@ -10,21 +10,26 @@ from importlib.metadata import version, PackageNotFoundError
 sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "src"))
 from avicenna.utils.utils import DataFinder, ParamWriter, Watcher, ProcessingScraper, ProcessingFilter
 from avicenna.pipelines.proc_pipeline import RunProcess
-from avicenna.utils.phil import ProcessingPHIL
+from avicenna.utils.phil import ProcessingPHIL, AvicennaPHIL
+from avicenna.utils.software import check_programs
 
 try:
     _version = version("avicenna")
 except PackageNotFoundError:
     _version = "unknown"
 
+_DEFAULT_PHIL = "processing.phil"
+
 parser = argparse.ArgumentParser(prog="vic.process")
 parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {_version}")
+parser.add_argument("--settings", type=pathlib.Path, metavar="FILE",
+                    help=f"PHIL settings file (default: auto-load {_DEFAULT_PHIL} if present)")
 parser.add_argument("-d", "--data", type=pathlib.Path, nargs="+", help="Path(s) to data; each should have the format <synchrotron>_<date_YYYYMMDD>_transfer")
 parser.add_argument("-p", "--pinlist", type=str, help="Filename for pin list file, typically pin_list.txt")
 parser.add_argument("-x", "--xdsparams", type=str, help="Filename for XDS param file, usually xds_input_parameters.txt")
 parser.add_argument("--bash", action="store_true", help="Run the bash scripts instead of the Python-based processing pipeline")
 parser.add_argument("-o", "--output", type=pathlib.Path, default=pathlib.Path(os.curdir), help="Path to output folder (default: current directory)")
-parser.add_argument("--dry_run", action="store_true", help="Create pin_list.txt and avicenna.phil without submitting jobs")
+parser.add_argument("--dry_run", action="store_true", help=f"Create pin_list.txt and {_DEFAULT_PHIL} without submitting jobs")
 parser.add_argument("--silent",    action="store_true", help="Submit jobs without tailing the log")
 parser.add_argument("--no_filter", action="store_true", help="Skip quality filter when writing qrefine_list.txt; write all completed results")
 parser.add_argument("--xds_root", type=pathlib.Path, help="Path to the XDS install folder, default is an SBGrid install (/programs/<OS>/xds)")
@@ -35,6 +40,14 @@ _phil_group.add_argument("-e", dest="phil_expert_level", type=int, metavar="LEVE
                          help="Print processing PHIL parameters up to expert level LEVEL and exit")
 parser.add_argument("-a", dest="phil_attrs", action="store_true",
                     help="Show PHIL parameter attributes (use with -c or -e)")
+
+
+def _apply_phil_file(phil_obj, path: pathlib.Path):
+    try:
+        phil_obj.from_file(str(path))
+        print(f"Loaded settings from {path}")
+    except RuntimeError as e:
+        sys.exit(f"ERROR: Invalid PHIL in {path}:\n  {e}")
 
 
 XDS_PARAM_DEFAULTS = {
@@ -86,12 +99,23 @@ def main():
         args = parser.parse_args()
 
         if args.phil or args.phil_expert_level is not None or args.phil_attrs:
-            ProcessingPHIL()._master.format(ProcessingPHIL()._params).show(
+            av = AvicennaPHIL()
+            av._master.format(av._params).show(
                 out=sys.stdout,
                 attributes_level=2 if args.phil_attrs else 0,
                 expert_level=args.phil_expert_level,
             )
             sys.exit(0)
+
+        phil = ProcessingPHIL()
+        if args.settings is not None:
+            if not args.settings.exists():
+                parser.error(f"Settings file not found: {args.settings}")
+            _apply_phil_file(phil, args.settings)
+        elif pathlib.Path(_DEFAULT_PHIL).exists():
+            _apply_phil_file(phil, pathlib.Path(_DEFAULT_PHIL))
+
+        check_programs(phil._params.processing.programs)
 
         if not args.pinlist and not args.data:
             parser.error("either -d/--data or -p/--pinlist must be provided")
@@ -101,19 +125,26 @@ def main():
                 parser.error("--dry_run is incompatible with --pinlist and --xdsparams")
             if not args.data:
                 parser.error("--dry_run requires -d/--data")
-            for fname in ("pin_list.txt", "avicenna.phil"):
+            for fname in ("pin_list.txt", _DEFAULT_PHIL):
                 if os.path.isfile(fname):
                     os.rename(fname, fname + ".bak")
                     print(f"Backed up {fname} -> {fname}.bak")
             _, _, data_path = DataFinder(paths=args.data).collect()
-            p = ProcessingPHIL()
             data_str = " ".join(f'"{d}"' for d in args.data)
-            p.adopt_phil_string(f"processing.input.data = {data_str}")
-            p.adopt_phil_string('processing.input.pinlist = "pin_list.txt"')
             output_str = str(pathlib.Path(args.output).resolve())
-            p.adopt_phil_string(f'processing.output.directory = "{output_str}"')
-            p.to_file("avicenna.phil")
-            print("Written: avicenna.phil")
+            phil.adopt_phil_string(f"""\
+processing {{
+  input {{
+    data = {data_str}
+    pinlist = "pin_list.txt"
+  }}
+  output {{
+    directory = "{output_str}"
+  }}
+}}""")
+            with open(_DEFAULT_PHIL, "w") as _f:
+                _f.write(phil.diff_phil_string())
+            print(f"Written: {_DEFAULT_PHIL}")
             print("Dry run complete.")
             sys.exit(0)
 
