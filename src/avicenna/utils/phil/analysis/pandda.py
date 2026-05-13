@@ -119,7 +119,7 @@ pandda
 
 def _run_pandda(step, ctx):
     """Run pandda.analyse via PanDDAPreparer."""
-    from avicenna.pipelines.pandda_pipeline import PanDDAPreparer
+    from avicenna.pipelines.legacy.pandda_pipeline import PanDDAPreparer
 
     p = step.pandda
     sources = list(p.input.sources or [])

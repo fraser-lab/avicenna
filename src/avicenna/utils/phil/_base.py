@@ -87,6 +87,16 @@ class PhilBase:
         """Return the current params as a PHIL-formatted string."""
         return self._master.format(self._params).as_str()
 
+    def full_phil_string(self) -> str:
+        """Return all parameters as a compact PHIL string matching default_*.phil style.
+
+        Within ``step {}`` blocks only the sub-scope matching ``step.program``
+        is emitted; step-level None params are omitted; choice params are
+        rendered as single selected values rather than freephil's
+        ``*selected other1 other2`` notation."""
+        from avicenna.utils.phil._serialize import compact_phil_string
+        return compact_phil_string(self)
+
     def diff_phil_string(self) -> str:
         """Return only parameters that differ from their defaults.
 

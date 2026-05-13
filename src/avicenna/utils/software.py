@@ -242,6 +242,42 @@ def find_pandda2(root=None) -> tuple:
 
 
 # ---------------------------------------------------------------------------
+# Setup-script helpers (for compute-node worker scripts)
+# ---------------------------------------------------------------------------
+
+def suite_setup_sources(suite_bin_map: dict) -> tuple:
+    """Return ``(sh_sources, csh_sources)`` for suites that declare setup scripts.
+
+    Parameters
+    ----------
+    suite_bin_map : dict
+        ``{suite_name: bin_dir}`` for each suite whose bin_dir is already known.
+
+    Returns
+    -------
+    tuple[list[Path], list[Path]]
+        Two lists of existing setup-script paths, one for sh/bash and one for
+        csh/tcsh.  Only paths that actually exist on disk are included.
+    """
+    registry = _registry_by_name()
+    sh_sources, csh_sources = [], []
+    for name, bin_dir in suite_bin_map.items():
+        entry = registry.get(name)
+        if entry is None:
+            continue
+        bin_dir = Path(bin_dir)
+        if entry.setup_sh:
+            p = bin_dir / entry.setup_sh
+            if p.exists():
+                sh_sources.append(p)
+        if entry.setup_csh:
+            p = bin_dir / entry.setup_csh
+            if p.exists():
+                csh_sources.append(p)
+    return sh_sources, csh_sources
+
+
+# ---------------------------------------------------------------------------
 # Pre-flight checker
 # ---------------------------------------------------------------------------
 

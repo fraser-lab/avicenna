@@ -19,10 +19,11 @@ processing {
   }
   steps {
     step {
-      id = xds1
+      id = 1_xds
       program = xds
       xds {
         generate_inp = True
+        try_forced_indexing = True
         recycle_geometry = False
         update_symmetry = False
         skip_if_no_improvement = False
@@ -40,21 +41,22 @@ processing {
       }
     }
     step {
-      id = ptl1
+      id = 2_pointless
       program = pointless
     }
     step {
-      id = aim1
+      id = 3_aimless
       program = aimless
       aimless {
         apply_res_cutoff = False
       }
     }
     step {
-      id = xds2
+      id = 4_xds
       program = xds
       xds {
         generate_inp = False
+        try_forced_indexing = True
         recycle_geometry = True
         update_symmetry = False
         skip_if_no_improvement = False
@@ -72,21 +74,22 @@ processing {
       }
     }
     step {
-      id = ptl2
+      id = 5_pointless
       program = pointless
     }
     step {
-      id = aim2
+      id = 6_aimless
       program = aimless
       aimless {
         apply_res_cutoff = True
       }
     }
     step {
-      id = xds3
+      id = 7_xds
       program = xds
       xds {
         generate_inp = False
+        try_forced_indexing = True
         recycle_geometry = True
         update_symmetry = True
         skip_if_no_improvement = True
@@ -104,22 +107,25 @@ processing {
       }
     }
     step {
-      id = ptl3
+      id = 8_pointless
       program = pointless
+      pointless {
+        enforce_spacegroup = True
+      }
     }
     step {
-      id = aim3
+      id = 9_aimless
       program = aimless
       aimless {
         apply_res_cutoff = True
       }
     }
     step {
-      id = rfree1
+      id = 10_rfree
       program = rfree
     }
     step {
-      id = xtriage1
+      id = 11_xtriage
       program = xtriage
     }
   }

@@ -8,7 +8,7 @@ analysis {
   }
   steps {
     step {
-      id = pandda1
+      id = 1_pandda
       program = pandda
       pandda {
         analyser = pandda

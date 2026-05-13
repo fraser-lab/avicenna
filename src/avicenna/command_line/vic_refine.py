@@ -8,7 +8,7 @@ import time
 from importlib.metadata import version, PackageNotFoundError
 sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "src"))
 from avicenna.utils.utils import QRefineWatcher, QRefineScraper, QRefineWriter
-from avicenna.pipelines.qrefine_pipeline import RunQRefine
+from avicenna.pipelines.legacy.qrefine_pipeline import RunQRefine
 from avicenna.utils.phil import RefinePHIL, AvicennaPHIL
 from avicenna.utils.software import check_programs
 
@@ -34,6 +34,8 @@ parser.add_argument("-p", "--params", type=pathlib.Path,
                     help="MR parameter file (default: qrefine_input_parameters.txt)")
 parser.add_argument("--dry_run", action="store_true",
                     help=f"Scan processing output and write qrefine_list.txt, qrefine_input_parameters.txt, and {_DEFAULT_PHIL} without submitting jobs")
+parser.add_argument("--legacy", action="store_true",
+                    help="Use the hard-coded legacy pipeline instead of the PHIL-driven interpreter")
 parser.add_argument("--silent", action="store_true",
                     help="Submit jobs without tailing the log")
 parser.add_argument("--no_fill", action="store_true",
@@ -89,17 +91,26 @@ refine {{
   }}
 }}""")
             with open(_DEFAULT_PHIL, "w") as _f:
-                _f.write(phil.diff_phil_string())
+                _f.write(phil.full_phil_string())
             print(f"Written: {_DEFAULT_PHIL}")
             return
 
-        RunQRefine(
-            process_dir=args.output,
-            dataset_list=args.list,
-            params_file=args.params,
-            dry_run=False,
-            fill=not args.no_fill,
-        ).run()
+        if args.legacy:
+            RunQRefine(
+                process_dir=args.output,
+                dataset_list=args.list,
+                params_file=args.params,
+                dry_run=False,
+                fill=not args.no_fill,
+            ).run()
+        else:
+            RunQRefine(                # step #3: swap to RefinementPipelineInterpreter
+                process_dir=args.output,
+                dataset_list=args.list,
+                params_file=args.params,
+                dry_run=False,
+                fill=not args.no_fill,
+            ).run()
 
         if args.silent:
             return

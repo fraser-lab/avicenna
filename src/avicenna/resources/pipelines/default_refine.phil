@@ -12,11 +12,11 @@ refine {
   }
   steps {
     step {
-      id = rigid_body1
+      id = 1_rigid_body
       program = phenix.refine
     }
     step {
-      id = phaser1
+      id = 2_phaser
       program = phenix.phaser
       phaser {
         mr_cutoff = 0.45
@@ -32,7 +32,7 @@ refine {
       }
     }
     step {
-      id = jelly1
+      id = 3_jelly
       program = refmac5
       refmac {
         ncycles = 4
@@ -41,7 +41,7 @@ refine {
       }
     }
     step {
-      id = refmac5_1
+      id = 4_refmac5
       program = refmac5
       refmac {
         ncycles = 8
@@ -50,7 +50,7 @@ refine {
       }
     }
     step {
-      id = phaser_mono1
+      id = 5_phaser_mono
       program = phenix.phaser
       phaser {
         mr_cutoff = 0.45
@@ -66,7 +66,7 @@ refine {
       }
     }
     step {
-      id = jelly_mono1
+      id = 6_jelly_mono
       program = refmac5
       refmac {
         ncycles = 4
@@ -75,7 +75,7 @@ refine {
       }
     }
     step {
-      id = refmac5_mono1
+      id = 7_refmac5_mono
       program = refmac5
       refmac {
         ncycles = 8
@@ -84,7 +84,7 @@ refine {
       }
     }
     step {
-      id = fill1
+      id = 8_fill
       program = fill
       fill {
         enabled = True

@@ -9,7 +9,8 @@ import time
 from importlib.metadata import version, PackageNotFoundError
 sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "src"))
 from avicenna.utils.utils import DataFinder, ParamWriter, Watcher, ProcessingScraper, ProcessingFilter
-from avicenna.pipelines.proc_pipeline import RunProcess
+from avicenna.pipelines.legacy.proc_pipeline import RunProcess
+from avicenna.pipelines.processing import ProcessingOrchestrator
 from avicenna.utils.phil import ProcessingPHIL, AvicennaPHIL
 from avicenna.utils.software import check_programs
 
@@ -28,6 +29,8 @@ parser.add_argument("-d", "--data", type=pathlib.Path, nargs="+", help="Path(s) 
 parser.add_argument("-p", "--pinlist", type=str, help="Filename for pin list file, typically pin_list.txt")
 parser.add_argument("-x", "--xdsparams", type=str, help="Filename for XDS param file, usually xds_input_parameters.txt")
 parser.add_argument("--bash", action="store_true", help="Run the bash scripts instead of the Python-based processing pipeline")
+parser.add_argument("--legacy", action="store_true",
+                    help="Use the hard-coded legacy pipeline instead of the PHIL-driven interpreter")
 parser.add_argument("-o", "--output", type=pathlib.Path, default=pathlib.Path(os.curdir), help="Path to output folder (default: current directory)")
 parser.add_argument("--dry_run", action="store_true", help=f"Create pin_list.txt and {_DEFAULT_PHIL} without submitting jobs")
 parser.add_argument("--silent",    action="store_true", help="Submit jobs without tailing the log")
@@ -117,6 +120,17 @@ def main():
 
         check_programs(phil._params.processing.programs)
 
+        # PHIL input/output values take precedence; CLI args are the fallback.
+        _pi = phil._params.processing.input
+        _po = phil._params.processing.output
+        if _pi.data:
+            _d = _pi.data
+            args.data = [pathlib.Path(x) for x in (_d if isinstance(_d, (list, tuple)) else [_d])]
+        if _pi.pinlist:
+            args.pinlist = _pi.pinlist
+        if _po.directory and _po.directory != ".":
+            args.output = pathlib.Path(_po.directory)
+
         if not args.pinlist and not args.data:
             parser.error("either -d/--data or -p/--pinlist must be provided")
 
@@ -143,7 +157,7 @@ processing {{
   }}
 }}""")
             with open(_DEFAULT_PHIL, "w") as _f:
-                _f.write(phil.diff_phil_string())
+                _f.write(phil.full_phil_string())
             print(f"Written: {_DEFAULT_PHIL}")
             print("Dry run complete.")
             sys.exit(0)
@@ -188,9 +202,11 @@ processing {{
             params.update(_read_xds_params(args.xdsparams))
         else:
             if data_path is None:
-                sys.exit(
-                    "ERROR: -d/--data is required when using a --pinlist but not using --xdsparams"
-                )
+                if not args.data:
+                    sys.exit(
+                        "ERROR: -d/--data is required when using a --pinlist but not using --xdsparams"
+                    )
+                data_path = DataFinder(paths=args.data).paths[0]
             args.data = data_path
             ParamWriter(args=args).build_parameters()
             params.update(_read_xds_params("xds_input_parameters.txt"))
@@ -210,8 +226,11 @@ processing {{
             if args.xds_root:
                 params["xds_root"] = args.xds_root
             with contextlib.redirect_stdout(_Tee(sys.stdout, omnibus)):
-                proc = RunProcess(params)
-                proc.run()
+                if args.legacy:
+                    RunProcess(params).run()
+                else:
+                    params["phil_string"] = phil.diff_phil_string()
+                    ProcessingOrchestrator(params).run()
 
         if args.silent or args.dry_run:
             return

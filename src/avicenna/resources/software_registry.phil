@@ -40,5 +40,13 @@ software_registry
     companion = None
       .type = str
       .help = "Name of another suite entry that is always checked alongside this one (e.g. xdsstat is a companion of xds)."
+
+    setup_sh = None
+      .type = str
+      .help = "Filename of a sh/bash setup script relative to bin_dir that must be sourced to set suite-specific environment variables (e.g. CLIBD for CCP4). Sourced on compute nodes after SBGrid."
+
+    setup_csh = None
+      .type = str
+      .help = "Filename of a csh/tcsh setup script relative to bin_dir (counterpart to setup_sh for C-shell users)."
   }
 }

@@ -27,6 +27,8 @@ software_registry {
     path_fallback  = pointless
     version_pinnable = True
     version_style  = numeric
+    setup_sh       = ccp4.setup-sh
+    setup_csh      = ccp4.setup-csh
   }
 
   suite {

@@ -503,7 +503,7 @@ class QRefineWorker:
 import json, os, subprocess, sys
 from pathlib import Path
 sys.path.insert(0, {_src_dir!r})
-from avicenna.pipelines.qrefine_pipeline import RunQRefineJob
+from avicenna.pipelines.legacy.qrefine_pipeline import RunQRefineJob
 
 shell = os.environ.get('SHELL', '/bin/bash')
 if any(s in shell for s in ('csh', 'tcsh')):

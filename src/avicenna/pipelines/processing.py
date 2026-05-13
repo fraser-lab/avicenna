@@ -33,11 +33,14 @@ Context dict keys (passed to every step handler)
 """
 
 import importlib
+import json
 import pkgutil
+import stat
 from pathlib import Path
 
-from avicenna.pipelines.proc_pipeline import RunProcess
+from avicenna.pipelines.legacy.proc_pipeline import RunProcess
 from avicenna.utils.phil.processing import ProcessingPHIL
+from avicenna.utils.software import suite_setup_sources
 from avicenna.utils.utils import QRefineWriter
 
 
@@ -58,6 +61,67 @@ def _build_registry() -> dict:
             for prog_name in mod.PROGRAMS:
                 registry[prog_name] = mod.run_step
     return registry
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator (writes worker scripts that call the PHIL interpreter)
+# ---------------------------------------------------------------------------
+
+class ProcessingOrchestrator(RunProcess):
+    """RunProcess subclass whose worker scripts invoke ProcessingPipelineInterpreter.
+
+    Inherits all outer orchestration (dataset discovery, params.json writing,
+    SGE submission, forced-integration re-submission) from RunProcess. The only
+    override is _write_worker_script, which emits a script that calls
+    ProcessingPipelineInterpreter(params).run(forced=...) instead of
+    RunProcess(params).run_single[_forced]().
+    """
+
+    def _write_worker_script(self, pipeline_subdir, per_params, method="run_single"):
+        forced = (method == "run_single_forced")
+        sh_sources, csh_sources = suite_setup_sources({
+            "ccp4":   self.CCP4_BIN,
+            "phenix": self.PHENIX_BIN,
+        })
+        _sh_extra  = "".join(f" && source {p}" for p in sh_sources)
+        _csh_extra = "".join(f" && source {p}" for p in csh_sources)
+
+        Path(pipeline_subdir, "params.json").write_text(
+            json.dumps(per_params, indent=2, default=str)
+        )
+        script = Path(pipeline_subdir) / "run_pipeline.py"
+        script.write_text(f"""\
+#!/usr/bin/env python3
+import json, os, subprocess, sys
+from pathlib import Path
+sys.path.insert(0, {self._src_dir!r})
+from avicenna.pipelines.processing import ProcessingPipelineInterpreter
+
+shell = os.environ.get('SHELL', '/bin/bash')
+if any(s in shell for s in ('csh', 'tcsh')):
+    _sbgrid_cmd = "tcsh -c 'source /programs/sbgrid.cshrc{_csh_extra} && env'"
+else:
+    _sbgrid_cmd = "bash --norc --noprofile -c 'source /programs/sbgrid.shrc{_sh_extra} && env'"
+_result = subprocess.run(_sbgrid_cmd, shell=True, capture_output=True, text=True)
+for _line in _result.stdout.splitlines():
+    if '=' in _line:
+        _key, _, _val = _line.partition('=')
+        if _key.isidentifier():
+            os.environ[_key] = _val
+
+params = json.loads(Path('params.json').read_text())
+print("=" * 60)
+print(f"pin          : {{params.get('pin', 'n/a')}}")
+print(f"dataset      : {{params.get('pin_id', 'n/a')}}")
+print(f"image_dir    : {{params.get('image_dir', 'n/a')}}")
+print(f"image_range  : {{params.get('image_range', 'n/a')}}")
+print(f"workdir      : {{params.get('pipeline_subdir', 'n/a')}}")
+print(f"space_group  : {{params.get('sg', 'n/a')}}")
+print(f"cell         : {{params.get('cell', 'n/a')}}")
+print("=" * 60, flush=True)
+ProcessingPipelineInterpreter(params).run(forced={forced!r})
+""")
+        script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IRUSR | stat.S_IWUSR)
 
 
 # ---------------------------------------------------------------------------
@@ -83,7 +147,7 @@ class ProcessingPipelineInterpreter:
 
     def __init__(self, params, rp=None):
         self.params    = params
-        self.rp        = rp if rp is not None else RunProcess(params)
+        self.rp        = rp if rp is not None else ProcessingOrchestrator(params)
         self._registry = _build_registry()
 
     # ------------------------------------------------------------------

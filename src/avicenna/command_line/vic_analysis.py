@@ -2,7 +2,7 @@ import sys
 import argparse
 import pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "src"))
-from avicenna.pipelines.pandda_pipeline import PanDDAPreparer
+from avicenna.pipelines.legacy.pandda_pipeline import PanDDAPreparer
 from avicenna.utils.phil import AnalysisPHIL, AvicennaPHIL
 from avicenna.utils.software import check_programs
 
@@ -38,6 +38,8 @@ parser.add_argument("--no_lr_comp_check", action="store_true",
                     help="Disable low-resolution completeness check in pandda.analyse")
 parser.add_argument("--log_time_out", type=int, default=0, metavar="MINUTES",
                     help="Stop waiting for pandda log after N minutes (default: 0 = no timeout)")
+parser.add_argument("--legacy", action="store_true",
+                    help="Use the hard-coded legacy pipeline instead of the PHIL-driven interpreter")
 parser.add_argument("--dry_run", action="store_true",
                     help=f"Show what would be done without copying or submitting; writes {_DEFAULT_PHIL}")
 _phil_group = parser.add_mutually_exclusive_group()
@@ -120,7 +122,7 @@ def _write_analysis_phil(args, phil: AnalysisPHIL):
     ]
     phil.adopt_phil_string("\n".join(lines))
     with open(_DEFAULT_PHIL, "w") as _f:
-        _f.write(phil.diff_phil_string())
+        _f.write(phil.full_phil_string())
     print(f"Written: {_DEFAULT_PHIL}")
 
 
@@ -153,23 +155,42 @@ def main():
         ground_state_datasets = []
         if args.ground_state_range:
             ground_state_datasets = _parse_ground_state_range(args.ground_state_range)
-        PanDDAPreparer(
-            process_dirs=list(args.sources),
-            prefix=args.prefix,
-            offset=args.offset,
-            suffix=args.suffix,
-            reference_pdb=args.reference_pdb,
-            reference_mtz=args.reference_mtz,
-            ground_state_datasets=ground_state_datasets,
-            cpus=args.cpus,
-            min_build_datasets=args.min_build,
-            max_build_datasets=args.max_build,
-            max_new_datasets=args.max_new,
-            no_lr_comp_check=args.no_lr_comp_check,
-            log_time_out=args.log_time_out,
-            dry_run=args.dry_run,
-            pin_map=_build_pin_map(args.sources),
-        ).run()
+        if args.legacy:
+            PanDDAPreparer(
+                process_dirs=list(args.sources),
+                prefix=args.prefix,
+                offset=args.offset,
+                suffix=args.suffix,
+                reference_pdb=args.reference_pdb,
+                reference_mtz=args.reference_mtz,
+                ground_state_datasets=ground_state_datasets,
+                cpus=args.cpus,
+                min_build_datasets=args.min_build,
+                max_build_datasets=args.max_build,
+                max_new_datasets=args.max_new,
+                no_lr_comp_check=args.no_lr_comp_check,
+                log_time_out=args.log_time_out,
+                dry_run=args.dry_run,
+                pin_map=_build_pin_map(args.sources),
+            ).run()
+        else:                          # step #3: swap to AnalysisPipelineInterpreter
+            PanDDAPreparer(
+                process_dirs=list(args.sources),
+                prefix=args.prefix,
+                offset=args.offset,
+                suffix=args.suffix,
+                reference_pdb=args.reference_pdb,
+                reference_mtz=args.reference_mtz,
+                ground_state_datasets=ground_state_datasets,
+                cpus=args.cpus,
+                min_build_datasets=args.min_build,
+                max_build_datasets=args.max_build,
+                max_new_datasets=args.max_new,
+                no_lr_comp_check=args.no_lr_comp_check,
+                log_time_out=args.log_time_out,
+                dry_run=args.dry_run,
+                pin_map=_build_pin_map(args.sources),
+            ).run()
         if args.dry_run:
             _write_analysis_phil(args, phil)
     except KeyboardInterrupt:

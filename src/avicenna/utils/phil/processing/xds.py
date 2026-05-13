@@ -18,6 +18,14 @@ xds
             XDS.INP and XPARM.XDS from the previous XDS step and run only \
             DEFPIX→INTEGRATE→CORRECT.
     .expert_level = 0
+  try_forced_indexing = True
+    .type = bool
+    .short_caption = Try forced indexing
+    .help = If True and initial indexing fails with XPARM.XDS present, \
+            re-submit with forced space-group and unit-cell constraints. \
+            If no known symmetry is provided, candidate point groups from \
+            IDXREF.LP are tried.
+    .expert_level = 1
   recycle_geometry = False
     .type = bool
     .short_caption = Recycle detector geometry
@@ -133,7 +141,8 @@ def run_step(step, ctx, rp, pipeline_subdir, forced):
 
         if not rp._xds_ascii_ok(pipeline_subdir, step_id):
             err = rp._xds_error(pipeline_subdir, step_id) or "XDS did not produce XDS_ASCII.HKL"
-            if not forced and (Path(pipeline_subdir) / step_id / "XPARM.XDS").is_file():
+            if (not forced and xds_p.try_forced_indexing
+                    and (Path(pipeline_subdir) / step_id / "XPARM.XDS").is_file()):
                 return {
                     "status": "error",
                     "fatal": True,

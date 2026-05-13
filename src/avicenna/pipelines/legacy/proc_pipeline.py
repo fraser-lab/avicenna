@@ -28,7 +28,7 @@ from datetime import datetime
 from pathlib import Path
 sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "src"))
 from avicenna.utils.utils import BRAVAIS_LATTICES, QRefineWriter, format_log_line, ProcessingWatcher
-from avicenna.utils.software import find_xds, find_ccp4, find_phenix
+from avicenna.utils.software import find_xds, find_ccp4, find_phenix, suite_setup_sources
 
 
 
@@ -1172,6 +1172,13 @@ class RunProcess:
         Serialise per_params to params.json and write a run_pipeline.py that
         imports this module and calls RunProcess(params).{method}().
         """
+        sh_sources, csh_sources = suite_setup_sources({
+            "ccp4":   self.CCP4_BIN,
+            "phenix": self.PHENIX_BIN,
+        })
+        _sh_extra  = "".join(f" && source {p}" for p in sh_sources)
+        _csh_extra = "".join(f" && source {p}" for p in csh_sources)
+
         Path(pipeline_subdir, "params.json").write_text(
             json.dumps(per_params, indent=2, default=str)
         )
@@ -1181,13 +1188,13 @@ class RunProcess:
 import json, os, subprocess, sys
 from pathlib import Path
 sys.path.insert(0, {self._src_dir!r})
-from avicenna.pipelines.proc_pipeline import RunProcess
+from avicenna.pipelines.legacy.proc_pipeline import RunProcess
 
 shell = os.environ.get('SHELL', '/bin/bash')
 if any(s in shell for s in ('csh', 'tcsh')):
-    _sbgrid_cmd = "tcsh -c 'source /programs/sbgrid.cshrc && env'"
+    _sbgrid_cmd = "tcsh -c 'source /programs/sbgrid.cshrc{_csh_extra} && env'"
 else:
-    _sbgrid_cmd = "bash --norc --noprofile -c 'source /programs/sbgrid.shrc && env'"
+    _sbgrid_cmd = "bash --norc --noprofile -c 'source /programs/sbgrid.shrc{_sh_extra} && env'"
 _result = subprocess.run(_sbgrid_cmd, shell=True, capture_output=True, text=True)
 for _line in _result.stdout.splitlines():
     if '=' in _line:
