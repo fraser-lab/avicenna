@@ -7,7 +7,7 @@ import pathlib
 import time
 from importlib.metadata import version, PackageNotFoundError
 sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "src"))
-from avicenna.utils.utils import QRefineWatcher, QRefineScraper, QRefineWriter
+from avicenna.utils.utils import QRefineWatcher, QRefineScraper, QRefineWriter, ProgressBar
 from avicenna.pipelines.legacy.qrefine_pipeline import RunQRefine
 from avicenna.utils.phil import RefinePHIL, AvicennaPHIL
 from avicenna.utils.software import check_programs
@@ -38,6 +38,8 @@ parser.add_argument("--legacy", action="store_true",
                     help="Use the hard-coded legacy pipeline instead of the PHIL-driven interpreter")
 parser.add_argument("--silent", action="store_true",
                     help="Submit jobs without tailing the log")
+parser.add_argument("--prog_log", action="store_true",
+                    help="Tail pipeline logs with a compact progress bar pinned below")
 parser.add_argument("--no_fill", action="store_true",
                     help="Skip populating missing/invalid reflections in the final MTZ (not recommended for panDDA input)")
 _phil_group = parser.add_mutually_exclusive_group()
@@ -55,6 +57,23 @@ def _apply_phil_file(phil_obj, path: pathlib.Path):
         print(f"Loaded settings from {path}")
     except RuntimeError as e:
         sys.exit(f"ERROR: Invalid PHIL in {path}:\n  {e}")
+
+
+def _watch_with_bar(watcher, omnibus):
+    """Tail per-job pipeline logs with a compact progress bar pinned below.
+
+    Each tick: erase the bar, emit any new log lines in its place, then
+    redraw the bar below them.  The braille spinner in the legend line animates
+    continuously so a frozen terminal is immediately visible.
+    """
+    bar = ProgressBar(watcher, multiline=True, separator=True)
+    while True:
+        bar.erase()
+        watcher.tail_logs(log_file=omnibus)
+        still_running = bar.draw()
+        if not still_running:
+            break
+        time.sleep(1)
 
 
 def main():
@@ -118,14 +137,17 @@ refine {{
         procpath = os.path.abspath(args.output)
         omnibus = os.path.join(procpath, "qrefine.log")
         watcher = QRefineWatcher(procpath=procpath)
-        while True:
-            watcher.tail_logs(log_file=omnibus)
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                still_running = watcher.show_progress()
-            if not still_running:
-                break
-            time.sleep(1)
+        if args.prog_log:
+            _watch_with_bar(watcher, omnibus)
+        else:
+            while True:
+                watcher.tail_logs(log_file=omnibus)
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    still_running = watcher.show_progress()
+                if not still_running:
+                    break
+                time.sleep(1)
         watcher.tail_logs(log_file=omnibus)
         print()
         watcher.print_summary(omnibus=omnibus)

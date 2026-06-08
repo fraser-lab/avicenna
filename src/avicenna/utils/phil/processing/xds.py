@@ -1,5 +1,6 @@
 """XDS indexing/integration backend for the processing sub-pipeline."""
 
+import freephil
 from pathlib import Path
 
 SCOPE_NAME = "xds"
@@ -18,13 +19,33 @@ xds
             XDS.INP and XPARM.XDS from the previous XDS step and run only \
             DEFPIX→INTEGRATE→CORRECT.
     .expert_level = 0
-  try_forced_indexing = True
-    .type = bool
-    .short_caption = Try forced indexing
-    .help = If True and initial indexing fails with XPARM.XDS present, \
-            re-submit with forced space-group and unit-cell constraints. \
-            If no known symmetry is provided, candidate point groups from \
-            IDXREF.LP are tried.
+  on_indexing_failure = *auto retry reject bypass
+    .type = choice
+    .short_caption = On indexing failure
+    .help = Action when XPARM.XDS is present but XDS_ASCII.HKL is absent \
+            after the initial XDS run. auto: retry when no known symmetry is \
+            supplied, bypass when known symmetry is supplied. retry: submit \
+            forced integration job(s) (see retry_mode). reject: stop this \
+            dataset immediately. bypass: re-run JOB= DEFPIX INTEGRATE CORRECT \
+            in-place using the existing XPARM.XDS, space group unchanged.
+    .expert_level = 1
+  retry_mode = *auto p1 best top_ten
+    .type = choice
+    .short_caption = Forced integration retry mode
+    .help = Ignored unless on_indexing_failure = retry. auto: use best \
+            (top-scoring Bravais lattice). p1: one job with \
+            SPACE_GROUP_NUMBER=1 (Pointless determines the true space group). \
+            best: one job using the top-scoring Bravais lattice from IDXREF.LP. \
+            top_ten: one SGE array job per starred Bravais lattice in IDXREF.LP \
+            (legacy behavior).
+    .expert_level = 1
+  on_integration_failure = *reject bypass
+    .type = choice
+    .short_caption = On integration failure
+    .help = Action when XPARM.XDS and INTEGRATE.HKL are present but \
+            XDS_ASCII.HKL is absent (CORRECT failed), or when a subsequent \
+            XDS run fails. reject: stop this dataset. bypass: log the \
+            failure and continue to the next pipeline step.
     .expert_level = 1
   recycle_geometry = False
     .type = bool
@@ -66,12 +87,6 @@ xds
     .type = str
     .short_caption = Indexing images
     .help = Which images to use for indexing (first_half, all, or a range).
-    .expert_level = 1
-  try_alt_sym = all
-    .type = str
-    .short_caption = Try alternative symmetry
-    .help = Whether to attempt alternative space groups after indexing \
-            (all, none, or a comma-separated list of lattice types).
     .expert_level = 1
   no_symmetry = False
     .type = bool
@@ -135,21 +150,61 @@ def run_step(step, ctx, rp, pipeline_subdir, forced):
     prev_aim = ctx["last_by_program"].get("aimless")
     prev_ptl = ctx["last_by_program"].get("pointless")
 
+    known_sym = params.get("known_sg", "none") != "none"
+    on_indexing_failure = xds_p.on_indexing_failure
+    if on_indexing_failure is freephil.Auto or on_indexing_failure == "auto":
+        on_indexing_failure = "bypass" if known_sym else "retry"
+    retry_mode = xds_p.retry_mode
+    if retry_mode is freephil.Auto or retry_mode == "auto":
+        retry_mode = "best"
+
     if xds_p.generate_inp:
         scenario = "xds_forced_integration" if forced else "xds_initial_indexing"
         rp._xds(step_id, params, scenario)
 
         if not rp._xds_ascii_ok(pipeline_subdir, step_id):
+            step_dir      = Path(pipeline_subdir) / step_id
+            xparm         = (step_dir / "XPARM.XDS").is_file()
+            integrate_hkl = (step_dir / "INTEGRATE.HKL").is_file()
             err = rp._xds_error(pipeline_subdir, step_id) or "XDS did not produce XDS_ASCII.HKL"
-            if (not forced and xds_p.try_forced_indexing
-                    and (Path(pipeline_subdir) / step_id / "XPARM.XDS").is_file()):
-                return {
-                    "status": "error",
-                    "fatal": True,
-                    "error_type": "needs_forced_integration",
-                    "message": f"{step_id}: {err}",
-                }
-            return {"status": "error", "fatal": True, "message": f"{step_id}: {err}"}
+
+            if not forced and xparm and not integrate_hkl:
+                # IDXREF failure (or early-INTEGRATE failure before INTEGRATE.HKL is written)
+                if on_indexing_failure == "retry":
+                    return {
+                        "status": "error",
+                        "fatal": True,
+                        "error_type": "needs_forced_integration",
+                        "retry_mode": retry_mode,
+                        "message": f"{step_id}: {err}",
+                    }
+                elif on_indexing_failure == "bypass":
+                    rp._log(pipeline_subdir, "ERROR",
+                            f"{step_id}: {err}")
+                    rp._log(pipeline_subdir, "BYPASS",
+                            f"{step_id}: re-running in-place: JOB= DEFPIX INTEGRATE CORRECT")
+                    rp._xds(step_id, params, "xds_bypass_indexing_failure")
+                    if rp._xds_ascii_ok(pipeline_subdir, step_id):
+                        return {"status": "completed",
+                                "message": f"{step_id}: completed (bypass)"}
+                    err2 = (rp._xds_error(pipeline_subdir, step_id)
+                            or "XDS did not produce XDS_ASCII.HKL after bypass")
+                    return {"status": "error", "fatal": True,
+                            "message": f"{step_id}: {err2}"}
+                else:  # reject
+                    return {"status": "error", "fatal": True, "message": f"{step_id}: {err}"}
+
+            elif xparm and integrate_hkl:
+                # CORRECT failure: on_integration_failure governs
+                if xds_p.on_integration_failure == "bypass":
+                    return {"status": "error", "fatal": False,
+                            "message": f"{step_id}: {err} (bypassed)"}
+                else:  # reject
+                    return {"status": "error", "fatal": True, "message": f"{step_id}: {err}"}
+
+            else:
+                # No XPARM.XDS: hard stop regardless of params
+                return {"status": "error", "fatal": True, "message": f"{step_id}: {err}"}
 
     else:
         if xds_p.skip_if_no_improvement and not forced:

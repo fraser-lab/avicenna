@@ -12,7 +12,6 @@ processing {
     isoform {
       id = isoform_1
       space_group = None
-      space_group_number = None
       unit_cell = None
       reference_hkl = None
     }
@@ -23,7 +22,7 @@ processing {
       program = xds
       xds {
         generate_inp = True
-        try_forced_indexing = True
+        on_indexing_failure = *auto retry reject bypass
         recycle_geometry = False
         update_symmetry = False
         skip_if_no_improvement = False
@@ -31,7 +30,8 @@ processing {
         xds_inp = None
         detector_edge = 0.8
         indexing_images = first_half
-        try_alt_sym = all
+        retry_mode = *auto p1 best top_ten
+        on_integration_failure = reject
         no_symmetry = False
         res_limit = cc12
         cleanup = partial
@@ -56,7 +56,7 @@ processing {
       program = xds
       xds {
         generate_inp = False
-        try_forced_indexing = True
+        on_indexing_failure = reject
         recycle_geometry = True
         update_symmetry = False
         skip_if_no_improvement = False
@@ -64,7 +64,7 @@ processing {
         xds_inp = None
         detector_edge = 0.8
         indexing_images = first_half
-        try_alt_sym = all
+        on_integration_failure = reject
         no_symmetry = False
         res_limit = cc12
         cleanup = partial
@@ -89,7 +89,7 @@ processing {
       program = xds
       xds {
         generate_inp = False
-        try_forced_indexing = True
+        on_indexing_failure = reject
         recycle_geometry = True
         update_symmetry = True
         skip_if_no_improvement = True
@@ -97,7 +97,7 @@ processing {
         xds_inp = None
         detector_edge = 0.8
         indexing_images = first_half
-        try_alt_sym = all
+        on_integration_failure = reject
         no_symmetry = False
         res_limit = cc12
         cleanup = partial

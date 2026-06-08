@@ -27,7 +27,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "src"))
-from avicenna.utils.utils import BRAVAIS_LATTICES, QRefineWriter, format_log_line, ProcessingWatcher
+from avicenna.utils.utils import BRAVAIS_LATTICES, QRefineWriter, format_log_line, ProcessingWatcher, sg_lookup
 from avicenna.utils.software import find_xds, find_ccp4, find_phenix, suite_setup_sources
 
 
@@ -332,8 +332,9 @@ class RunXDS(RunBase):
         text = re.sub(r"SPOT_RANGE=.*", f"SPOT_RANGE={self.image_range}", text)
         text = re.sub(r"SPACE_GROUP_NUMBER=.*!",
                       f"SPACE_GROUP_NUMBER= {self.sg_number} !", text)
-        text = re.sub(r"UNIT_CELL_CONSTANTS=.*!",
-                      f"UNIT_CELL_CONSTANTS= {self.cell} !", text)
+        if self.cell != "none":
+            text = re.sub(r"UNIT_CELL_CONSTANTS=.*!",
+                          f"UNIT_CELL_CONSTANTS= {self.cell} !", text)
         text = text.replace(
             "JOB= XYCORR INIT COLSPOT IDXREF DEFPIX INTEGRATE CORRECT",
             "JOB= DEFPIX INTEGRATE CORRECT",
@@ -354,6 +355,24 @@ class RunXDS(RunBase):
             for cbf in xds_dir.glob("*.cbf"):
                 shutil.copy(str(cbf), ".")
 
+        self._run_xds()
+        self._run_xdsstat()
+
+    def xds_bypass_indexing_failure(self):
+        """
+        In-place bypass of indexing failure: modify the existing XDS.INP to
+        run JOB= DEFPIX INTEGRATE CORRECT using the XPARM.XDS already present
+        in the step directory.  Used when on_indexing_failure = bypass.
+        """
+        job_dir = self.pipeline_subdir / self.step_id
+        os.chdir(job_dir)
+        xds_inp = job_dir / "XDS.INP"
+        text = xds_inp.read_text()
+        text = text.replace(
+            "JOB= XYCORR INIT COLSPOT IDXREF DEFPIX INTEGRATE CORRECT",
+            "JOB= DEFPIX INTEGRATE CORRECT",
+        )
+        xds_inp.write_text(text)
         self._run_xds()
         self._run_xdsstat()
 
@@ -950,9 +969,12 @@ class RunProcess:
         10_rfree   RunRfree
         11_xtriage RunXtriage
 
-      Forced integration path (1_xds produces XPARM.XDS but not XDS_ASCII.HKL):
-        Same step sequence, but 1_xds uses xds_forced_integration and
-        7_xds always runs (no skip check).
+      Forced integration path (on_indexing_failure=retry; 1_xds produces
+      XPARM.XDS but not XDS_ASCII.HKL):
+        Submits a new SGE job per candidate SG (controlled by retry_mode).
+        run_single_forced() runs the same step sequence with xds_forced_integration
+        and all Pointless steps as free runs (prev_aimless_id=None); 7_xds
+        always runs (no skip check).
     """
 
     MIN_IMAGES         = 180
@@ -971,7 +993,7 @@ class RunProcess:
         self.ncpu          = int(params.get("ncpu", 8))
         self.indexing_images = params.get("indexing_images", "first_half")
         self.no_symmetry   = params.get("no_symmetry", "false")
-        self.try_alt_sym   = params.get("try_alt_sym", "all")
+        self.retry_mode    = params.get("retry_mode", params.get("try_alt_sym", "auto")).lower()
         # Absolute path to the src/ directory so worker scripts can import this module
         self._src_dir = str(Path(__file__).parents[3] / "src")
 
@@ -1010,10 +1032,15 @@ class RunProcess:
                     continue
                 key, _, val = line.partition("=")
                 kv[key.strip()] = val.strip()
+            sg = kv.get("sg", "none")
+            try:
+                sg_number = str(sg_lookup(space_group=sg)[0]) if sg != "none" else "none"
+            except ValueError:
+                sg_number = "none"
             crystals.append({
                 "first_pass": kv.get("first_pass", "none"),
-                "sg":         kv.get("sg", "none"),
-                "sg_number":  kv.get("number", "none"),
+                "sg":         sg,
+                "sg_number":  sg_number,
                 "cell":       kv.get("cell", "none"),
                 "ref_hkl":    kv.get("ref_hkl", "none"),
                 "ref_mtz":    kv.get("ref_mtz", "none"),
@@ -1039,11 +1066,16 @@ class RunProcess:
                 parts = line.split(",")
                 if len(parts) < 8:
                     continue
+                sg = parts[2]
+                try:
+                    sg_number = str(sg_lookup(space_group=sg)[0]) if sg != "none" else "none"
+                except ValueError:
+                    sg_number = "none"
                 entries.append({
                     "crystal_number":        parts[0],
                     "first_pass":            parts[1],
-                    "sg":                    parts[2],
-                    "sg_number":             parts[3],
+                    "sg":                    sg,
+                    "sg_number":             sg_number,
                     "cell":                  parts[4],
                     "ref_hkl":               parts[5],
                     "ref_mtz":               parts[6],
@@ -1120,7 +1152,14 @@ class RunProcess:
                 ranges.append((int(s), int(e)))
         return ranges
 
-    def _sym_from_idxref(self, idxref_lp):
+    def _cell_from_xparm(self, xparm_path):
+        """Read unit cell constants from XPARM.XDS (line 4: SG a b c alpha beta gamma)."""
+        line = Path(xparm_path).read_text().splitlines()[3]
+        parts = line.split()
+        # parts[0] is the SG number; parts[1:7] are a b c alpha beta gamma
+        return " ".join(parts[1:7])
+
+    def _sym_from_idxref(self, idxref_lp, retry_mode=None):
         """
         Parse IDXREF.LP and map starred Bravais lattice solutions to candidate
         space groups using BRAVAIS_LATTICES from avicenna.utils.utils.
@@ -1129,8 +1168,10 @@ class RunProcess:
         lowest-penalty solution first (matching the tac/reverse ordering in
         the bash).
         """
-        # Parse starred solutions
-        solutions = []
+        retry_mode = retry_mode if retry_mode is not None else self.retry_mode
+
+        # Parse all starred solutions including the first aP/P1 row
+        all_solutions = []
         in_table = False
         for line in Path(idxref_lp).read_text().splitlines():
             if "LATTICE-  BRAVAIS-   QUALITY" in line:
@@ -1143,11 +1184,15 @@ class RunProcess:
                 continue
             lattice = clean[1]
             cell    = " ".join(clean[3:9])
-            solutions.append((lattice, cell))
-        solutions = solutions[1:]               # skip first row (aP/P1 — trivially correct, uninformative)
-        solutions = list(reversed(solutions))   # lowest penalty first → highest symmetry first
+            all_solutions.append((lattice, cell))
 
-        if self.try_alt_sym == "all":
+        # IDXREF.LP lists starred rows ascending by quality penalty (aP at 0.0,
+        # highest-symmetry lattices at the end).  After skipping aP and reversing,
+        # solutions[0] = highest-symmetry candidate (highest penalty, tried first).
+        solutions = all_solutions[1:]           # drop aP/P1 — trivially correct, uninformative
+        solutions = list(reversed(solutions))   # highest-symmetry (highest penalty) first
+
+        if retry_mode == "top_ten":
             results = []
             prefix = 0
             for lattice, cell in solutions:
@@ -1157,10 +1202,10 @@ class RunProcess:
                     prefix += 1
                     results.append((str(prefix), name, str(number), cell.replace(" ", "-")))
             return results
-        elif self.try_alt_sym == "top":
+        elif retry_mode == "best":
             if not solutions:
                 return []
-            lattice, cell = solutions[-1]   # best before reversal
+            lattice, cell = solutions[0]    # highest-symmetry candidate
             sg_list = BRAVAIS_LATTICES.get(lattice, [])
             if sg_list:
                 number, name = sg_list[0]
@@ -1308,8 +1353,15 @@ RunProcess(params).{method}()
     def _log(self, pipeline_subdir, tag, message):
         """Append a timestamped line to pipeline.log in pipeline_subdir."""
         context = self.params.get("pin_id") if pipeline_subdir is not None else None
+        forced_dir = (
+            Path(pipeline_subdir).name
+            if pipeline_subdir is not None
+            and self.params.get("force_integration") == "true"
+            else None
+        )
         line = format_log_line(tag, message, context=context,
-                               context_width=self.params.get("context_width"))
+                               context_width=self.params.get("context_width"),
+                               forced_dir=forced_dir)
         if pipeline_subdir is not None:
             with open(Path(pipeline_subdir) / "pipeline.log", "a") as fh:
                 fh.write(line)
@@ -1509,105 +1561,124 @@ RunProcess(params).{method}()
 
         self._setup_scratch(params)
 
+        on_fail = params.get("on_indexing_failure", "auto").lower()
+        if on_fail == "auto":
+            on_fail = "bypass" if sg != "none" else "retry"
+
         # 1_xds: initial indexing
         self._xds("1_xds", params, "xds_initial_indexing")
 
-        if self._xds_ascii_ok(pipeline_subdir, "1_xds"):
+        if not self._xds_ascii_ok(pipeline_subdir, "1_xds"):
+            xparm         = (pipeline_subdir / "1_xds" / "XPARM.XDS").is_file()
+            integrate_hkl = (pipeline_subdir / "1_xds" / "INTEGRATE.HKL").is_file()
+            err = self._xds_error(pipeline_subdir, "1_xds") or "XDS did not produce XDS_ASCII.HKL"
+            self._log(pipeline_subdir, "ERROR", f"1_xds: {err}")
+
+            if xparm and not integrate_hkl and on_fail == "retry":
+                self._log(pipeline_subdir, "FORCE", "submitting forced integration jobs")
+                self._run_forced_integration(params, pipeline_subdir)
+                return
+            elif xparm and not integrate_hkl and on_fail == "bypass":
+                self._log(pipeline_subdir, "BYPASS",
+                          "1_xds: re-running in-place: JOB= DEFPIX INTEGRATE CORRECT")
+                self._xds("1_xds", params, "xds_bypass_indexing_failure")
+                if not self._xds_ascii_ok(pipeline_subdir, "1_xds"):
+                    self._log(pipeline_subdir, "ERROR",
+                              f"1_xds: {self._xds_error(pipeline_subdir, '1_xds') or 'bypass failed'}")
+                    return
+                self._log(pipeline_subdir, "RUN", "1_xds: completed (bypass)")
+            else:
+                return
+        else:
             self._log(pipeline_subdir, "RUN", "1_xds: completed")
 
-            # 2_pointless: first pass, Pointless chooses SG freely
-            self._pointless("2_pointless", params,
-                            prev_xds_id="1_xds", prev_aimless_id=None)
-            self._log(pipeline_subdir, "RUN", "2_pointless: completed")
+        # 2_pointless: first pass, Pointless chooses SG freely
+        self._pointless("2_pointless", params,
+                        prev_xds_id="1_xds", prev_aimless_id=None)
+        self._log(pipeline_subdir, "RUN", "2_pointless: completed")
 
-            # 3_aimless: no resolution cutoff
-            self._aimless("3_aimless", params,
-                          prev_pointless_id="2_pointless", prev_aimless_id=None,
-                          apply_res_cutoff=False)
-            self._log(pipeline_subdir, "RUN", "3_aimless: completed")
+        # 3_aimless: no resolution cutoff
+        self._aimless("3_aimless", params,
+                      prev_pointless_id="2_pointless", prev_aimless_id=None,
+                      apply_res_cutoff=False)
+        self._log(pipeline_subdir, "RUN", "3_aimless: completed")
 
-            # 4_xds: recycle refined detector geometry from 1_xds
-            self._xds("4_xds", params, "xds_recycle_detector", prev_xds_id="1_xds")
+        # 4_xds: recycle refined detector geometry from 1_xds
+        self._xds("4_xds", params, "xds_recycle_detector", prev_xds_id="1_xds")
 
-            if self._xds_ascii_ok(pipeline_subdir, "4_xds"):
-                self._log(pipeline_subdir, "RUN", "4_xds: completed")
+        if not self._xds_ascii_ok(pipeline_subdir, "4_xds"):
+            self._log(pipeline_subdir, "ERROR",
+                      f"4_xds: {self._xds_error(pipeline_subdir, '4_xds') or 'unknown error'}")
+            return
 
-                # 5_pointless: enforce SG from 3_aimless
-                self._pointless("5_pointless", params,
-                                prev_xds_id="4_xds", prev_aimless_id="3_aimless")
-                self._log(pipeline_subdir, "RUN", "5_pointless: completed")
+        self._log(pipeline_subdir, "RUN", "4_xds: completed")
 
-                # 6_aimless: CC½ cutoff derived from 3_aimless
-                self._aimless("6_aimless", params,
-                              prev_pointless_id="5_pointless", prev_aimless_id="3_aimless",
+        # 5_pointless: enforce SG from 3_aimless
+        self._pointless("5_pointless", params,
+                        prev_xds_id="4_xds", prev_aimless_id="3_aimless")
+        self._log(pipeline_subdir, "RUN", "5_pointless: completed")
+
+        # 6_aimless: CC½ cutoff derived from 3_aimless
+        self._aimless("6_aimless", params,
+                      prev_pointless_id="5_pointless", prev_aimless_id="3_aimless",
+                      apply_res_cutoff=True)
+        self._log(pipeline_subdir, "RUN", "6_aimless: completed")
+
+        def _cc12(log_path):
+            for line in Path(log_path).read_text().splitlines():
+                if "0.30: limit =" in line:
+                    return line.split("=", 1)[1].split("A")[0].strip()
+            return "0.00"
+
+        res_lim_6 = _cc12(pipeline_subdir / "6_aimless" / "6_aimless.log")
+        res_lim_3 = _cc12(pipeline_subdir / "3_aimless" / "3_aimless.log")
+
+        last_aimless_id = "6_aimless"
+        last_xds_id     = "4_xds"
+
+        if float(res_lim_6) > float(res_lim_3):
+            self._log(pipeline_subdir, "RUN",
+                      f"resolution improved ({res_lim_3} → {res_lim_6} Å), running symmetry refinement")
+            self._xds("7_xds", params, "xds_refine_symmetry",
+                      prev_xds_id="4_xds",
+                      prev_aimless_id="6_aimless",
+                      prev_pointless_id="5_pointless")
+
+            if self._xds_ascii_ok(pipeline_subdir, "7_xds"):
+                self._log(pipeline_subdir, "RUN", "7_xds: completed")
+
+                self._pointless("8_pointless", params,
+                                prev_xds_id="7_xds", prev_aimless_id="6_aimless")
+                self._log(pipeline_subdir, "RUN", "8_pointless: completed")
+
+                self._aimless("9_aimless", params,
+                              prev_pointless_id="8_pointless", prev_aimless_id="6_aimless",
                               apply_res_cutoff=True)
-                self._log(pipeline_subdir, "RUN", "6_aimless: completed")
+                self._log(pipeline_subdir, "RUN", "9_aimless: completed")
 
-                # Decide whether to run 7_xds: compare CC½ limits from 6 vs 3
-                def _cc12(log_path):
-                    for line in Path(log_path).read_text().splitlines():
-                        if "0.30: limit =" in line:
-                            return line.split("=", 1)[1].split("A")[0].strip()
-                    return "0.00"
-
-                res_lim_6 = _cc12(pipeline_subdir / "6_aimless" / "6_aimless.log")
-                res_lim_3 = _cc12(pipeline_subdir / "3_aimless" / "3_aimless.log")
-
-                last_aimless_id = "6_aimless"
-                last_xds_id     = "4_xds"
-
-                if float(res_lim_6) > float(res_lim_3):
-                    self._log(pipeline_subdir, "RUN",
-                              f"resolution improved ({res_lim_3} → {res_lim_6} Å), running symmetry refinement")
-                    self._xds("7_xds", params, "xds_refine_symmetry",
-                              prev_xds_id="4_xds",
-                              prev_aimless_id="6_aimless",
-                              prev_pointless_id="5_pointless")
-
-                    if self._xds_ascii_ok(pipeline_subdir, "7_xds"):
-                        self._log(pipeline_subdir, "RUN", "7_xds: completed")
-
-                        self._pointless("8_pointless", params,
-                                        prev_xds_id="7_xds", prev_aimless_id="6_aimless")
-                        self._log(pipeline_subdir, "RUN", "8_pointless: completed")
-
-                        self._aimless("9_aimless", params,
-                                      prev_pointless_id="8_pointless", prev_aimless_id="6_aimless",
-                                      apply_res_cutoff=True)
-                        self._log(pipeline_subdir, "RUN", "9_aimless: completed")
-
-                        last_aimless_id = "9_aimless"
-                        last_xds_id     = "7_xds"
-                    else:
-                        self._log(pipeline_subdir, "ERROR",
-                                  f"7_xds: {self._xds_error(pipeline_subdir, '7_xds') or 'unknown error'}")
-
-                self._rfree("10_rfree", params, prev_aimless_id=last_aimless_id)
-                self._log(pipeline_subdir, "RUN", "10_rfree: completed")
-                self._xtriage("11_xtriage", params, prev_xds_id=last_xds_id)
-
-                summary = self._aimless_summary(
-                    pipeline_subdir / last_aimless_id / f"{last_aimless_id}.log")
-                self._log(pipeline_subdir, "DONE", summary)
-                QRefineWriter(params["process_dir"]).write()
-
+                last_aimless_id = "9_aimless"
+                last_xds_id     = "7_xds"
             else:
                 self._log(pipeline_subdir, "ERROR",
-                          f"4_xds: {self._xds_error(pipeline_subdir, '4_xds') or 'unknown error'}")
+                          f"7_xds: {self._xds_error(pipeline_subdir, '7_xds') or 'unknown error'}")
 
-        elif (pipeline_subdir / "1_xds" / "XPARM.XDS").is_file():
-            err = self._xds_error(pipeline_subdir, "1_xds") or "indexing failed"
-            self._log(pipeline_subdir, "ERROR", f"1_xds: {err}")
-            self._log(pipeline_subdir, "FORCE", "submitting forced integration jobs")
-            self._run_forced_integration(params, pipeline_subdir)
-        else:
-            self._log(pipeline_subdir, "ERROR", "1_xds: XDS did not attempt to index")
+        self._rfree("10_rfree", params, prev_aimless_id=last_aimless_id)
+        self._log(pipeline_subdir, "RUN", "10_rfree: completed")
+        self._xtriage("11_xtriage", params, prev_xds_id=last_xds_id)
 
-    def _run_forced_integration(self, params, pipeline_subdir):
+        summary = self._aimless_summary(
+            pipeline_subdir / last_aimless_id / f"{last_aimless_id}.log")
+        self._log(pipeline_subdir, "DONE", summary)
+        QRefineWriter(params["process_dir"]).write()
+
+    def _run_forced_integration(self, params, pipeline_subdir, retry_mode=None):
         """
         Enumerate candidate space groups and submit a second SGE array for
         forced integration. Mirrors the XPARM.XDS branch of xds_pipeline_index_qsub.sh.
         """
+        retry_mode = retry_mode if retry_mode is not None else self.retry_mode
+        if retry_mode == "auto":
+            retry_mode = "best"
         known_sg = params.get("known_sg", "none")
         if known_sg != "none":
             sym_to_try = [(
@@ -1616,8 +1687,13 @@ RunProcess(params).{method}()
                 params["known_sg_number"],
                 params.get("known_cell", "none"),
             )]
+        elif retry_mode == "p1":
+            xparm = pipeline_subdir / "1_xds" / "XPARM.XDS"
+            cell = self._cell_from_xparm(xparm)
+            sym_to_try = [("1", "P1", "1", cell)]
         else:
-            sym_to_try = self._sym_from_idxref(pipeline_subdir / "1_xds" / "IDXREF.LP")
+            sym_to_try = self._sym_from_idxref(
+                pipeline_subdir / "1_xds" / "IDXREF.LP", retry_mode)
 
         if not sym_to_try:
             print("## No candidate lattices found in IDXREF.LP")
@@ -1699,9 +1775,9 @@ RunProcess(params).{method}()
 
         self._log(pipeline_subdir, "RUN", "4_xds: completed")
 
-        # 5_pointless
+        # 5_pointless: free run — forced SG may differ from the true SG found by 2_pointless
         self._pointless("5_pointless", params,
-                        prev_xds_id="4_xds", prev_aimless_id="3_aimless")
+                        prev_xds_id="4_xds", prev_aimless_id=None)
         self._log(pipeline_subdir, "RUN", "5_pointless: completed")
 
         # 6_aimless: with cutoff
@@ -1723,9 +1799,9 @@ RunProcess(params).{method}()
 
         self._log(pipeline_subdir, "RUN", "7_xds: completed")
 
-        # 8_pointless
+        # 8_pointless: free run — all forced-path Pointless steps are SG-agnostic
         self._pointless("8_pointless", params,
-                        prev_xds_id="7_xds", prev_aimless_id="6_aimless")
+                        prev_xds_id="7_xds", prev_aimless_id=None)
         self._log(pipeline_subdir, "RUN", "8_pointless: completed")
 
         # 9_aimless

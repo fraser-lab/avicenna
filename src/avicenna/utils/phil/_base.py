@@ -11,6 +11,40 @@ def _simplify_choices(s: str) -> str:
     return re.sub(r'(=[ \t]*)(?:\w+[ \t]+)*\*(\w+)(?:[ \t]+\w+)*', r'\1\2', s)
 
 
+def _choice_names_from_def(phil_def: str) -> frozenset:
+    """Scan a PHIL definition string and return names of all choice-type params.
+
+    freephil validates choice values case-sensitively, so values like 'P1'
+    would silently fail validation and revert to the previous setting.
+    We collect these names once so adopt_phil_string can normalize them first.
+    """
+    names = set()
+    lines = phil_def.splitlines()
+    for i, line in enumerate(lines):
+        if re.search(r'\.type\s*=\s*choice', line):
+            for j in range(i - 1, max(i - 6, -1), -1):
+                m = re.match(r'[ \t]*(\w+)\s*=', lines[j])
+                if m:
+                    names.add(m.group(1))
+                    break
+    return frozenset(names)
+
+
+def _normalize_choice_case(text: str, choice_names: frozenset) -> str:
+    """Lowercase values of choice-type params in a raw PHIL string.
+
+    Only unquoted single-word values are affected; everything else is left alone.
+    """
+    if not choice_names:
+        return text
+    pattern = (
+        r'(?m)^([ \t]*)('
+        + '|'.join(re.escape(n) for n in sorted(choice_names, key=len, reverse=True))
+        + r')([ \t]*=[ \t]*)([^\s"\'#][^\s#]*|[^\s"\'#])'
+    )
+    return re.sub(pattern, lambda m: m.group(1) + m.group(2) + m.group(3) + m.group(4).lower(), text)
+
+
 class PhilBase:
     """Abstract base for all Avicenna PHIL parameter objects.
 
@@ -23,6 +57,7 @@ class PhilBase:
     def __init__(self):
         self._master = freephil.parse(self.phil_def)
         self._params = self._master.fetch().extract()
+        self._choice_names = _choice_names_from_def(self.phil_def)
 
     # ------------------------------------------------------------------
     # Properties
@@ -44,6 +79,7 @@ class PhilBase:
 
     def adopt_phil_string(self, phil_string: str):
         """Merge a PHIL-formatted string into the current params."""
+        phil_string = _normalize_choice_case(phil_string, self._choice_names)
         user_phil = freephil.parse(phil_string)
         current_phil = freephil.parse(self.as_phil_string())
         self._params = self._master.fetch(sources=[current_phil, user_phil]).extract()

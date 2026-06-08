@@ -8,7 +8,7 @@ import subprocess
 import time
 from importlib.metadata import version, PackageNotFoundError
 sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "src"))
-from avicenna.utils.utils import DataFinder, ParamWriter, Watcher, ProcessingScraper, ProcessingFilter
+from avicenna.utils.utils import DataFinder, ParamWriter, Watcher, ProcessingScraper, ProcessingFilter, ProgressBar
 from avicenna.pipelines.legacy.proc_pipeline import RunProcess
 from avicenna.pipelines.processing import ProcessingOrchestrator
 from avicenna.utils.phil import ProcessingPHIL, AvicennaPHIL
@@ -34,6 +34,7 @@ parser.add_argument("--legacy", action="store_true",
 parser.add_argument("-o", "--output", type=pathlib.Path, default=pathlib.Path(os.curdir), help="Path to output folder (default: current directory)")
 parser.add_argument("--dry_run", action="store_true", help=f"Create pin_list.txt and {_DEFAULT_PHIL} without submitting jobs")
 parser.add_argument("--silent",    action="store_true", help="Submit jobs without tailing the log")
+parser.add_argument("--prog_log",  action="store_true", help="Tail pipeline logs with a compact progress bar pinned below")
 parser.add_argument("--no_filter", action="store_true", help="Skip quality filter when writing qrefine_list.txt; write all completed results")
 parser.add_argument("--xds_root", type=pathlib.Path, help="Path to the XDS install folder, default is an SBGrid install (/programs/<OS>/xds)")
 _phil_group = parser.add_mutually_exclusive_group()
@@ -57,7 +58,9 @@ XDS_PARAM_DEFAULTS = {
     "script_dir":            "../scripts",
     "detector_edge":         "0.8",
     "indexing_images":       "first_half",
-    "try_alt_sym":           "all",
+    "on_indexing_failure":   "auto",
+    "retry_mode":            "auto",
+    "on_integration_failure": "reject",
     "ncpu":                  "8",
     "no_symmetry":           "false",
     "scaling":               "correct",
@@ -95,6 +98,23 @@ def _read_xds_params(filepath):
             if key in XDS_PARAM_DEFAULTS:
                 result[key] = value.strip()
     return result
+
+
+def _watch_with_bar(watcher, omnibus):
+    """Tail per-dataset pipeline logs with a compact progress bar pinned below.
+
+    Each tick: erase the bar, emit any new log lines in its place, then
+    redraw the bar below them.  The braille spinner in the legend line animates
+    continuously so a frozen terminal is immediately visible.
+    """
+    bar = ProgressBar(watcher, multiline=True, separator=True)
+    while True:
+        bar.erase()
+        watcher.tail_logs(log_file=omnibus)
+        still_running = bar.draw()
+        if not still_running:
+            break
+        time.sleep(1)
 
 
 def main():
@@ -236,14 +256,17 @@ processing {{
             return
 
         watcher = Watcher(procpath=procpath)
-        while True:
-            watcher.tail_logs(log_file=omnibus)
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                still_running = watcher.show_progress()
-            if not still_running:
-                break
-            time.sleep(1)
+        if args.prog_log:
+            _watch_with_bar(watcher, omnibus)
+        else:
+            while True:
+                watcher.tail_logs(log_file=omnibus)
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    still_running = watcher.show_progress()
+                if not still_running:
+                    break
+                time.sleep(1)
         watcher.tail_logs(log_file=omnibus)
         print()
         watcher.print_summary(omnibus=omnibus)

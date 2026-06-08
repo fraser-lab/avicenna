@@ -105,7 +105,11 @@ def _sentinel_in_dir(directory: Path, sentinel: str) -> Path | None:
 
 def _find_bin_in_version_dir(version_dir: Path, entry) -> Path | None:
     """Return the bin_dir for *entry*'s sentinel within *version_dir*,
-    accounting for subdir_prefix and search_subdirs."""
+    accounting for subdir_prefix and search_subdirs.
+
+    Raises PermissionError when a path inside *version_dir* is inaccessible,
+    so the caller can track and report which version dirs were restricted.
+    """
     sentinel = entry.sentinel or ""
     if not sentinel:
         return None
@@ -173,11 +177,16 @@ def find(name: str, root=None, version: str = "latest") -> tuple:
         )
 
     sbgrid_name = entry.sbgrid_name or name
+    restricted = []   # version dirs skipped due to PermissionError
     for suite_root in _sbgrid_suite_roots(sbgrid_name):
         if not (suite_root and suite_root.is_dir()):
             continue
+        try:
+            version_dirs = list(suite_root.iterdir())
+        except OSError:
+            continue
         candidates = []
-        for d in suite_root.iterdir():
+        for d in version_dirs:
             if not d.is_dir():
                 continue
             if entry.version_style == "date":
@@ -190,7 +199,11 @@ def find(name: str, root=None, version: str = "latest") -> tuple:
                     continue
             if not _version_matches(vtup, effective_version):
                 continue
-            bin_dir = _find_bin_in_version_dir(d, entry)
+            try:
+                bin_dir = _find_bin_in_version_dir(d, entry)
+            except PermissionError:
+                restricted.append(d)
+                continue
             if bin_dir:
                 candidates.append((vtup, bin_dir, d.name))
         if candidates:
@@ -203,9 +216,15 @@ def find(name: str, root=None, version: str = "latest") -> tuple:
             return Path(path).parent, "unknown"
 
     suffix = f" (version {version})" if version != "latest" else ""
+    restricted_note = (
+        f"  Note: {len(restricted)} version director{'y' if len(restricted) == 1 else 'ies'} "
+        f"could not be accessed due to permissions:\n"
+        + "\n".join(f"    {p}" for p in restricted)
+    ) if restricted else ""
     raise FileNotFoundError(
         f"{name}{suffix} not found.  "
         f"Source SBGrid or ensure {entry.path_fallback or [name]} is on PATH."
+        + (f"\n{restricted_note}" if restricted_note else "")
     )
 
 

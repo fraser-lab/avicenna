@@ -251,7 +251,9 @@ class ProcessingPipelineInterpreter:
                         triggered_forced = True
                         self.rp._log(pipeline_subdir, "FORCE",
                                      "submitting forced integration jobs")
-                        self.rp._run_forced_integration(params, pipeline_subdir)
+                        self.rp._run_forced_integration(
+                            params, pipeline_subdir,
+                            retry_mode=result.get("retry_mode"))
                     fatal_break = True
                     break
                 # Non-fatal error: log and continue.

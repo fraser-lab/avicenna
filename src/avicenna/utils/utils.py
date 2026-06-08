@@ -19,7 +19,7 @@ _LOG_DECORATIONS = {
 _TAG_WIDTH = 12
 
 
-def format_log_line(tag, message, context=None, context_width=None):
+def format_log_line(tag, message, context=None, context_width=None, forced_dir=None):
     """Return a formatted pipeline log line.
 
     The tag field is fixed-width (_TAG_WIDTH). Tags in _LOG_DECORATIONS get
@@ -27,6 +27,8 @@ def format_log_line(tag, message, context=None, context_width=None):
     (e.g. a job_id) is inserted in brackets between the tag field and the
     message. If context_width is given, the context is left-padded to that
     width so the message column stays aligned across all log lines.
+    forced_dir, when present, is inserted in brackets immediately before the
+    message to identify forced-integration retry jobs.
     """
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     decoration = _LOG_DECORATIONS.get(tag, "")
@@ -36,7 +38,8 @@ def format_log_line(tag, message, context=None, context_width=None):
         ctx = f"[ {ctx_str} ]  "
     else:
         ctx = ""
-    return f"[{ts}] {tag_field}  {ctx}{message}\n"
+    prefix = f"[{forced_dir}]  " if forced_dir else ""
+    return f"[{ts}] {tag_field}  {ctx}{prefix}{message}\n"
 
 # Bravais lattice → list of (sg_number, sg_name) tuples.
 # Derived from xds_lattices.txt in the processing pipeline scripts directory.
@@ -65,6 +68,47 @@ BRAVAIS_LATTICES = {
     "cF": [(196, "F23"),    (209, "F432"),   (210, "F4132")],
     "cI": [(197, "I23"),    (199, "I213"),   (211, "I432"),   (214, "I4132")],
 }
+
+_SG_BY_NAME:   dict = {}
+_SG_BY_NUMBER: dict = {}
+for _lat_sgs in BRAVAIS_LATTICES.values():
+    for _num, _name in _lat_sgs:
+        _SG_BY_NAME[_name.upper()] = (_num, _name)
+        _SG_BY_NUMBER[_num]        = (_num, _name)
+
+# Short / alternative symbols that differ from the canonical XDS name.
+# Monoclinic: IUCr short symbol omits the identity axis positions.
+# Rhombohedral: H-prefix names denote the hexagonal setting used by CCP4/Pointless.
+_SG_ALIASES = {
+    "P2":  "P121",   # SG 3
+    "P21": "P1211",  # SG 4
+    "H3":  "R3",     # SG 146, hexagonal setting
+    "H32": "R32",    # SG 155, hexagonal setting
+}
+for _alias, _canonical in _SG_ALIASES.items():
+    _SG_BY_NAME[_alias] = _SG_BY_NAME[_canonical]
+
+
+def sg_lookup(space_group=None, space_group_number=None):
+    """Return (number, canonical_name) for a space group specification.
+
+    Pass exactly one argument; raises ValueError if the lookup fails.
+    Names are matched case-insensitively with spaces stripped
+    (e.g. 'P43212', 'p 43 2 12', 'P 43 21 2' all resolve to SG 96).
+    """
+    if space_group is not None:
+        key = space_group.strip().upper().replace(" ", "")
+        if key not in _SG_BY_NAME:
+            raise ValueError(
+                f"Unknown space group name {space_group!r}. "
+                "Use XDS-style names (e.g. 'P43212', 'C2', 'I222')."
+            )
+        return _SG_BY_NAME[key]
+    if space_group_number is not None:
+        if space_group_number not in _SG_BY_NUMBER:
+            raise ValueError(f"Unknown space group number {space_group_number}.")
+        return _SG_BY_NUMBER[space_group_number]
+    raise ValueError("Provide space_group or space_group_number.")
 
 
 class DataFinder(object):
@@ -126,7 +170,9 @@ class ParamWriter(object):
             'image_dir':             image_dir,
             'detector_edge':         '0.8',
             'indexing_images':       'first_half',
-            'try_alt_sym':           'all',
+            'on_indexing_failure':   'auto',
+            'retry_mode':            'auto',
+            'on_integration_failure': 'reject',
             'ncpu':                  '8',
             'no_symmetry':           'false',
             'scaling':               'correct',
@@ -1116,9 +1162,10 @@ class ProgressBar:
         "PanDDAWatcher"     : lambda path: "Running panDDA",
     }
 
-    def __init__(self, watcher, multiline=False, title=None):
+    def __init__(self, watcher, multiline=False, title=None, separator=False):
         self.watcher = watcher
         self.multiline = multiline
+        self.separator = separator
         self._drawn = False
         self._prev_lines = 0  # lines printed on last draw (multiline mode)
         if title is not None:
@@ -1132,6 +1179,21 @@ class ProgressBar:
         n   = len(self._SPINNER_CHARS)
         idx = int((time.time() % self._SPINNER_PERIOD) / self._SPINNER_PERIOD * n)
         return self._SPINNER_CHARS[idx % n]
+
+    def erase(self):
+        """Clear the bar area so new content can be printed above it.
+
+        Moves the cursor to the top-left of the bar block, clears to end of
+        screen, and resets draw state so the next draw() call prints fresh.
+        """
+        if not self._drawn:
+            return
+        n_up = (self._prev_lines - 1) if self.multiline else 1
+        if n_up > 0:
+            print(f"\033[{n_up}A", end="")
+        print("\r\033[J", end="", flush=True)
+        self._drawn = False
+        self._prev_lines = 0
 
     def draw(self):
         """Redraw progress in place. Returns True if any jobs still running."""
@@ -1161,7 +1223,7 @@ class ProgressBar:
         if self._drawn:
             print("\033[1A\r", end="")   # up 1 line, back to column 0
 
-        print(f"\033[2K{self._SIMPLE_LEGEND}")
+        print(f"\033[2K {self._spinner_char()}  {self._SIMPLE_LEGEND}")
         print(f"\033[2K({finished + failed + rejected}/{total}) [{bar}]",
               end="", flush=True)
         self._drawn = True
@@ -1182,9 +1244,11 @@ class ProgressBar:
         }
         active = [(label, counts[key]) for label, key, _sym in self._MULTILINE_CATEGORIES]
 
-        bar_width = 40
+        bar_width = min(total, 50) if total > 0 else 50
         denom = total or 1
         new_lines = len(active) + 1  # +1 for title line
+        if self.separator:
+            new_lines += 1
 
         # Reposition cursor to start of our block.
         # Cursor sits at end of last printed line (no trailing \n).
@@ -1192,6 +1256,11 @@ class ProgressBar:
             if self._prev_lines > 1:
                 print(f"\033[{self._prev_lines - 1}A", end="")
             print("\r", end="")
+
+        # Optional separator between log output above and the bar block.
+        # Fixed width avoids wrapping when the terminal is resized at runtime.
+        if self.separator:
+            print(f"\033[2K{'─' * 72}")
 
         # Title line with spinner
         print(f"\033[2K {self._spinner_char()}  {self._title}")
