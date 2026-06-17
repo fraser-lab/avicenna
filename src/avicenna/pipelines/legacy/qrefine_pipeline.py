@@ -473,6 +473,39 @@ class QRefineWorker:
         self.context_width = context_width
         self.fill          = fill
 
+    def _extra_params(self, suffix):
+        """Per-suffix params merged into params_{suffix}.json.
+
+        Override hook: subclasses (e.g. the PHIL interpreter orchestrator) add
+        keys such as ``phil_string`` here.  Base behavior adds nothing.
+        """
+        return {}
+
+    def _sbgrid_block(self):
+        """Shell command lines that capture the SBGrid environment.
+
+        Override hook: subclasses can chain additional setup scripts (e.g.
+        CCP4/Phenix ``setup-sh``) after the base SBGrid sourcing.
+        """
+        return (
+            "shell = os.environ.get('SHELL', '/bin/bash')\n"
+            "if any(s in shell for s in ('csh', 'tcsh')):\n"
+            "    _sbgrid_cmd = \"tcsh -c 'source /programs/sbgrid.cshrc && env'\"\n"
+            "else:\n"
+            "    _sbgrid_cmd = \"bash --norc --noprofile -c 'source /programs/sbgrid.shrc && env'\"\n"
+        )
+
+    def _worker_body(self, suffix):
+        """Python source that loads params and runs the per-dataset job.
+
+        Override hook: subclasses swap ``RunQRefineJob`` for the PHIL
+        interpreter.  The script's CWD is the dataset job_dir at run time.
+        """
+        return (
+            "from avicenna.pipelines.legacy.qrefine_pipeline import RunQRefineJob\n"
+            "RunQRefineJob(params).run()\n"
+        )
+
     def write(self):
         d = self.dataset
         p = self.mr_params
@@ -491,26 +524,23 @@ class QRefineWorker:
             per_params = {**p, "mtz": str(d.mtz_path), "suffix": suffix,
                           "pin": d.pin, "job_id": job_id,
                           "context_width": self.context_width,
-                          "fill": self.fill}
+                          "fill": self.fill,
+                          **self._extra_params(suffix)}
             script_path = d.job_dir / f"run_qrefine_{suffix}.py"
 
             pathlib.Path(d.job_dir / f"params_{suffix}.json").write_text(
                 json.dumps(per_params, indent=2)
             )
 
+            import_and_run = self._worker_body(suffix)
+            sbgrid_block = self._sbgrid_block()
             script_path.write_text(f"""\
 #!/usr/bin/env python3
 import json, os, subprocess, sys
 from pathlib import Path
 sys.path.insert(0, {_src_dir!r})
-from avicenna.pipelines.legacy.qrefine_pipeline import RunQRefineJob
 
-shell = os.environ.get('SHELL', '/bin/bash')
-if any(s in shell for s in ('csh', 'tcsh')):
-    _sbgrid_cmd = "tcsh -c 'source /programs/sbgrid.cshrc && env'"
-else:
-    _sbgrid_cmd = "bash --norc --noprofile -c 'source /programs/sbgrid.shrc && env'"
-_result = subprocess.run(_sbgrid_cmd, shell=True, capture_output=True, text=True)
+{sbgrid_block}_result = subprocess.run(_sbgrid_cmd, shell=True, capture_output=True, text=True)
 for _line in _result.stdout.splitlines():
     if '=' in _line:
         _key, _, _val = _line.partition('=')
@@ -524,8 +554,7 @@ print(f"crystal : {{params.get('crystal_name', 'n/a')}}")
 print(f"mtz     : {{params.get('mtz', 'n/a')}}")
 print(f"suffix  : {{params.get('suffix', 'n/a')}}")
 print("=" * 60, flush=True)
-RunQRefineJob(params).run()
-""")
+{import_and_run}""")
             script_path.chmod(script_path.stat().st_mode | stat.S_IXUSR | stat.S_IRUSR | stat.S_IWUSR)
             scripts.append(script_path)
 
@@ -586,6 +615,14 @@ class RunQRefine:
                     pin, crystal_name, cell_refined, index, integration, self.process_dir
                 ))
         return datasets
+
+    def _make_worker(self, dataset, params, context_width):
+        """Build the worker that writes per-suffix scripts for one dataset.
+
+        Override hook: ``RefinementOrchestrator`` returns a worker whose scripts
+        invoke the PHIL interpreter instead of ``RunQRefineJob``.
+        """
+        return QRefineWorker(dataset, params, context_width=context_width, fill=self.fill)
 
     def _write_qsub_submit(self, qsub_list, njob):
         submit_path = self.process_dir / "qrefine_qsub_submit.sh"
@@ -715,7 +752,7 @@ pandda.analyse \\
             dataset.job_dir.mkdir(parents=True)
 
             params = mr_params.get(dataset.crystal_name)
-            scripts = QRefineWorker(dataset, params, context_width=context_width, fill=self.fill).write()
+            scripts = self._make_worker(dataset, params, context_width).write()
 
             with open(qsub_list, 'a') as fh:
                 for script in scripts:

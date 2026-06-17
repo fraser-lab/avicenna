@@ -27,17 +27,10 @@ import time
 from datetime import datetime
 from pathlib import Path
 sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "src"))
-from avicenna.utils.utils import BRAVAIS_LATTICES, QRefineWriter, format_log_line, ProcessingWatcher, sg_lookup
+from avicenna.utils.utils import BRAVAIS_LATTICES, QRefineWriter, format_log_line, ProcessingWatcher, sg_lookup, count_hdf5_images
 from avicenna.utils.software import find_xds, find_ccp4, find_phenix, suite_setup_sources
 
 
-
-
-# TODO: HDF5 image counting is not yet implemented.
-# Eiger master files vary significantly in internal structure across firmware
-# versions and beamlines, and some future formats do not yet exist.  Until a
-# robust multi-format reader is available, the MIN_IMAGES check is skipped for
-# HDF5 datasets.  See RunProcess.run() for the skip logic.
 
 
 class RunBase:
@@ -164,11 +157,15 @@ class RunXDS(RunBase):
             xds_inp.write_text(text)
 
     def _inject_lib(self, xds_inp):
-        """Prepend LIB= to XDS.INP so neggia can read HDF5 data. No-op for CBF."""
+        """Prepend LIB= to XDS.INP so neggia can read HDF5 data. No-op for CBF
+        or when an active LIB= line is already present."""
         if self.data_format != 'hdf5':
             return
+        existing = xds_inp.read_text()
+        if any(line.lstrip().startswith("LIB=") for line in existing.splitlines()):
+            return
         neggia = self._xds_dir / "lib" / "dectris-neggia.so"
-        xds_inp.write_text(f"LIB={neggia}\n" + xds_inp.read_text())
+        xds_inp.write_text(f"LIB={neggia}\n" + existing)
 
     def _recycle_detector_params(self, xds_dir, xds_inp, is_job2=False):
         """
@@ -339,11 +336,11 @@ class RunXDS(RunBase):
             "JOB= XYCORR INIT COLSPOT IDXREF DEFPIX INTEGRATE CORRECT",
             "JOB= DEFPIX INTEGRATE CORRECT",
         )
-        if self.data_format == 'hdf5':
-            master = self.image_dir / f"{self.image_prefix}_master.h5"
-            text = re.sub(r"NAME_TEMPLATE_OF_DATA_FRAMES=.*",
-                          f"NAME_TEMPLATE_OF_DATA_FRAMES={master}", text)
-        else:
+        if self.data_format == 'cbf':
+            # CBF NAME_TEMPLATE may need to be re-pointed at the original image
+            # dir (the source XDS.INP may reference a scratch path from a prior
+            # task).  HDF5 templates use a ?????? placeholder that's already
+            # correct in the copied XDS.INP, so leave them alone.
             text = re.sub(r"NAME_TEMPLATE_OF_DATA_FRAMES=.*",
                           f"NAME_TEMPLATE_OF_DATA_FRAMES={self.image_dir}/{self.image_prefix}_0????.cbf",
                           text)
@@ -351,9 +348,11 @@ class RunXDS(RunBase):
         self._inject_lib(job_dir / "XDS.INP")
 
         shutil.copy(str(xparm), "XPARM.XDS")
-        if self.data_format == 'cbf':
-            for cbf in xds_dir.glob("*.cbf"):
-                shutil.copy(str(cbf), ".")
+        # Copy XDS-generated correction frames (X-CORRECTIONS, Y-CORRECTIONS,
+        # BKGINIT, BLANK, GAIN, ...). Raw images live in image_dir for CBF and
+        # in the HDF5 master for hdf5, so this glob only catches XDS output.
+        for cbf in xds_dir.glob("*.cbf"):
+            shutil.copy(str(cbf), ".")
 
         self._run_xds()
         self._run_xdsstat()
@@ -390,9 +389,8 @@ class RunXDS(RunBase):
         os.chdir(job_dir)
 
         shutil.copy(str(xds_dir / "XDS.INP"), "XDS.INP")
-        if self.data_format == 'cbf':
-            for cbf in xds_dir.glob("*.cbf"):
-                shutil.copy(str(cbf), ".")
+        for cbf in xds_dir.glob("*.cbf"):
+            shutil.copy(str(cbf), ".")
         shutil.copy(str(xds_dir / "XPARM.XDS"), "XPARM.XDS")
 
         self._recycle_detector_params(xds_dir, job_dir / "XDS.INP", is_job2=True)
@@ -419,9 +417,8 @@ class RunXDS(RunBase):
         os.chdir(job_dir)
 
         shutil.copy(str(xds_dir / "XDS.INP"), "XDS.INP")
-        if self.data_format == 'cbf':
-            for cbf in xds_dir.glob("*.cbf"):
-                shutil.copy(str(cbf), ".")
+        for cbf in xds_dir.glob("*.cbf"):
+            shutil.copy(str(cbf), ".")
         shutil.copy(str(xds_dir / "XPARM.XDS"), "XPARM.XDS")
 
         xds_inp = job_dir / "XDS.INP"
@@ -1366,6 +1363,16 @@ RunProcess(params).{method}()
             with open(Path(pipeline_subdir) / "pipeline.log", "a") as fh:
                 fh.write(line)
 
+    def _record_rejection(self, pin_id, reason):
+        """Record a rejected dataset: write a per-pin marker so the scraper
+        can surface the reason, and log REJECT to the omnibus log.
+        """
+        rejected_dir = self._output_dir / ".rejected"
+        rejected_dir.mkdir(exist_ok=True)
+        (rejected_dir / f"{pin_id}.txt").write_text(reason + "\n")
+        self.params["pin_id"] = pin_id
+        self._log(None, "REJECT", reason)
+
     def _aimless_summary(self, log_path):
         """Extract SG, resolution, completeness, multiplicity, and Rpim
         from the last 100 lines of an aimless log. Returns a string."""
@@ -1433,6 +1440,11 @@ RunProcess(params).{method}()
         self._output_dir.mkdir(exist_ok=True)
         self._logs_dir.mkdir(exist_ok=True)
 
+        # Wipe stale rejection markers from any prior run in this output dir.
+        rejected_dir = self._output_dir / ".rejected"
+        if rejected_dir.is_dir():
+            shutil.rmtree(rejected_dir)
+
         sym_entries = self._known_symmetry_entries()
 
         self._context_width = ProcessingWatcher(procpath=self._output_dir).context_width
@@ -1446,21 +1458,47 @@ RunProcess(params).{method}()
             data_range  = parts[2].strip() if len(parts) > 2 else "false"
             collection_id = Path(collection).name.replace("_transfer", "")
 
-            image_dir = Path(collection) / pin_id
+            pin_root = Path(collection) / pin_id
 
             # Detect data format and build per-series groups.
-            # HDF5: each master file is one series; image counting deferred (see TODO above).
-            # CBF: group files by series key (strip frame-number suffix).
-            hdf5_masters = sorted(image_dir.glob(f"{pin_id}_*_master.h5"))
+            # HDF5 masters may be nested under per-scan subdirs (e.g. NSLS layout
+            # <pin>/<N>/<pin>/<pin>_<run>_master.h5); raster pre-scans live in
+            # rasterImages/ and are filtered out.  Each master is its own series.
+            # CBF files are expected directly under the pin dir; group by series key.
+            if not pin_root.is_dir():
+                reason = f"image directory not found: {pin_root}"
+                print(f"No image dir for {pin_id} — skipping")
+                self._record_rejection(f"{collection_id}_{pin_id}", reason)
+                continue
+
+            hdf5_masters = sorted(
+                m for m in pin_root.rglob(f"{pin_id}_*_master.h5")
+                if "rasterImages" not in m.parts and "_r_Raster_" not in m.name
+            )
             if hdf5_masters:
                 data_format = 'hdf5'
                 groups = {m.stem[:-7]: [m] for m in hdf5_masters}  # strip "_master"
             else:
                 data_format = 'cbf'
                 groups = {}
-                for f in image_dir.glob(f"{pin_id}_*.cbf"):
+                for f in pin_root.glob(f"{pin_id}_*.cbf"):
                     series_key = "_".join(f.stem.split("_")[:-1])
                     groups.setdefault(series_key, []).append(f)
+
+            if not groups:
+                # No diffraction data: any *_master.h5 was filtered as a raster
+                # pre-scan, and no CBF series were found.
+                any_raster = any(
+                    "_r_Raster_" in m.name or "rasterImages" in m.parts
+                    for m in pin_root.rglob(f"{pin_id}_*_master.h5")
+                )
+                if any_raster:
+                    reason = "no diffraction data — only raster pre-scans present"
+                else:
+                    reason = f"no diffraction data found in {pin_root}"
+                print(f"No diffraction data for {pin_id} — skipping")
+                self._record_rejection(f"{collection_id}_{pin_id}", reason)
+                continue
 
             for series_key, files in sorted(groups.items()):
                 pin_dir_check = self._output_dir / f"{collection_id}_{series_key}"
@@ -1468,23 +1506,34 @@ RunProcess(params).{method}()
                     print(f"Output folder already exists — skipping {series_key}")
                     continue
 
+                # For HDF5 the master file's parent is the per-dataset image_dir;
+                # for CBF the pin dir is the image_dir.
+                if data_format == 'hdf5':
+                    image_dir = files[0].parent
+                else:
+                    image_dir = pin_root
+
                 if data_range == "false":
                     if data_format == 'hdf5':
-                        image_count = None  # HDF5 image counting not yet implemented (see TODO)
-                        first_image = 1
+                        try:
+                            image_count = count_hdf5_images(files[0])
+                        except Exception as exc:
+                            reason = f"HDF5 image count unreadable: {exc}"
+                            print(f"Could not read image count from {files[0]}: {exc} — skipping {series_key}")
+                            self._record_rejection(f"{collection_id}_{series_key}", reason)
+                            continue
                     else:
                         image_count = len(files)
-                        first_image = 1
+                    first_image = 1
                 else:
                     first_str, last_str = data_range.split("-")
                     first_image = int(first_str)
                     image_count = int(last_str)
 
-                if data_format == 'cbf' and image_count is not None and image_count < self.MIN_IMAGES:
+                if image_count is not None and image_count < self.MIN_IMAGES:
+                    reason = f"partial dataset ({image_count} images, minimum is {self.MIN_IMAGES})"
                     print(f"Partial dataset ({image_count} images) — skipping {series_key}")
-                    self.params["pin_id"] = f"{collection_id}_{series_key}"
-                    self._log(None, "REJECT",
-                              f"partial dataset ({image_count} images, minimum is {self.MIN_IMAGES})")
+                    self._record_rejection(f"{collection_id}_{series_key}", reason)
                     continue
 
                 pin_dir = self._output_dir / f"{collection_id}_{series_key}"

@@ -111,6 +111,43 @@ def sg_lookup(space_group=None, space_group_number=None):
     raise ValueError("Provide space_group or space_group_number.")
 
 
+def count_hdf5_images(master_path):
+    """Return the number of diffraction images in a Dectris Eiger HDF5 master file.
+
+    Tries the omega axis (one entry per image) first, since it is the most
+    direct count. Falls back to nimages*ntrigger from detectorSpecific.
+    Raises ValueError if neither path is present.
+    """
+    import h5py
+    with h5py.File(str(master_path), "r") as f:
+        omega = f.get("/entry/sample/goniometer/omega")
+        if omega is not None and omega.shape:
+            return int(omega.shape[0])
+        ds = f.get("/entry/instrument/detector/detectorSpecific")
+        if ds is not None and "nimages" in ds and "ntrigger" in ds:
+            return int(ds["nimages"][()]) * int(ds["ntrigger"][()])
+    raise ValueError(f"Could not determine image count from {master_path}")
+
+
+def has_image_data(path, max_depth=4):
+    """Return True if *path* contains any *_master.h5 or *.cbf file within
+    *max_depth* subdirectory levels (inclusive).
+
+    Used by DataFinder to skip non-dataset sibling folders (e.g. autoProc_dir,
+    jpegs) so they don't inflate the pin list.  Folders with only raster
+    pre-scans still pass — they're filtered downstream with a specific reason.
+    """
+    base = os.path.normpath(str(path))
+    base_sep = base.count(os.sep)
+    for root, dirs, files in os.walk(base):
+        if root.count(os.sep) - base_sep >= max_depth:
+            dirs[:] = []
+        for fname in files:
+            if fname.endswith('_master.h5') or fname.endswith('.cbf'):
+                return True
+    return False
+
+
 class DataFinder(object):
 
     def __init__(self, paths):
@@ -145,7 +182,11 @@ class DataFinder(object):
         self.image_dir = parents.pop()
         for path in self.paths:
             for sf in sorted(os.listdir(path)):
-                if not os.path.isdir(os.path.join(path, sf)):
+                sub = os.path.join(path, sf)
+                if not os.path.isdir(sub):
+                    continue
+                if not has_image_data(sub):
+                    print(f"Skipping {sf} — no image data")
                     continue
                 pin_line = f"{path},{sf}"
                 print(pin_line)
@@ -202,6 +243,8 @@ class ScraperBase(object):
     def scrape_all(self):
         results = self.find_results()
         for result in results:
+            if result.get('outcome') == 'rejected':
+                continue
             updated_result = self.scrape_one_log(info_dict=result)
             if updated_result is None:
                 result['outcome'] = 'failed'
@@ -217,20 +260,29 @@ class ScraperBase(object):
     def _print_table_mixed(tagged_rows, headers):
         """Print rows as an aligned fixed-width table with two row formats.
 
-        tagged_rows is a list of (is_error, row) pairs:
-          - ok rows (is_error=False): full n-tuple matching headers
-          - error rows (is_error=True): (*id_cols, msg) where id_cols are the
-            leading columns to pad and msg is the error string (may be empty)
+        tagged_rows is a list of (status, row) pairs:
+          - ok rows (status=None): full n-tuple matching headers
+          - error rows (status=str, e.g. 'FAILED', 'REJECTED'): (*id_cols, msg)
+            where id_cols are the leading columns to pad and msg is the reason
+            string (may be empty). The status label appears in place of the
+            middle columns.
+
+        For backwards compatibility a bool status is treated as None/'FAILED'.
 
         Column widths are computed from headers and ok rows only, so error rows
-        do not inflate the column widths. Error rows print their id columns
-        padded to the same widths as ok rows, then 'FAILED' and the message
-        directly — skipping the empty middle columns entirely.
+        do not inflate the column widths.
         """
         if not tagged_rows:
             return
+        def _norm(status):
+            if status is False or status is None:
+                return None
+            if status is True:
+                return 'FAILED'
+            return str(status)
+        normalized = [(_norm(s), row) for s, row in tagged_rows]
         n = len(headers)
-        ok_rows = [row for is_err, row in tagged_rows if not is_err]
+        ok_rows = [row for status, row in normalized if status is None]
         widths = [
             max(len(str(headers[i])), max((len(str(r[i])) for r in ok_rows), default=0))
             for i in range(n - 1)
@@ -239,18 +291,18 @@ class ScraperBase(object):
             parts = [f'{str(row[i]):<{widths[i]}}' for i in range(n - 1)]
             parts.append(str(row[n - 1]))
             return '  '.join(parts).rstrip()
-        def fmt_err(row):
+        def fmt_err(label, row):
             n_ids = len(row) - 1
             parts = [f'{str(row[i]):<{widths[i]}}' for i in range(n_ids)]
-            parts.append('FAILED')
+            parts.append(label)
             if row[-1]:
                 parts.append(str(row[-1]))
             return '  '.join(parts).rstrip()
         header = fmt_ok(headers)
         print(header)
         print('-' * len(header))
-        for is_err, row in tagged_rows:
-            print(fmt_err(row) if is_err else fmt_ok(row))
+        for status, row in normalized:
+            print(fmt_err(status, row) if status else fmt_ok(row))
 
 
 class ProcessingScraper(ScraperBase):
@@ -412,7 +464,30 @@ class ProcessingScraper(ScraperBase):
                         'pipeline_subdir' : pipeline_subdir,
                         'outcome'         : 'unprocessed',
                     })
+        results.extend(self._find_rejections())
         return results
+
+    def _find_rejections(self):
+        """Read .rejected/*.txt markers written by RunProcess and return one
+        result dict per rejected pin so they surface in print_info().
+        """
+        rejected_dir = pathlib.Path(self.result_path) / ".rejected"
+        if not rejected_dir.is_dir():
+            return []
+        out = []
+        for marker in sorted(rejected_dir.glob("*.txt")):
+            try:
+                reason = marker.read_text().strip()
+            except OSError:
+                reason = "(could not read rejection marker)"
+            out.append({
+                'pin_code'    : marker.stem,
+                'dataset_code': marker.stem,
+                'result_path' : '',  # no result subdir for rejected pins
+                'error'       : reason,
+                'outcome'     : 'rejected',
+            })
+        return out
 
     def scrape_one_log(self, info_dict):
         logfile          = info_dict.get('aimless_log')
@@ -475,12 +550,13 @@ class ProcessingScraper(ScraperBase):
                     cell  = ' '.join(result['Average unit cell'])
                     res   = result['High resolution limit'][-1]
                     sg    = result['Space group']
-                    tagged_rows.append((False, (code, rtype, sg, cell, res, comp, mult, cc12, rpim, '')))
+                    tagged_rows.append((None, (code, rtype, sg, cell, res, comp, mult, cc12, rpim, '')))
                 except (KeyError, TypeError):
-                    tagged_rows.append((False, (code, rtype, '?', '?', '?', '?', '?', '?', '?', 'missing stats')))
+                    tagged_rows.append((None, (code, rtype, '?', '?', '?', '?', '?', '?', '?', 'missing stats')))
+            elif result['outcome'] == 'rejected':
+                tagged_rows.append(('REJECTED', (code, rtype, result.get('error', ''))))
             else:
-                error = result.get('error', '')
-                tagged_rows.append((True, (code, rtype, error)))
+                tagged_rows.append(('FAILED', (code, rtype, result.get('error', ''))))
         self._print_table_mixed(tagged_rows, HEADERS)
 
     def write_qrefine_list(self, path=None):
@@ -1168,6 +1244,7 @@ class ProgressBar:
         self.separator = separator
         self._drawn = False
         self._prev_lines = 0  # lines printed on last draw (multiline mode)
+        self._last_state = None  # cached count signature for spinner-only updates
         if title is not None:
             self._title = title
         else:
@@ -1194,6 +1271,7 @@ class ProgressBar:
         print("\r\033[J", end="", flush=True)
         self._drawn = False
         self._prev_lines = 0
+        self._last_state = None
 
     def draw(self):
         """Redraw progress in place. Returns True if any jobs still running."""
@@ -1243,6 +1321,18 @@ class ProgressBar:
             "no_longer_running":    finished + failed + rejected,
         }
         active = [(label, counts[key]) for label, key, _sym in self._MULTILINE_CATEGORIES]
+        state = (total, tuple(c for _, c in active), self.separator)
+
+        # If counts are unchanged since last full draw, update only the spinner
+        # char on the title line in place — leaves the rest of the bar untouched
+        # so it doesn't blink.  Cursor saved/restored via DEC SC/RC.
+        if self._drawn and self._last_state == state:
+            n_up = len(active)
+            sys.stdout.write(
+                f"\033[s\033[{n_up}A\r\033[2K {self._spinner_char()}  {self._title}\033[u"
+            )
+            sys.stdout.flush()
+            return in_progress > 0
 
         bar_width = min(total, 50) if total > 0 else 50
         denom = total or 1
@@ -1250,22 +1340,15 @@ class ProgressBar:
         if self.separator:
             new_lines += 1
 
-        # Reposition cursor to start of our block.
-        # Cursor sits at end of last printed line (no trailing \n).
+        # Build the full bar block as a single write so the redraw is visually atomic.
+        parts = []
         if self._drawn and self._prev_lines > 0:
             if self._prev_lines > 1:
-                print(f"\033[{self._prev_lines - 1}A", end="")
-            print("\r", end="")
-
-        # Optional separator between log output above and the bar block.
-        # Fixed width avoids wrapping when the terminal is resized at runtime.
+                parts.append(f"\033[{self._prev_lines - 1}A")
+            parts.append("\r")
         if self.separator:
-            print(f"\033[2K{'─' * 72}")
-
-        # Title line with spinner
-        print(f"\033[2K {self._spinner_char()}  {self._title}")
-
-        # Draw per-category lines
+            parts.append(f"\033[2K{'─' * 72}\n")
+        parts.append(f"\033[2K {self._spinner_char()}  {self._title}\n")
         for i, (label, count) in enumerate(active):
             n = round(count / denom * bar_width)
             if count > 0 and n == 0:
@@ -1273,22 +1356,20 @@ class ProgressBar:
             else:
                 bar = "█" * n
             line = f"\033[2K{label:>10}: {count:>4}/{total:<4} │{bar:<{bar_width}}"
-            if i < len(active) - 1:
-                print(line)
-            else:
-                print(line, end="", flush=True)
-
-        # Blank out any extra lines from the previous (longer) draw, then
+            parts.append(line + ("\n" if i < len(active) - 1 else ""))
+        # Blank out extra lines left over from a previous longer draw, then
         # move cursor back up so it sits at the end of the last real line.
         extra = self._prev_lines - new_lines
         if extra > 0:
             for _ in range(extra):
-                print()
-                print("\033[2K", end="")
-            print(f"\033[{extra}A", end="", flush=True)
+                parts.append("\n\033[2K")
+            parts.append(f"\033[{extra}A")
+        sys.stdout.write("".join(parts))
+        sys.stdout.flush()
 
         self._drawn = True
         self._prev_lines = new_lines
+        self._last_state = state
         return in_progress > 0
 
 

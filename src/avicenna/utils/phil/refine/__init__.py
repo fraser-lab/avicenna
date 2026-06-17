@@ -13,7 +13,7 @@ from pathlib import Path
 
 import freephil
 
-from avicenna.utils.phil._base import PhilBase
+from avicenna.utils.phil._base import PhilBase, _choice_names_from_def, _normalize_choice_case
 
 _PIPELINES_DIR = Path(__file__).parents[3] / "resources" / "pipelines"
 
@@ -192,16 +192,30 @@ class RefinePHIL(PhilBase):
 
     def __init__(self, load_defaults: bool = True):
         self._master = freephil.parse(self.phil_def)
+        self._choice_names = _choice_names_from_def(self.phil_def)
         if load_defaults:
             resource = _PIPELINES_DIR / self._resource_file
             self._default_sources = [freephil.parse(resource.read_text())] if resource.exists() else []
         else:
             self._default_sources = []
         self._params = self._master.fetch(sources=self._default_sources).extract()
+        self._default_step_ids = [s.id for s in self._params.refine.steps.step]
 
     def adopt_phil_string(self, phil_string: str):
+        phil_string = _normalize_choice_case(phil_string, self._choice_names)
         user_phil = freephil.parse(phil_string)
-        self._params = self._master.fetch(sources=[*self._default_sources, user_phil]).extract()
+        merged = self._master.fetch(sources=[*self._default_sources, user_phil]).extract()
+        # freephil appends .multiple=True instances rather than merging by id;
+        # deduplicate so the last (user) definition of each step id wins,
+        # then restore canonical order (defaults first, user-only steps appended).
+        steps = merged.refine.steps.step
+        seen = {}
+        for step in steps:
+            seen[step.id] = step
+        ordered = [seen.pop(sid) for sid in self._default_step_ids if sid in seen]
+        ordered.extend(seen.values())
+        merged.refine.steps.step = ordered
+        self._params = merged
 
     def from_file(self, path: str):
         with open(path) as fh:

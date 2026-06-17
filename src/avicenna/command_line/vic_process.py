@@ -103,14 +103,21 @@ def _read_xds_params(filepath):
 def _watch_with_bar(watcher, omnibus):
     """Tail per-dataset pipeline logs with a compact progress bar pinned below.
 
-    Each tick: erase the bar, emit any new log lines in its place, then
-    redraw the bar below them.  The braille spinner in the legend line animates
-    continuously so a frozen terminal is immediately visible.
+    Captures new log lines to a buffer; only erases the bar (which causes a
+    visible blink) when there is content to splice in above it.  Otherwise the
+    bar's draw() does a spinner-only in-place update.  The braille spinner in
+    the title line animates each tick so a frozen terminal is visible.
     """
     bar = ProgressBar(watcher, multiline=True, separator=True)
     while True:
-        bar.erase()
-        watcher.tail_logs(log_file=omnibus)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            watcher.tail_logs(log_file=omnibus)
+        new_log = buf.getvalue()
+        if new_log:
+            bar.erase()
+            sys.stdout.write(new_log)
+            sys.stdout.flush()
         still_running = bar.draw()
         if not still_running:
             break

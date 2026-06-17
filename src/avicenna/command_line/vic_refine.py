@@ -9,6 +9,7 @@ from importlib.metadata import version, PackageNotFoundError
 sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "src"))
 from avicenna.utils.utils import QRefineWatcher, QRefineScraper, QRefineWriter, ProgressBar
 from avicenna.pipelines.legacy.qrefine_pipeline import RunQRefine
+from avicenna.pipelines.refinement import RefinementOrchestrator
 from avicenna.utils.phil import RefinePHIL, AvicennaPHIL
 from avicenna.utils.software import check_programs
 
@@ -62,14 +63,21 @@ def _apply_phil_file(phil_obj, path: pathlib.Path):
 def _watch_with_bar(watcher, omnibus):
     """Tail per-job pipeline logs with a compact progress bar pinned below.
 
-    Each tick: erase the bar, emit any new log lines in its place, then
-    redraw the bar below them.  The braille spinner in the legend line animates
-    continuously so a frozen terminal is immediately visible.
+    Captures new log lines to a buffer; only erases the bar (which causes a
+    visible blink) when there is content to splice in above it.  Otherwise the
+    bar's draw() does a spinner-only in-place update.  The braille spinner in
+    the title line animates each tick so a frozen terminal is visible.
     """
     bar = ProgressBar(watcher, multiline=True, separator=True)
     while True:
-        bar.erase()
-        watcher.tail_logs(log_file=omnibus)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            watcher.tail_logs(log_file=omnibus)
+        new_log = buf.getvalue()
+        if new_log:
+            bar.erase()
+            sys.stdout.write(new_log)
+            sys.stdout.flush()
         still_running = bar.draw()
         if not still_running:
             break
@@ -123,12 +131,28 @@ refine {{
                 fill=not args.no_fill,
             ).run()
         else:
-            RunQRefine(                # step #3: swap to RefinementPipelineInterpreter
+            if args.no_fill:
+                # Disable any fill step in the PHIL so the interpreter skips it
+                # (the legacy `fill` constructor flag has no effect on this path).
+                fill_ids = [s.id for s in phil._params.refine.steps.step
+                            if s.program == "fill"]
+                steps = "".join(
+                    f"    step {{\n"
+                    f"      id = {sid}\n"
+                    f"      program = fill\n"
+                    f"      fill {{ enabled = False }}\n"
+                    f"    }}\n"
+                    for sid in fill_ids
+                )
+                if steps:
+                    phil.adopt_phil_string(f"refine {{\n  steps {{\n{steps}  }}\n}}\n")
+            RefinementOrchestrator(
                 process_dir=args.output,
                 dataset_list=args.list,
                 params_file=args.params,
                 dry_run=False,
                 fill=not args.no_fill,
+                phil_string=phil.diff_phil_string(),
             ).run()
 
         if args.silent:

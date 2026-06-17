@@ -37,7 +37,9 @@ import importlib
 import pathlib
 import pkgutil
 
+from avicenna.pipelines.legacy.qrefine_pipeline import QRefineWorker, RunQRefine
 from avicenna.utils.phil.refine import RefinePHIL
+from avicenna.utils.software import find_ccp4, find_phenix, suite_setup_sources
 from avicenna.utils.utils import format_log_line
 
 
@@ -164,3 +166,70 @@ class RefinementPipelineInterpreter:
 
         if not fatal_break:
             self._log("DONE", f"suffix={suffix} complete", job_dir)
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator (writes worker scripts that call the PHIL interpreter)
+# ---------------------------------------------------------------------------
+
+class _InterpreterWorker(QRefineWorker):
+    """QRefineWorker whose generated scripts invoke RefinementPipelineInterpreter.
+
+    Overrides the three hooks added to the base worker: it injects the user's
+    ``phil_string`` into params, sources CCP4/Phenix setup scripts (for CLIBD
+    and friends) after SBGrid, and swaps RunQRefineJob for the PHIL interpreter.
+    """
+
+    def __init__(self, dataset, mr_params, context_width=None, fill=True,
+                 phil_string=None, sh_sources=(), csh_sources=()):
+        super().__init__(dataset, mr_params, context_width=context_width, fill=fill)
+        self.phil_string = phil_string
+        self._sh_extra  = "".join(f" && source {p}" for p in sh_sources)
+        self._csh_extra = "".join(f" && source {p}" for p in csh_sources)
+
+    def _extra_params(self, suffix):
+        return {"phil_string": self.phil_string} if self.phil_string is not None else {}
+
+    def _sbgrid_block(self):
+        return (
+            "shell = os.environ.get('SHELL', '/bin/bash')\n"
+            "if any(s in shell for s in ('csh', 'tcsh')):\n"
+            f"    _sbgrid_cmd = \"tcsh -c 'source /programs/sbgrid.cshrc{self._csh_extra} && env'\"\n"
+            "else:\n"
+            f"    _sbgrid_cmd = \"bash --norc --noprofile -c 'source /programs/sbgrid.shrc{self._sh_extra} && env'\"\n"
+        )
+
+    def _worker_body(self, suffix):
+        return (
+            "from avicenna.pipelines.refinement import RefinementPipelineInterpreter\n"
+            "RefinementPipelineInterpreter(params).run()\n"
+        )
+
+
+class RefinementOrchestrator(RunQRefine):
+    """RunQRefine subclass whose worker scripts invoke the PHIL interpreter.
+
+    Inherits all outer orchestration (CCP4 pinning, qrefine/ setup, dataset
+    list parsing, SGE submission, panDDA template) from RunQRefine.  The only
+    override is ``_make_worker``, which returns an ``_InterpreterWorker`` that
+    emits scripts calling ``RefinementPipelineInterpreter(params).run()``.
+    """
+
+    def __init__(self, process_dir, dataset_list, params_file, data=None,
+                 model=None, dry_run=False, fill=True, phil_string=None):
+        super().__init__(process_dir, dataset_list, params_file, data=data,
+                         model=model, dry_run=dry_run, fill=fill)
+        self.phil_string = phil_string
+        self.CCP4_BIN   = find_ccp4()[0]
+        self.PHENIX_BIN = find_phenix()[0]
+
+    def _make_worker(self, dataset, params, context_width):
+        sh_sources, csh_sources = suite_setup_sources({
+            "ccp4":   self.CCP4_BIN,
+            "phenix": self.PHENIX_BIN,
+        })
+        return _InterpreterWorker(
+            dataset, params, context_width=context_width, fill=self.fill,
+            phil_string=self.phil_string,
+            sh_sources=sh_sources, csh_sources=csh_sources,
+        )
