@@ -714,13 +714,21 @@ pandda.analyse \\
         print(f"Written: {script}")
         print("Edit the three FILL_IN values in that file before submitting.")
 
-    def run(self):
-        self._pin_ccp4_version()
-        self._setup_output_dir()
+    def _load_mr_params(self):
+        """Load the per-crystal MR parameter source.
 
+        Override hook: the PHIL orchestrator returns None (it sources MR
+        settings from refine.phil instead of qrefine_input_parameters.txt).
+        """
         mr_params = QRefineParams(self.params_file)
         mr_params.parse()
+        return mr_params
 
+    def _validate_inputs(self, mr_params):
+        """Validate reference-model paths before submission.
+
+        Override hook: the PHIL orchestrator validates refine.input.reference_pdb.
+        """
         errors = []
         for crystal_name, p in mr_params._crystals.items():
             for key in ('mr_pdb', 'mr_pdb_monomer'):
@@ -734,6 +742,21 @@ pandda.analyse \\
             for e in errors:
                 print(e)
             sys.exit(1)
+
+    def _dataset_params(self, dataset, mr_params):
+        """Per-dataset params dict passed to the worker.
+
+        Override hook: the PHIL orchestrator returns PHIL-sourced values
+        (water handling) rather than the per-crystal txt block.
+        """
+        return mr_params.get(dataset.crystal_name)
+
+    def run(self):
+        self._pin_ccp4_version()
+        self._setup_output_dir()
+
+        mr_params = self._load_mr_params()
+        self._validate_inputs(mr_params)
 
         datasets  = self._read_dataset_list()
         qsub_list = self.process_dir / "qrefine_qsub_list.txt"
@@ -751,7 +774,7 @@ pandda.analyse \\
                 shutil.rmtree(dataset.job_dir)
             dataset.job_dir.mkdir(parents=True)
 
-            params = mr_params.get(dataset.crystal_name)
+            params = self._dataset_params(dataset, mr_params)
             scripts = self._make_worker(dataset, params, context_width).write()
 
             with open(qsub_list, 'a') as fh:

@@ -14,21 +14,17 @@ refine {
     step {
       id = 1_rigid_body
       program = phenix.refine
+      phenix {
+        strategy = rigid_body
+        number_of_macro_cycles = 5
+        hydrogens = riding
+      }
     }
     step {
       id = 2_phaser
       program = phenix.phaser
       phaser {
-        mr_cutoff = 0.45
-        mr_copies = 1
-        mr_mw = 0.0
-        mr_seq_id = 90.0
-        mr_tncs = False
-        monomer = False
-        mr_try_monomer = False
-        monomer_rfree_cutoff = 0.4
-        mr_copies_monomer = 1
-        mr_mw_monomer = 0.0
+        rfree_threshold = 0.45
       }
     }
     step {
@@ -37,7 +33,6 @@ refine {
       refmac {
         ncycles = 4
         jelly = True
-        monomer = False
       }
     }
     step {
@@ -46,45 +41,10 @@ refine {
       refmac {
         ncycles = 8
         jelly = False
-        monomer = False
       }
     }
     step {
-      id = 5_phaser_mono
-      program = phenix.phaser
-      phaser {
-        mr_cutoff = 0.45
-        mr_copies = 1
-        mr_mw = 0.0
-        mr_seq_id = 90.0
-        mr_tncs = False
-        monomer = True
-        mr_try_monomer = False
-        monomer_rfree_cutoff = 0.4
-        mr_copies_monomer = 1
-        mr_mw_monomer = 0.0
-      }
-    }
-    step {
-      id = 6_jelly_mono
-      program = refmac5
-      refmac {
-        ncycles = 4
-        jelly = True
-        monomer = True
-      }
-    }
-    step {
-      id = 7_refmac5_mono
-      program = refmac5
-      refmac {
-        ncycles = 8
-        jelly = False
-        monomer = True
-      }
-    }
-    step {
-      id = 8_fill
+      id = 5_fill
       program = fill
       fill {
         enabled = True

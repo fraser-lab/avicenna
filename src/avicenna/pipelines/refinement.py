@@ -24,18 +24,16 @@ Context dict keys passed between handlers
 -----------------------------------------
   rfree_after_rigid_body   : float
   jelly_input              : str   (path to PDB for the jelly step)
-  mr_cutoff                : float (stored by phaser for downstream checks)
+  rfree_threshold          : float (stored by phaser for downstream checks)
   phaser_succeeded         : bool
   jelly_succeeded          : bool
   final_rfree              : float
-  phaser_monomer_succeeded : bool
-  jelly_mono_input         : str
-  jelly_mono_succeeded     : bool
 """
 
 import importlib
 import pathlib
 import pkgutil
+import sys
 
 from avicenna.pipelines.legacy.qrefine_pipeline import QRefineWorker, RunQRefine
 from avicenna.utils.phil.refine import RefinePHIL
@@ -99,6 +97,11 @@ class RefinementPipelineInterpreter:
         phil = RefinePHIL()
         if "phil_string" in params:
             phil.adopt_phil_string(params["phil_string"])
+        # Reference model comes from refine.phil (input scope), NOT the legacy
+        # per-crystal qrefine_input_parameters.txt.  Inject so the program
+        # handlers can keep reading params["mr_pdb"].  (The alternate/monomer
+        # search model is phaser.alt_search_model, read from the step itself.)
+        params["mr_pdb"] = phil._params.refine.input.reference_pdb
         steps = phil._params.refine.steps.step
 
         self._log("START", f"suffix={suffix}", job_dir)
@@ -210,9 +213,9 @@ class RefinementOrchestrator(RunQRefine):
     """RunQRefine subclass whose worker scripts invoke the PHIL interpreter.
 
     Inherits all outer orchestration (CCP4 pinning, qrefine/ setup, dataset
-    list parsing, SGE submission, panDDA template) from RunQRefine.  The only
-    override is ``_make_worker``, which returns an ``_InterpreterWorker`` that
-    emits scripts calling ``RefinementPipelineInterpreter(params).run()``.
+    list parsing, SGE submission, panDDA template) from RunQRefine.  Overrides
+    ``_make_worker`` (emit interpreter scripts) and the input seams so MR
+    settings come from refine.phil, NOT qrefine_input_parameters.txt.
     """
 
     def __init__(self, process_dir, dataset_list, params_file, data=None,
@@ -222,6 +225,35 @@ class RefinementOrchestrator(RunQRefine):
         self.phil_string = phil_string
         self.CCP4_BIN   = find_ccp4()[0]
         self.PHENIX_BIN = find_phenix()[0]
+        # Resolve run-wide refine settings from refine.phil (not the legacy txt).
+        phil = RefinePHIL()
+        if phil_string:
+            phil.adopt_phil_string(phil_string)
+        self._water         = phil._params.refine.water
+        self._reference_pdb = phil._params.refine.input.reference_pdb
+
+    # --- input seams: source from refine.phil, ignore qrefine_input_parameters.txt ---
+
+    def _load_mr_params(self):
+        return None  # PHIL mode does not read qrefine_input_parameters.txt
+
+    def _validate_inputs(self, mr_params):
+        if not self._reference_pdb:
+            sys.exit("ERROR: refine.input.reference_pdb is not set — edit "
+                     "refine.phil to point to your reference model.")
+        if not pathlib.Path(self._reference_pdb).is_file():
+            sys.exit(f"ERROR: reference_pdb not found: {self._reference_pdb}")
+
+    def _dataset_params(self, dataset, mr_params):
+        # Only water (drives hoh/nohoh suffix fan-out) is needed here; the
+        # reference model is injected by the interpreter from phil_string.
+        # Translate the PHIL vocabulary (both/hoh/nohoh) to the legacy water
+        # values the shared worker's suffix logic expects (both/true/false).
+        legacy_water = {"both": "both", "hoh": "true", "nohoh": "false"}[self._water]
+        return {"mr_water": legacy_water}
+
+    def _infer_pandda_suffix(self, mr_params):
+        return "nohoh" if self._water == "nohoh" else "hoh"
 
     def _make_worker(self, dataset, params, context_width):
         sh_sources, csh_sources = suite_setup_sources({

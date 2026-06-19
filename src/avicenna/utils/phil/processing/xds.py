@@ -67,62 +67,46 @@ xds
     .help = Skip this step if the resolution limit has not improved over the \
             prior run. Only meaningful when update_symmetry = True.
     .expert_level = 1
-  ncpu = 8
-    .type = int
-    .short_caption = CPUs per job
-    .help = Number of CPUs allocated to this XDS SGE job.
-    .expert_level = 1
   xds_inp = None
     .type = path
     .short_caption = XDS.INP file
     .help = Path to an existing XDS.INP file -- overrides all other xds.* \
             parameters at this step if provided.
     .expert_level = 0
+}
+""",
+}
+
+# Global (dataset-wide) settings for the XDS program.  Assembled into the
+# processing scope as ``processing.xds`` by _build_processing_phil.  Swapping
+# the indexing program = dropping in a backend that declares its own SETTINGS.
+SETTINGS = """\
+xds
+  .short_caption = XDS settings
+  .help = Dataset-wide XDS settings (apply to every XDS step).
+{
+  ncpu = 8
+    .type = int
+    .short_caption = CPUs per job
+    .help = Number of CPUs allocated to each XDS SGE job.
+    .expert_level = 0
   detector_edge = 0.8
     .type = float
     .short_caption = Detector edge fraction
     .help = Fraction of the detector radius used as the initial resolution limit.
     .expert_level = 1
-  indexing_images = first_half
-    .type = str
-    .short_caption = Indexing images
-    .help = Which images to use for indexing (first_half, all, or a range).
-    .expert_level = 1
-  no_symmetry = False
-    .type = bool
-    .short_caption = Skip symmetry determination
-    .help = If True, skip Pointless space-group determination and use only \
-            the XDS-determined symmetry.
-    .expert_level = 2
   res_limit = cc12
     .type = str
     .short_caption = Resolution limit criterion
-    .help = Criterion for automatic high-resolution cutoff (cc12 or i_over_sigma).
+    .help = Criterion for the automatic high-resolution cutoff (cc12, i_over_sigma, or a multiplicity threshold).
+    .expert_level = 0
+  scaling = *correct aimless
+    .type = choice
+    .short_caption = Scaling source
+    .help = Which XDS output Pointless/Aimless scale -- correct uses XDS_ASCII.HKL from CORRECT, aimless uses INTEGRATE.HKL.
     .expert_level = 1
-  cleanup = partial
-    .type = str
-    .short_caption = Cleanup level
-    .help = How much intermediate output to remove after processing \
-            (none, partial, or full).
-    .expert_level = 2
-  refine_cell_integrate = both
-    .type = str
-    .short_caption = Cell refinement mode
-    .help = Whether to refine the unit cell during INTEGRATE (true, false, or both).
-    .expert_level = 2
-  ref_hkl = None
-    .type = path
-    .short_caption = Reference HKL
-    .help = Path to a reference HKL file for reindexing (optional).
-    .expert_level = 2
-  ref_mtz = None
-    .type = path
-    .short_caption = Reference MTZ
-    .help = Path to a reference MTZ file for reindexing (optional).
-    .expert_level = 2
 }
-""",
-}
+"""
 
 
 def run_step(step, ctx, rp, pipeline_subdir, forced):

@@ -41,7 +41,7 @@ from pathlib import Path
 from avicenna.pipelines.legacy.proc_pipeline import RunProcess
 from avicenna.utils.phil.processing import ProcessingPHIL
 from avicenna.utils.software import suite_setup_sources
-from avicenna.utils.utils import QRefineWriter
+from avicenna.utils.utils import QRefineWriter, sg_lookup
 
 
 # ---------------------------------------------------------------------------
@@ -71,11 +71,57 @@ class ProcessingOrchestrator(RunProcess):
     """RunProcess subclass whose worker scripts invoke ProcessingPipelineInterpreter.
 
     Inherits all outer orchestration (dataset discovery, params.json writing,
-    SGE submission, forced-integration re-submission) from RunProcess. The only
-    override is _write_worker_script, which emits a script that calls
-    ProcessingPipelineInterpreter(params).run(forced=...) instead of
-    RunProcess(params).run_single[_forced]().
+    SGE submission, forced-integration re-submission) from RunProcess. Overrides
+    _write_worker_script (emit interpreter scripts) and _known_symmetry_entries
+    (read symmetry from the PHIL known_symmetry scope rather than the legacy
+    known_symmetry.txt / xds_input_parameters.txt files).
     """
+
+    def _known_symmetry_entries(self):
+        """Build symmetry entries from the PHIL ``processing.known_symmetry``
+        scope when enabled; otherwise fall back to the legacy file-based source.
+
+        Each isoform becomes one entry (or two when refine_cell_integrate=both),
+        matching the dict shape produced by the legacy path so the downstream
+        loop and output-dir naming are unchanged.
+        """
+        phil = ProcessingPHIL()
+        phil_string = self.params.get("phil_string")
+        if phil_string:
+            phil.adopt_phil_string(phil_string)
+        ks = phil._params.processing.known_symmetry
+        # ``isoform`` is .multiple, and the shipped default carries an empty
+        # template instance (space_group=None); freephil APPENDS the user's
+        # isoforms rather than replacing it.  Keep only isoforms that actually
+        # name a space group.
+        isoforms = [iso for iso in ks.isoform if iso.space_group]
+        if not (ks.enabled and isoforms):
+            return super()._known_symmetry_entries()
+
+        refcell = self.params.get("refine_cell_integrate", "true")
+        entries = []
+        for n, iso in enumerate(isoforms, start=1):
+            sg = iso.space_group or "none"
+            try:
+                sg_number = str(sg_lookup(space_group=sg)[0]) if sg != "none" else "none"
+            except ValueError:
+                sg_number = "none"
+            cell = " ".join(str(v) for v in iso.unit_cell) if iso.unit_cell else "none"
+            base = {
+                "crystal_number": str(n),
+                "first_pass":     "none",
+                "sg":             sg,
+                "sg_number":      sg_number,
+                "cell":           cell,
+                "ref_hkl":        str(iso.reference_hkl) if iso.reference_hkl else "none",
+                "ref_mtz":        "none",
+            }
+            if refcell == "both":
+                entries.append({**base, "refine_cell_integrate": "true"})
+                entries.append({**base, "refine_cell_integrate": "false"})
+            else:
+                entries.append({**base, "refine_cell_integrate": refcell})
+        return entries
 
     def _write_worker_script(self, pipeline_subdir, per_params, method="run_single"):
         forced = (method == "run_single_forced")
@@ -264,4 +310,7 @@ class ProcessingPipelineInterpreter:
                 summary = self.rp._aimless_summary(
                     pipeline_subdir / last_aimless / f"{last_aimless}.log")
                 self.rp._log(pipeline_subdir, "DONE", summary)
-            QRefineWriter(params["process_dir"]).write()
+            # PHIL path: emit only the dataset list.  MR settings now live in
+            # refine.phil (written by vic.process), so qrefine_input_parameters.txt
+            # is legacy-only and intentionally not produced here.
+            QRefineWriter(params["process_dir"]).write_qrefine_list()

@@ -3,7 +3,7 @@ import argparse
 import pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "src"))
 from avicenna.pipelines.legacy.pandda_pipeline import PanDDAPreparer
-from avicenna.utils.phil import AnalysisPHIL, AvicennaPHIL
+from avicenna.utils.phil import AnalysisPHIL
 from avicenna.utils.software import check_programs
 
 _DEFAULT_PHIL = "analysis.phil"
@@ -128,15 +128,13 @@ def _write_analysis_phil(args, phil: AnalysisPHIL):
 
 def main():
     try:
-        args = parser.parse_args()
+        args, _extras = parser.parse_known_args()
 
         if args.phil or args.phil_expert_level is not None or args.phil_attrs:
-            av = AvicennaPHIL()
-            av._master.format(av._params).show(
-                out=sys.stdout,
-                attributes_level=2 if args.phil_attrs else 0,
+            sys.stdout.write(AnalysisPHIL().full_phil_string(
                 expert_level=args.phil_expert_level,
-            )
+                attributes=args.phil_attrs,
+            ))
             sys.exit(0)
 
         phil = AnalysisPHIL()
@@ -146,6 +144,17 @@ def main():
             _apply_phil_file(phil, args.settings)
         elif pathlib.Path(_DEFAULT_PHIL).exists():
             _apply_phil_file(phil, pathlib.Path(_DEFAULT_PHIL))
+
+        # PHIL overrides given as CLI args (e.g. analysis.pandda1.analyser=pandda2).
+        _flags = [e for e in _extras if e.startswith("-")]
+        if _flags:
+            parser.error("unrecognized arguments: " + " ".join(_flags))
+        if _extras:
+            try:
+                phil.adopt_cli_args(_extras)
+                print("Applied PHIL overrides: " + " ".join(_extras))
+            except ValueError as e:
+                sys.exit(f"ERROR: {e}")
 
         check_programs(phil._params.analysis.programs)
 

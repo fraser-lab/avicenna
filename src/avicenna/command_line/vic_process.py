@@ -11,8 +11,26 @@ sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "src"))
 from avicenna.utils.utils import DataFinder, ParamWriter, Watcher, ProcessingScraper, ProcessingFilter, ProgressBar
 from avicenna.pipelines.legacy.proc_pipeline import RunProcess
 from avicenna.pipelines.processing import ProcessingOrchestrator
-from avicenna.utils.phil import ProcessingPHIL, AvicennaPHIL
+from avicenna.utils.phil import ProcessingPHIL, RefinePHIL
 from avicenna.utils.software import check_programs
+
+
+def _write_refine_phil(project_dir):
+    """Emit refine.phil (defaults + run-specific paths) so the user can edit the
+    reference PDB and run vic.refine next -- the PHIL replacement for the legacy
+    qrefine_input_parameters.txt.  Looks like `vic.refine --dry_run` output."""
+    phil = RefinePHIL()
+    phil.adopt_phil_string(
+        f'refine {{\n  input {{\n'
+        f'    output_dir = "{project_dir}"\n'
+        f'    dataset_list = "qrefine_list.txt"\n'
+        f'  }}\n}}\n'
+    )
+    out = os.path.join(project_dir, "refine.phil")
+    with open(out, "w") as fh:
+        fh.write(phil.full_phil_string())
+    print(f"Written: {out}")
+    print("  -> edit input.reference_pdb to point to your reference model, then run: vic.refine")
 
 try:
     _version = version("avicenna")
@@ -100,6 +118,28 @@ def _read_xds_params(filepath):
     return result
 
 
+def _params_from_phil(phil):
+    """Flatten the processing PHIL into the flat XDS-param keys the executor reads.
+
+    PHIL is the single source on the default path (no xds_input_parameters.txt).
+    Starts from XDS_PARAM_DEFAULTS so dropped/dead keys (script_dir, cleanup,
+    recycle_xds) keep safe defaults, and the per-step failure params (read from
+    the step scope by the interpreter) keep harmless placeholders.
+    """
+    p = phil._params.processing
+    out = dict(XDS_PARAM_DEFAULTS)
+    out["ncpu"]                  = str(p.xds.ncpu)
+    out["detector_edge"]         = str(p.xds.detector_edge)
+    out["res_limit"]             = p.xds.res_limit
+    out["scaling"]               = p.xds.scaling
+    out["indexing_images"]       = p.dataset.indexing_images
+    out["refine_cell_integrate"] = p.dataset.refine_cell_integrate
+    out["no_symmetry"]           = "true" if p.dataset.no_symmetry else "false"
+    out["ref_hkl"]               = "none" if p.dataset.reference_hkl is None else str(p.dataset.reference_hkl)
+    out["ref_mtz"]               = "none" if p.input.reference_mtz is None else str(p.input.reference_mtz)
+    return out
+
+
 def _watch_with_bar(watcher, omnibus):
     """Tail per-dataset pipeline logs with a compact progress bar pinned below.
 
@@ -126,15 +166,13 @@ def _watch_with_bar(watcher, omnibus):
 
 def main():
     try:
-        args = parser.parse_args()
+        args, _extras = parser.parse_known_args()
 
         if args.phil or args.phil_expert_level is not None or args.phil_attrs:
-            av = AvicennaPHIL()
-            av._master.format(av._params).show(
-                out=sys.stdout,
-                attributes_level=2 if args.phil_attrs else 0,
+            sys.stdout.write(ProcessingPHIL().full_phil_string(
                 expert_level=args.phil_expert_level,
-            )
+                attributes=args.phil_attrs,
+            ))
             sys.exit(0)
 
         phil = ProcessingPHIL()
@@ -144,6 +182,17 @@ def main():
             _apply_phil_file(phil, args.settings)
         elif pathlib.Path(_DEFAULT_PHIL).exists():
             _apply_phil_file(phil, pathlib.Path(_DEFAULT_PHIL))
+
+        # PHIL overrides given as CLI args (e.g. processing.xds.ncpu=16 res_limit=i_over_sigma).
+        _flags = [e for e in _extras if e.startswith("-")]
+        if _flags:
+            parser.error("unrecognized arguments: " + " ".join(_flags))
+        if _extras:
+            try:
+                phil.adopt_cli_args(_extras)
+                print("Applied PHIL overrides: " + " ".join(_extras))
+            except ValueError as e:
+                sys.exit(f"ERROR: {e}")
 
         check_programs(phil._params.processing.programs)
 
@@ -224,19 +273,24 @@ processing {{
             params["pins"] = pin_list
             params["image_dir"] = image_dir
 
-        # Phase 2: Resolve XDS params (file overrides args)
-        if args.xdsparams and os.path.isfile(args.xdsparams):
-            params.update(_read_xds_params(args.xdsparams))
+        # Phase 2: Resolve XDS / dataset settings.
+        #  - PHIL path (default): settings come from processing.phil (single source).
+        #  - --legacy / --bash:   settings come from xds_input_parameters.txt.
+        if args.legacy or args.bash:
+            if args.xdsparams and os.path.isfile(args.xdsparams):
+                params.update(_read_xds_params(args.xdsparams))
+            else:
+                if data_path is None:
+                    if not args.data:
+                        sys.exit(
+                            "ERROR: -d/--data is required when using a --pinlist but not using --xdsparams"
+                        )
+                    data_path = DataFinder(paths=args.data).paths[0]
+                args.data = data_path
+                ParamWriter(args=args).build_parameters()
+                params.update(_read_xds_params("xds_input_parameters.txt"))
         else:
-            if data_path is None:
-                if not args.data:
-                    sys.exit(
-                        "ERROR: -d/--data is required when using a --pinlist but not using --xdsparams"
-                    )
-                data_path = DataFinder(paths=args.data).paths[0]
-            args.data = data_path
-            ParamWriter(args=args).build_parameters()
-            params.update(_read_xds_params("xds_input_parameters.txt"))
+            params.update(_params_from_phil(phil))
 
         project_dir = os.path.abspath(args.output)
         procpath    = os.path.join(project_dir, "processing")
@@ -286,6 +340,8 @@ processing {{
             scraper.write_qrefine_list(
                 path=os.path.join(os.path.abspath(args.output), 'qrefine_list.txt')
             )
+            if not args.legacy:
+                _write_refine_phil(os.path.abspath(args.output))
     except KeyboardInterrupt:
         print("\nInterrupted. Any submitted jobs are still running on the cluster.")
         sys.exit(1)

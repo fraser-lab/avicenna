@@ -10,13 +10,10 @@ Context dict keys set and consumed by these handlers
 -----------------------------------------------------
   rfree_after_rigid_body  : float — set by rigid_body
   jelly_input             : str   — set by rigid_body (initial), updated by phaser
-  mr_cutoff               : float — set by phaser (for downstream skip decisions)
-  phaser_succeeded        : bool  — set by phaser (non-monomer)
-  jelly_succeeded         : bool  — set by refmac (jelly, non-monomer)
-  final_rfree             : float — set by refmac (restrained, non-monomer)
-  phaser_monomer_succeeded: bool  — set by phaser (monomer)
-  jelly_mono_input        : str   — set by phaser (monomer)
-  jelly_mono_succeeded    : bool  — set by refmac (jelly, monomer)
+  rfree_threshold         : float — set by phaser (for downstream skip decisions)
+  phaser_succeeded        : bool  — set by phaser
+  jelly_succeeded         : bool  — set by refmac (jelly)
+  final_rfree             : float — set by refmac (restrained)
 """
 
 import pathlib
@@ -29,71 +26,88 @@ SCOPE_NAME = "qrefine"
 
 PROGRAMS = {
     "phenix.refine": """\
-rigid_body
-  .short_caption = Rigid-body refinement
-  .help = Phenix rigid-body refinement of the input model (5 cycles).
+phenix
+  .short_caption = Phenix refinement
+  .help = phenix.refine settings.  Parameters left as None fall back to phenix.refine's own defaults.  Use extra_args for any phenix parameter not exposed here.
 {
+  strategy = None
+    .type = str
+    .short_caption = Refinement strategy
+    .help = phenix.refine target(s), e.g. rigid_body or individual_sites+individual_adp+occupancies.  None uses the phenix default.
+    .expert_level = 0
+  number_of_macro_cycles = None
+    .type = int
+    .short_caption = Macro-cycles
+    .help = Number of refinement macro-cycles (main.number_of_macro_cycles).  None uses the phenix default.
+    .expert_level = 0
+  hydrogens = individual riding
+    .type = choice
+    .short_caption = Hydrogen treatment
+    .help = How to treat hydrogens (hydrogens.refine).  None (neither selected) uses the phenix default (Auto).
+    .expert_level = 0
+  extra_args = None
+    .type = strings
+    .short_caption = Extra phenix.refine arguments
+    .help = Verbatim phenix.refine command-line overrides forwarded as-is, e.g. "nqh_flips=False" "ordered_solvent=True".  phenix.refine validates these.
+    .expert_level = 0
 }
 """,
     "phenix.phaser": """\
 phaser
   .short_caption = Phaser MR
-  .help = Phenix Phaser molecular replacement.  Set monomer to True to mark this step as the optional monomer-model retry.
+  .help = Phenix Phaser molecular replacement.  Runs only when rigid-body refinement leaves Rfree above rfree_threshold.
 {
-  mr_cutoff = 0.45
+  rfree_threshold = 0.45
     .type = float
-    .short_caption = Rfree cutoff
-    .help = Rfree threshold above which MR is attempted.  Step is skipped when rigid-body Rfree is at or below this value.
+    .short_caption = Rfree threshold
+    .help = MR is attempted only when the rigid-body Rfree exceeds this value.
     .expert_level = 0
-  mr_copies = 1
-    .type = int
-    .short_caption = Search copies
-    .help = Number of copies to search for in the primary MR run.
-    .expert_level = 0
-  mr_mw = 0.0
-    .type = float
-    .short_caption = Molecular weight (Da)
-    .help = Molecular weight of the primary search model in Daltons.
-    .expert_level = 0
-  mr_seq_id = 90.0
-    .type = float
-    .short_caption = Sequence identity (%)
-    .help = Sequence identity between primary search model and target (percent).
-    .expert_level = 0
-  mr_tncs = False
+  tncs = False
     .type = bool
     .short_caption = Use tNCS
     .help = Apply translational NCS correction in Phaser.
     .expert_level = 1
-  monomer = False
-    .type = bool
-    .short_caption = Monomer retry
-    .help = If True this step is the optional monomer-model retry rather than the primary MR attempt.
-    .expert_level = 1
-  mr_try_monomer = False
-    .type = bool
-    .short_caption = Enable monomer retry
-    .help = When monomer=True, the retry only runs if mr_try_monomer=True and conditions are met.
+  alt_search_model = None
+    .type = path
+    .short_caption = Alternate search model
+    .help = Optional search model used in place of input.reference_pdb -- e.g. a monomer, or a perturbed / poly-Ala-truncated model.  When None the reference is used.
     .expert_level = 0
-  monomer_rfree_cutoff = 0.4
-    .type = float
-    .short_caption = Rfree cutoff for monomer retry
-    .help = Monomer retry is attempted when final Rfree exceeds this value or primary MR failed.
-    .expert_level = 1
-  mr_copies_monomer = 1
-    .type = int
-    .short_caption = Monomer search copies
-    .expert_level = 1
-  mr_mw_monomer = 0.0
-    .type = float
-    .short_caption = Monomer molecular weight (Da)
-    .expert_level = 1
+  asu_composition
+    .short_caption = ASU composition
+    .help = Asymmetric-unit contents Phaser uses to estimate solvent content.
+  {
+    derive_from_pdb = True
+      .type = bool
+      .short_caption = Derive from model
+      .help = Estimate molecular weight and copy number from the search model and reference_pdb instead of the values below.  Assumes reference_pdb models the full ASU and the crystals are isomorphous to it.
+      .expert_level = 0
+    num_copies = 1
+      .type = int
+      .short_caption = Copies in ASU
+      .help = Number of copies of the search model to find.  Ignored when derive_from_pdb=True.
+      .expert_level = 0
+    mw = 0.0
+      .type = float
+      .short_caption = Molecular weight (Da)
+      .help = Molecular weight of the search model in Daltons.  Ignored when derive_from_pdb=True.
+      .expert_level = 0
+    seq_id = 90.0
+      .type = float
+      .short_caption = Sequence identity (%)
+      .help = Sequence identity between search model and target (percent).
+      .expert_level = 0
+  }
+  extra_args = None
+    .type = strings
+    .short_caption = Extra phenix.phaser arguments
+    .help = Verbatim phenix.phaser command-line overrides forwarded as-is (e.g. a sequence file or explicit composition keywords).  phenix.phaser validates these.
+    .expert_level = 0
 }
 """,
     "refmac5": """\
 refmac
   .short_caption = REFMAC5 refinement
-  .help = CCP4 REFMAC5 restrained or jelly-body refinement.  Set jelly to True for jelly-body mode and monomer to True to operate on the monomer MR solution.
+  .help = CCP4 REFMAC5 restrained or jelly-body refinement.  Set jelly to True for jelly-body mode.
 {
   ncycles = 8
     .type = int
@@ -105,11 +119,6 @@ refmac
     .short_caption = Jelly-body mode
     .help = Use ridge-distance jelly-body restraints (sigma 0.01, 4 cycles typical) instead of standard restrained refinement.
     .expert_level = 0
-  monomer = False
-    .type = bool
-    .short_caption = Monomer step
-    .help = If True, operates on the monomer MR solution rather than the primary solution.
-    .expert_level = 1
 }
 """,
     "fill": """\
@@ -179,10 +188,85 @@ def _final_rfree_from_refmac_log(log_path):
 
 
 # ---------------------------------------------------------------------------
+# ASU composition derivation from the reference PDB (quick-and-dirty)
+# ---------------------------------------------------------------------------
+
+# Average masses of free amino acids (Da).  MSE (selenomethionine) is treated
+# as MET.  Non-standard residues / ligands / waters are ignored.
+_AA_MASS = {
+    "ALA": 89.09, "ARG": 174.20, "ASN": 132.12, "ASP": 133.10, "CYS": 121.16,
+    "GLN": 146.15, "GLU": 147.13, "GLY": 75.07, "HIS": 155.16, "ILE": 131.17,
+    "LEU": 131.17, "LYS": 146.19, "MET": 149.21, "PHE": 165.19, "PRO": 115.13,
+    "SER": 105.09, "THR": 119.12, "TRP": 204.23, "TYR": 181.19, "VAL": 117.15,
+    "MSE": 149.21,
+}
+_WATER_MASS = 18.015
+_AVG_RES_MASS = 110.0   # used to fill unmodeled gaps (by residue-number span)
+
+
+def _protein_mw_and_chains(pdb_path, gap_fill=True):
+    """Return (molecular_weight_Da, n_protein_chains) from a PDB's ATOM records.
+
+    Counts standard amino-acid residues (unique per chain+resseq), sums average
+    masses minus one water per intra-chain peptide bond.  With gap_fill, missing
+    residues (breaks in the resseq span) are charged the average residue mass so
+    a partial model does not under-estimate the protein MW.  Returns (None, 0)
+    if nothing parseable is found.
+    """
+    if not pdb_path:
+        return None, 0
+    chains = {}   # chain_id -> {resseq: resname}
+    try:
+        with open(pdb_path) as fh:
+            for line in fh:
+                if not line.startswith(("ATOM", "HETATM")):
+                    continue
+                resname = line[17:20].strip()
+                if resname not in _AA_MASS:
+                    continue
+                try:
+                    resseq = int(line[22:26])
+                except ValueError:
+                    continue
+                chains.setdefault(line[21], {})[resseq] = resname
+    except OSError:
+        return None, 0
+    if not chains:
+        return None, 0
+    total = 0.0
+    for residues in chains.values():
+        modeled = sum(_AA_MASS[r] for r in residues.values())
+        n_res = len(residues)
+        if gap_fill:
+            span = max(residues) - min(residues) + 1
+            modeled += max(0, span - n_res) * _AVG_RES_MASS
+            n_res = span
+        total += modeled - (n_res - 1) * _WATER_MASS   # peptide bonds
+    return total, len(chains)
+
+
+def _derive_composition(reference_pdb, search_model):
+    """Return (mol_weight, num_copies) for Phaser from the model files.
+
+    mol_weight = MW of the search model; num_copies = (protein chains in the
+    reference) / (chains in the search model), so MW and copies stay consistent
+    whether the search model is the full ASU (1 copy) or a monomer (N copies).
+    Returns (None, None) when the search model cannot be parsed.
+    """
+    model_mw, model_chains = _protein_mw_and_chains(search_model)
+    if model_mw is None or model_chains == 0:
+        return None, None
+    _, ref_chains = _protein_mw_and_chains(reference_pdb)
+    copies = max(1, round(ref_chains / model_chains)) if ref_chains else 1
+    return model_mw, copies
+
+
+# ---------------------------------------------------------------------------
 # Step handlers
 # ---------------------------------------------------------------------------
 
-def _run_rigid_body(step, ctx, params, suffix, job_dir):
+def _run_phenix(step, ctx, params, suffix, job_dir):
+    s      = step.phenix
     mr_pdb = params["mr_pdb"]
     mtz    = params["mtz"]
 
@@ -193,15 +277,25 @@ def _run_rigid_body(step, ctx, params, suffix, job_dir):
             lines = [l for l in fh if not l.startswith("HETATM") or "HOH" not in l]
         (job_dir / f"01-rigid-body_input_nohoh.pdb").write_text("".join(lines))
 
-    _run_cmd([
-        "phenix.refine", str(job_dir / f"01-rigid-body_input_{suffix}.pdb"), mtz,
-        "main.number_of_macro_cycles=5",
-        "strategy=rigid_body",
+    cmd = ["phenix.refine",
+           str(job_dir / f"01-rigid-body_input_{suffix}.pdb"), mtz]
+    # Typed params: emit only when set; None falls back to the phenix default.
+    if s.strategy is not None:
+        cmd.append(f"strategy={s.strategy}")
+    if s.number_of_macro_cycles is not None:
+        cmd.append(f"main.number_of_macro_cycles={s.number_of_macro_cycles}")
+    if s.hydrogens is not None:
+        cmd.append(f"hydrogens.refine={s.hydrogens}")
+    # Housekeeping + I/O plumbing set by the pipeline (not user-facing).
+    cmd += [
         "write_eff_file=false", "write_geo_file=false", "write_def_file=false",
-        "hydrogens.refine=riding",
         "miller_array.labels.name=F,SIGF",
         f"output.prefix=01-rigid-body_{suffix}",
-    ], job_dir)
+    ]
+    # Verbatim pass-through: forwarded as-is, validated by phenix.refine itself.
+    cmd += list(s.extra_args or [])
+
+    _run_cmd(cmd, job_dir)
 
     log_path = job_dir / f"01-rigid-body_{suffix}_001.log"
     rfree = _rfree_from_phenix_log(log_path)
@@ -217,142 +311,99 @@ def _run_rigid_body(step, ctx, params, suffix, job_dir):
 
 
 def _run_phaser(step, ctx, params, suffix, job_dir):
-    s       = step.phaser
-    mtz     = params["mtz"]
-    monomer = s.monomer
+    s         = step.phaser
+    mtz       = params["mtz"]
+    reference = params["mr_pdb"]
 
-    if monomer:
-        if not s.mr_try_monomer:
-            return {"status": "skipped", "message": "phaser (monomer): mr_try_monomer=False",
-                    "ctx_updates": {"phaser_monomer_succeeded": False}}
-        phaser_ok   = ctx.get("phaser_succeeded", False)
-        final_rfree = ctx.get("final_rfree", 1.0)
-        if phaser_ok and final_rfree <= s.monomer_rfree_cutoff:
-            return {
-                "status": "skipped",
-                "message": (f"phaser (monomer): primary ok and "
-                            f"rfree={final_rfree:.4f} ≤ {s.monomer_rfree_cutoff}"),
-                "ctx_updates": {"phaser_monomer_succeeded": False},
-            }
-        mr_pdb_input = params.get("mr_pdb_monomer") or params.get("mr_pdb")
-        copies  = s.mr_copies_monomer
-        mw      = s.mr_mw_monomer
-        prefix  = f"05-phaser_{suffix}"
-        out_pdb = job_dir / f"05-phaser_{suffix}.1.pdb"
+    # MR is only needed when rigid-body refinement didn't get close enough.
+    rfree = ctx.get("rfree_after_rigid_body", 1.0)
+    if rfree <= s.rfree_threshold:
+        return {"status": "skipped",
+                "message": f"phaser: rfree={rfree:.4f} ≤ {s.rfree_threshold} — MR not needed",
+                "ctx_updates": {"phaser_succeeded": False,
+                                "rfree_threshold": s.rfree_threshold}}
+
+    # Search model: the alternate model if given, else the reference.
+    search_model = s.alt_search_model or reference
+    comp = s.asu_composition
+    if comp.derive_from_pdb:
+        mw, copies = _derive_composition(reference, search_model)
+        if mw is None:            # parse failed — fall back to explicit values
+            mw, copies = comp.mw, comp.num_copies
     else:
-        rfree     = ctx.get("rfree_after_rigid_body", 1.0)
-        mr_cutoff = s.mr_cutoff
-        if rfree <= mr_cutoff:
-            return {
-                "status": "skipped",
-                "message": f"phaser: rfree={rfree:.4f} ≤ {mr_cutoff} — MR not needed",
-                "ctx_updates": {
-                    "phaser_succeeded": False,
-                    "mr_cutoff": mr_cutoff,
-                },
-            }
-        copies  = s.mr_copies
-        mw      = s.mr_mw
-        prefix  = f"02-phaser_{suffix}"
-        out_pdb = job_dir / f"02-phaser_{suffix}.1.pdb"
+        mw, copies = comp.mw, comp.num_copies
 
-        if suffix == "hoh":
-            src = pathlib.Path(params["mr_pdb"]).read_text().replace("HOH", "WWW")
-            (job_dir / f"02-phaser_input_hoh.pdb").write_text(src)
-            mr_pdb_input = str(job_dir / f"02-phaser_input_hoh.pdb")
-        else:
-            with open(params["mr_pdb"]) as fh:
-                lines = [l for l in fh if not l.startswith("HETATM") or "HOH" not in l]
-            (job_dir / f"02-phaser_input_nohoh.pdb").write_text("".join(lines))
-            mr_pdb_input = str(job_dir / f"02-phaser_input_nohoh.pdb")
+    prefix  = f"02-phaser_{suffix}"
+    out_pdb = job_dir / f"02-phaser_{suffix}.1.pdb"
+    if suffix == "hoh":
+        src = pathlib.Path(search_model).read_text().replace("HOH", "WWW")
+        (job_dir / f"02-phaser_input_hoh.pdb").write_text(src)
+        model_in = str(job_dir / f"02-phaser_input_hoh.pdb")
+    else:
+        with open(search_model) as fh:
+            lines = [l for l in fh if not l.startswith("HETATM") or "HOH" not in l]
+        (job_dir / f"02-phaser_input_nohoh.pdb").write_text("".join(lines))
+        model_in = str(job_dir / f"02-phaser_input_nohoh.pdb")
 
-    _run_cmd([
-        "phenix.phaser", mr_pdb_input, mtz,
-        f"phaser.keywords.tncs.use={s.mr_tncs}",
+    cmd = [
+        "phenix.phaser", model_in, mtz,
+        f"phaser.keywords.tncs.use={s.tncs}",
         f"phaser.search_copies={copies}",
-        f"phaser.mol_weight={mw}",
-        f"phaser.model_identity={s.mr_seq_id}",
+        f"phaser.model_identity={comp.seq_id}",
         f"phaser.keywords.general.root={prefix}",
-    ], job_dir)
+    ]
+    if mw:   # omit mol_weight when 0/None so Phaser estimates it itself
+        cmd.append(f"phaser.mol_weight={mw}")
+    cmd += list(s.extra_args or [])
+    _run_cmd(cmd, job_dir)
 
     succeeded = out_pdb.is_file()
-    if succeeded and not monomer and suffix == "hoh":
+    if succeeded and suffix == "hoh":
         text = out_pdb.read_text().replace("WWW", "HOH").replace("  0.00 ", "  1.00 ")
         out_pdb.write_text(text)
 
-    if monomer:
-        return {
-            "status": "completed",
-            "message": f"phaser (monomer): {'success' if succeeded else 'failed'}",
-            "ctx_updates": {
-                "phaser_monomer_succeeded": succeeded,
-                "jelly_mono_input": str(out_pdb) if succeeded else None,
-            },
-        }
-    else:
-        jelly_input = str(out_pdb) if succeeded else ctx.get("jelly_input")
-        return {
-            "status": "completed",
-            "message": f"phaser: {'success' if succeeded else 'failed'}",
-            "ctx_updates": {
-                "phaser_succeeded": succeeded,
-                "jelly_input": jelly_input,
-                "mr_cutoff": s.mr_cutoff,
-            },
-        }
+    jelly_input = str(out_pdb) if succeeded else ctx.get("jelly_input")
+    return {
+        "status": "completed",
+        "message": f"phaser: {'success' if succeeded else 'failed'}",
+        "ctx_updates": {
+            "phaser_succeeded": succeeded,
+            "jelly_input": jelly_input,
+            "rfree_threshold": s.rfree_threshold,
+        },
+    }
 
 
 def _run_refmac(step, ctx, params, suffix, job_dir):
     s       = step.refmac
     mtz     = params["mtz"]
     jelly   = s.jelly
-    monomer = s.monomer
     ncycles = s.ncycles
 
-    if monomer:
-        if not ctx.get("phaser_monomer_succeeded", False):
-            return {"status": "skipped",
-                    "message": f"refmac (monomer, jelly={jelly}): phaser-monomer failed or skipped"}
-        if jelly:
-            xyz_in  = ctx.get("jelly_mono_input", "")
-            xyz_out = job_dir / f"06-jelly_{suffix}.pdb"
-            hkl_out = job_dir / f"06-jelly_{suffix}.mtz"
-            log_out = f"06-jelly_{suffix}.log"
-            label   = "06-jelly (monomer)"
-        else:
-            if not ctx.get("jelly_mono_succeeded", False):
-                return {"status": "skipped",
-                        "message": "refmac (monomer, restrained): monomer jelly failed or skipped"}
-            xyz_in  = str(job_dir / f"06-jelly_{suffix}.pdb")
-            xyz_out = job_dir / f"final_monomer_{suffix}.pdb"
-            hkl_out = job_dir / f"final_monomer_{suffix}.mtz"
-            log_out = f"07-refmac_{suffix}.log"
-            label   = "07-refmac (monomer)"
+    phaser_ok = ctx.get("phaser_succeeded", False)
+    rfree     = ctx.get("rfree_after_rigid_body", 1.0)
+    rfree_threshold = ctx.get("rfree_threshold", 0.45)
+    if not phaser_ok and rfree >= rfree_threshold:
+        flag = "jelly_succeeded" if jelly else None
+        updates = {flag: False} if flag else {}
+        return {"status": "skipped",
+                "message": f"refmac (jelly={jelly}): phaser failed and rfree too high",
+                "ctx_updates": updates}
+    if jelly:
+        xyz_in  = ctx.get("jelly_input", "")
+        xyz_out = job_dir / f"03-jelly_{suffix}.pdb"
+        hkl_out = job_dir / f"03-jelly_{suffix}.mtz"
+        log_out = f"03-jelly_{suffix}.log"
+        label   = "03-jelly"
     else:
-        phaser_ok = ctx.get("phaser_succeeded", False)
-        rfree     = ctx.get("rfree_after_rigid_body", 1.0)
-        mr_cutoff = ctx.get("mr_cutoff", 0.45)
-        if not phaser_ok and rfree >= mr_cutoff:
-            flag = "jelly_succeeded" if jelly else None
-            updates = {flag: False} if flag else {}
+        if not ctx.get("jelly_succeeded", False):
             return {"status": "skipped",
-                    "message": f"refmac (jelly={jelly}): phaser failed and rfree too high",
-                    "ctx_updates": updates}
-        if jelly:
-            xyz_in  = ctx.get("jelly_input", "")
-            xyz_out = job_dir / f"03-jelly_{suffix}.pdb"
-            hkl_out = job_dir / f"03-jelly_{suffix}.mtz"
-            log_out = f"03-jelly_{suffix}.log"
-            label   = "03-jelly"
-        else:
-            if not ctx.get("jelly_succeeded", False):
-                return {"status": "skipped",
-                        "message": "refmac (restrained): jelly failed or skipped"}
-            xyz_in  = str(job_dir / f"03-jelly_{suffix}.pdb")
-            xyz_out = job_dir / f"final_{suffix}.pdb"
-            hkl_out = job_dir / f"final_{suffix}.mtz"
-            log_out = f"04-refmac_{suffix}.log"
-            label   = "04-refmac"
+                    "message": "refmac (restrained): jelly failed or skipped"}
+        xyz_in  = str(job_dir / f"03-jelly_{suffix}.pdb")
+        xyz_out = job_dir / f"final_{suffix}.pdb"
+        hkl_out = job_dir / f"final_{suffix}.mtz"
+        log_out = f"04-refmac_{suffix}.log"
+        label   = "04-refmac"
 
     stdin_kw = (
         "make newligand continue\n"
@@ -374,13 +425,10 @@ def _run_refmac(step, ctx, params, suffix, job_dir):
     )
 
     ctx_updates = {}
-    if jelly and monomer:
-        ctx_updates["jelly_mono_succeeded"] = xyz_out.is_file()
-    elif jelly and not monomer:
+    if jelly:
         ctx_updates["jelly_succeeded"] = xyz_out.is_file()
-    elif not jelly and not monomer:
-        log_path = job_dir / log_out
-        ctx_updates["final_rfree"] = _final_rfree_from_refmac_log(log_path)
+    else:
+        ctx_updates["final_rfree"] = _final_rfree_from_refmac_log(job_dir / log_out)
 
     return {
         "status": "completed",
@@ -393,12 +441,9 @@ def _run_fill(step, ctx, params, suffix, job_dir):
     if not step.fill.enabled:
         return {"status": "skipped", "message": "fill: disabled"}
 
-    for pdb_prefix in (f"final_monomer_{suffix}", f"final_{suffix}"):
-        pdb_path = job_dir / f"{pdb_prefix}.pdb"
-        mtz_path = job_dir / f"{pdb_prefix}.mtz"
-        if pdb_path.is_file() and mtz_path.is_file():
-            break
-    else:
+    pdb_path = job_dir / f"final_{suffix}.pdb"
+    mtz_path = job_dir / f"final_{suffix}.mtz"
+    if not (pdb_path.is_file() and mtz_path.is_file()):
         return {"status": "error", "fatal": False,
                 "message": "fill: no final PDB/MTZ pair found"}
 
@@ -438,7 +483,7 @@ def _run_fill(step, ctx, params, suffix, job_dir):
 # ---------------------------------------------------------------------------
 
 _HANDLERS = {
-    "phenix.refine": _run_rigid_body,
+    "phenix.refine": _run_phenix,
     "phenix.phaser": _run_phaser,
     "refmac5":       _run_refmac,
     "fill":          _run_fill,

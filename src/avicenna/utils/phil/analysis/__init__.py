@@ -10,11 +10,7 @@ import importlib
 import pkgutil
 from pathlib import Path
 
-import freephil
-
 from avicenna.utils.phil._base import PhilBase
-
-_PIPELINES_DIR = Path(__file__).parents[3] / "resources" / "pipelines"
 
 # ---------------------------------------------------------------------------
 # Fixed sub-pipeline header
@@ -130,49 +126,41 @@ def _discover_backends():
     return modules
 
 
-def _build_analysis_phil() -> str:
-    backends = _discover_backends()
+def _build_analysis_phil():
+    """Return (phil_def, program_blocks) assembled from the program catalog.
+
+    program_blocks maps each program choice value to its settings-block scope
+    name, so the serializer can emit just the one block belonging to each step's
+    program.
+    """
     all_programs: dict[str, str] = {}
-    for mod in backends:
+    for mod in _discover_backends():
         all_programs.update(mod.PROGRAMS)
     names = list(all_programs.keys())
     choice = " ".join(f"*{n}" if i == 0 else n for i, n in enumerate(names))
-    return (
+    phil_def = (
         _HEADER
         + _STEP_HEADER.replace("{choice}", choice)
         + "".join(all_programs.values())
         + _FOOTER
     )
+    program_blocks = {prog: block.split(None, 1)[0] for prog, block in all_programs.items()}
+    return phil_def, program_blocks
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
-PHIL_DEF = _build_analysis_phil()
+PHIL_DEF, PROGRAM_BLOCKS = _build_analysis_phil()
 
 
 class AnalysisPHIL(PhilBase):
     """PHIL parameters for the analysis sub-pipeline (vic.analysis)."""
     phil_def = PHIL_DEF
     _resource_file = "default_analysis.phil"
-
-    def __init__(self, load_defaults: bool = True):
-        self._master = freephil.parse(self.phil_def)
-        if load_defaults:
-            resource = _PIPELINES_DIR / self._resource_file
-            self._default_sources = [freephil.parse(resource.read_text())] if resource.exists() else []
-        else:
-            self._default_sources = []
-        self._params = self._master.fetch(sources=self._default_sources).extract()
-
-    def adopt_phil_string(self, phil_string: str):
-        user_phil = freephil.parse(phil_string)
-        self._params = self._master.fetch(sources=[*self._default_sources, user_phil]).extract()
-
-    def from_file(self, path: str):
-        with open(path) as fh:
-            self.adopt_phil_string(fh.read())
+    _scope_name = "analysis"
+    _program_blocks = PROGRAM_BLOCKS
 
 
 # Backward-compatible alias

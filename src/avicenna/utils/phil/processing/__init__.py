@@ -20,11 +20,7 @@ import importlib
 import pkgutil
 from pathlib import Path
 
-import freephil
-
-from avicenna.utils.phil._base import PhilBase, _choice_names_from_def, _normalize_choice_case
-
-_PIPELINES_DIR = Path(__file__).parents[3] / "resources" / "pipelines"
+from avicenna.utils.phil._base import PhilBase
 
 # ---------------------------------------------------------------------------
 # Fixed sub-pipeline header (input / output) — not backend-specific
@@ -55,6 +51,31 @@ processing
       .short_caption = Reference MTZ
       .help = Reference MTZ dataset for copying R-free flags to all processed datasets.
       .expert_level = 0
+  }
+  dataset
+    .short_caption = Dataset
+    .help = Program-agnostic dataset-processing settings (apply to any indexing program).
+  {
+    indexing_images = first_half
+      .type = str
+      .short_caption = Indexing images
+      .help = Which images to index (first_half, last_half, all, quarters, eighths, or an explicit range).
+      .expert_level = 1
+    refine_cell_integrate = *both true false
+      .type = choice
+      .short_caption = Cell refinement mode
+      .help = Refine the unit cell during integration -- both spawns two branches (cell-refined and not).
+      .expert_level = 1
+    no_symmetry = False
+      .type = bool
+      .short_caption = Also process without symmetry
+      .help = If True, also process each dataset with no symmetry constraint (a free run), in addition to any known_symmetry isoforms.
+      .expert_level = 2
+    reference_hkl = None
+      .type = path
+      .short_caption = Reference HKL
+      .help = Reference XDS_ASCII.HKL for reindexing / isomorphism-guided integration.
+      .expert_level = 1
   }
   output
     .short_caption = Output
@@ -161,6 +182,11 @@ processing
         .expert_level = 0
     }
   }
+"""
+
+# Steps scope opener — kept separate so program SETTINGS scopes can be inserted
+# between the fixed header and the step list in _build_processing_phil.
+_STEPS_OPEN = """\
   steps
     .short_caption = Pipeline steps
     .help = Ordered sequence of programs to run.  Edit, reorder, or replace \
@@ -217,60 +243,43 @@ def _discover_backends():
     return modules
 
 
-def _build_processing_phil() -> str:
-    backends = _discover_backends()
+def _build_processing_phil():
+    """Return (phil_def, program_blocks) assembled from the program catalog.
+
+    program_blocks maps each program choice value to its settings-block scope
+    name, so the serializer can emit just the one block belonging to each step's
+    program.
+    """
     all_programs: dict[str, str] = {}
-    for mod in backends:
+    settings_blocks = []
+    for mod in _discover_backends():
         all_programs.update(mod.PROGRAMS)
+        if hasattr(mod, "SETTINGS"):
+            settings_blocks.append(mod.SETTINGS)
     names = list(all_programs.keys())
     choice = " ".join(f"*{n}" if i == 0 else n for i, n in enumerate(names))
-    return (
+    phil_def = (
         _HEADER
+        + "".join(settings_blocks)          # per-program global settings scopes
+        + _STEPS_OPEN
         + _STEP_HEADER.replace("{choice}", choice)
         + "".join(all_programs.values())
         + _FOOTER
     )
+    program_blocks = {prog: block.split(None, 1)[0] for prog, block in all_programs.items()}
+    return phil_def, program_blocks
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
-PHIL_DEF = _build_processing_phil()
+PHIL_DEF, PROGRAM_BLOCKS = _build_processing_phil()
 
 
 class ProcessingPHIL(PhilBase):
     """PHIL parameters for the data-processing sub-pipeline (vic.process)."""
     phil_def = PHIL_DEF
     _resource_file = "default_processing.phil"
-
-    def __init__(self, load_defaults: bool = True):
-        self._master = freephil.parse(self.phil_def)
-        self._choice_names = _choice_names_from_def(self.phil_def)
-        if load_defaults:
-            resource = _PIPELINES_DIR / self._resource_file
-            self._default_sources = [freephil.parse(resource.read_text())] if resource.exists() else []
-        else:
-            self._default_sources = []
-        self._params = self._master.fetch(sources=self._default_sources).extract()
-        self._default_step_ids = [s.id for s in self._params.processing.steps.step]
-
-    def adopt_phil_string(self, phil_string: str):
-        phil_string = _normalize_choice_case(phil_string, self._choice_names)
-        user_phil = freephil.parse(phil_string)
-        merged = self._master.fetch(sources=[*self._default_sources, user_phil]).extract()
-        # freephil appends .multiple=True instances rather than merging by id;
-        # deduplicate so the last (user) definition of each step id wins,
-        # then restore canonical order (defaults first, user-only steps appended).
-        steps = merged.processing.steps.step
-        seen = {}
-        for step in steps:
-            seen[step.id] = step
-        ordered = [seen.pop(sid) for sid in self._default_step_ids if sid in seen]
-        ordered.extend(seen.values())
-        merged.processing.steps.step = ordered
-        self._params = merged
-
-    def from_file(self, path: str):
-        with open(path) as fh:
-            self.adopt_phil_string(fh.read())
+    _scope_name = "processing"
+    _program_blocks = PROGRAM_BLOCKS

@@ -10,7 +10,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "src"))
 from avicenna.utils.utils import QRefineWatcher, QRefineScraper, QRefineWriter, ProgressBar
 from avicenna.pipelines.legacy.qrefine_pipeline import RunQRefine
 from avicenna.pipelines.refinement import RefinementOrchestrator
-from avicenna.utils.phil import RefinePHIL, AvicennaPHIL
+from avicenna.utils.phil import RefinePHIL
 from avicenna.utils.software import check_programs
 
 try:
@@ -86,15 +86,13 @@ def _watch_with_bar(watcher, omnibus):
 
 def main():
     try:
-        args = parser.parse_args()
+        args, _extras = parser.parse_known_args()
 
         if args.phil or args.phil_expert_level is not None or args.phil_attrs:
-            av = AvicennaPHIL()
-            av._master.format(av._params).show(
-                out=sys.stdout,
-                attributes_level=2 if args.phil_attrs else 0,
+            sys.stdout.write(RefinePHIL().full_phil_string(
                 expert_level=args.phil_expert_level,
-            )
+                attributes=args.phil_attrs,
+            ))
             sys.exit(0)
 
         phil = RefinePHIL()
@@ -104,6 +102,17 @@ def main():
             _apply_phil_file(phil, args.settings)
         elif pathlib.Path(_DEFAULT_PHIL).exists():
             _apply_phil_file(phil, pathlib.Path(_DEFAULT_PHIL))
+
+        # PHIL overrides given as CLI args (e.g. water=hoh reference_pdb=ref.pdb).
+        _flags = [e for e in _extras if e.startswith("-")]
+        if _flags:
+            parser.error("unrecognized arguments: " + " ".join(_flags))
+        if _extras:
+            try:
+                phil.adopt_cli_args(_extras)
+                print("Applied PHIL overrides: " + " ".join(_extras))
+            except ValueError as e:
+                sys.exit(f"ERROR: {e}")
 
         check_programs(phil._params.refine.programs)
 

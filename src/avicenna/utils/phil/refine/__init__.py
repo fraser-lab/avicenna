@@ -11,11 +11,7 @@ import importlib
 import pkgutil
 from pathlib import Path
 
-import freephil
-
-from avicenna.utils.phil._base import PhilBase, _choice_names_from_def, _normalize_choice_case
-
-_PIPELINES_DIR = Path(__file__).parents[3] / "resources" / "pipelines"
+from avicenna.utils.phil._base import PhilBase
 
 # ---------------------------------------------------------------------------
 # Fixed sub-pipeline header
@@ -26,6 +22,11 @@ refine
   .short_caption = Refinement
   .help = Parameters for the crystallographic refinement sub-pipeline.
 {
+  water = *both hoh nohoh
+    .type = choice
+    .short_caption = Water handling
+    .help = Refine with ordered waters retained (hoh), stripped (nohoh), or both as parallel jobs per dataset.
+    .expert_level = 0
   input
     .short_caption = Input
     .help = Input files for the refinement run.
@@ -43,9 +44,9 @@ refine
       .expert_level = 0
     params_file = "qrefine_input_parameters.txt"
       .type = path
-      .short_caption = MR parameter file
-      .help = File containing qRefine/MR parameters.
-      .expert_level = 0
+      .short_caption = MR parameter file (legacy)
+      .help = Legacy-only per-crystal MR parameter file (vic.refine --legacy).  The PHIL pipeline ignores it and reads MR settings from refine.phil instead.
+      .expert_level = 1
     reference_mtz = None
       .type = path
       .short_caption = Reference MTZ
@@ -54,7 +55,7 @@ refine
     reference_pdb = None
       .type = path
       .short_caption = Reference PDB
-      .help = Reference coordinate file for molecular replacement.
+      .help = Reference coordinate model -- used as the rigid-body starting model and the molecular-replacement search model.  Edit this to point to your model before running vic.refine.
       .expert_level = 0
   }
   output
@@ -163,60 +164,38 @@ def _discover_backends():
     return modules
 
 
-def _build_refine_phil() -> str:
-    backends = _discover_backends()
+def _build_refine_phil():
+    """Return (phil_def, program_blocks) assembled from the program catalog.
+
+    program_blocks maps each program choice value (e.g. ``phenix.refine``) to
+    its settings-block scope name (e.g. ``rigid_body``), so the serializer can
+    emit just the one block belonging to each step's program.
+    """
     all_programs: dict[str, str] = {}
-    for mod in backends:
+    for mod in _discover_backends():
         all_programs.update(mod.PROGRAMS)
     names = list(all_programs.keys())
     choice = " ".join(f"*{n}" if i == 0 else n for i, n in enumerate(names))
-    return (
+    phil_def = (
         _HEADER
         + _STEP_HEADER.replace("{choice}", choice)
         + "".join(all_programs.values())
         + _FOOTER
     )
+    program_blocks = {prog: block.split(None, 1)[0] for prog, block in all_programs.items()}
+    return phil_def, program_blocks
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
-PHIL_DEF = _build_refine_phil()
+PHIL_DEF, PROGRAM_BLOCKS = _build_refine_phil()
 
 
 class RefinePHIL(PhilBase):
     """PHIL parameters for the refinement sub-pipeline (vic.refine)."""
     phil_def = PHIL_DEF
     _resource_file = "default_refine.phil"
-
-    def __init__(self, load_defaults: bool = True):
-        self._master = freephil.parse(self.phil_def)
-        self._choice_names = _choice_names_from_def(self.phil_def)
-        if load_defaults:
-            resource = _PIPELINES_DIR / self._resource_file
-            self._default_sources = [freephil.parse(resource.read_text())] if resource.exists() else []
-        else:
-            self._default_sources = []
-        self._params = self._master.fetch(sources=self._default_sources).extract()
-        self._default_step_ids = [s.id for s in self._params.refine.steps.step]
-
-    def adopt_phil_string(self, phil_string: str):
-        phil_string = _normalize_choice_case(phil_string, self._choice_names)
-        user_phil = freephil.parse(phil_string)
-        merged = self._master.fetch(sources=[*self._default_sources, user_phil]).extract()
-        # freephil appends .multiple=True instances rather than merging by id;
-        # deduplicate so the last (user) definition of each step id wins,
-        # then restore canonical order (defaults first, user-only steps appended).
-        steps = merged.refine.steps.step
-        seen = {}
-        for step in steps:
-            seen[step.id] = step
-        ordered = [seen.pop(sid) for sid in self._default_step_ids if sid in seen]
-        ordered.extend(seen.values())
-        merged.refine.steps.step = ordered
-        self._params = merged
-
-    def from_file(self, path: str):
-        with open(path) as fh:
-            self.adopt_phil_string(fh.read())
+    _scope_name = "refine"
+    _program_blocks = PROGRAM_BLOCKS
