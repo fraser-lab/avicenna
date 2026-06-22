@@ -265,3 +265,8 @@ class RefinementOrchestrator(RunQRefine):
             phil_string=self.phil_string,
             sh_sources=sh_sources, csh_sources=csh_sources,
         )
+
+    def _write_pandda_template(self, mr_params):
+        """No-op on the PHIL path: the next stage is emitted as analysis.phil by
+        RefinementSentinel on completion, not the legacy pandda_template.sh."""
+        return

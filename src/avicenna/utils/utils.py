@@ -89,6 +89,24 @@ for _alias, _canonical in _SG_ALIASES.items():
     _SG_BY_NAME[_alias] = _SG_BY_NAME[_canonical]
 
 
+def qsub_terse(args):
+    """Submit via ``qsub -terse`` and return the numeric job id (str) or None.
+
+    ``-terse`` prints just the job id; for array jobs it is
+    ``jobid.start-end:step``, so the id usable with ``-hold_jid`` is the leading
+    integer.  This isolates the only scheduler-specific call, so completion
+    detection elsewhere can stay scheduler-agnostic (file-structure sweep)."""
+    import subprocess
+    result = subprocess.run(["qsub", "-terse", *map(str, args)],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    out = (result.stdout or "").strip()
+    if result.returncode != 0 or not out:
+        if out:
+            print(out)
+        return None
+    return out.splitlines()[0].split(".")[0].strip()
+
+
 def sg_lookup(space_group=None, space_group_number=None):
     """Return (number, canonical_name) for a space group specification.
 
@@ -981,6 +999,55 @@ class ProcessingWatcher(WatcherBase):
                     logs.append(flat_log)
         return logs
 
+    def _psf_status(self, psf_path):
+        """Aggregate one crystal subfolder's status across its ``index_*/``
+        attempts, treating forced-lattice (``*_force/``) re-runs correctly.
+
+        A forced attempt counts as still-running while its ``*_force/`` directory
+        exists (it is created *before* the SGE job is submitted) but its
+        ``pipeline.log`` is missing or non-terminal -- so the run is never
+        declared done while forced re-runs are queued or in flight.  The dataset
+        is non-terminal if ANY attempt is non-terminal; otherwise FINISHED if ANY
+        attempt finished (forced integration deliberately tries several lattices,
+        most of which fail); otherwise FAILED.  Returns ``(None, None)`` when
+        there is no information yet (treated as in-progress by get_counts)."""
+        states = []        # terminal (status, msg) from attempts that have a log
+        running = None     # a representative non-terminal (status, msg), if any
+        pending = False    # a *_force/ (or index_) dir exists with no terminal log yet
+        try:
+            entries = sorted(os.listdir(psf_path))
+        except OSError:
+            return (None, None)
+        for entry in entries:
+            index_path = os.path.join(psf_path, entry)
+            if not (entry.startswith('index_') and os.path.isdir(index_path)):
+                continue
+            force_dirs = [s for s in os.listdir(index_path)
+                          if s.endswith('_force')
+                          and os.path.isdir(os.path.join(index_path, s))]
+            if force_dirs:
+                log_paths = [os.path.join(index_path, fd, 'pipeline.log') for fd in force_dirs]
+            else:
+                log_paths = [os.path.join(index_path, 'pipeline.log')]
+            for lp in log_paths:
+                if not os.path.isfile(lp):
+                    pending = True          # job submitted, not yet logging
+                    continue
+                st, msg = self._read_pipeline_log(lp)
+                if st is None:
+                    continue
+                if st in ("FINISHED", "FAILED"):
+                    states.append((st, msg))
+                else:
+                    running = running or (st, msg)
+        if pending or running:
+            return running or ("RUNNING_FORCE", None)
+        if not states:
+            return (None, None)
+        if any(s == "FINISHED" for s, _ in states):
+            return ("FINISHED", None)
+        return ("FAILED", next((m for s, m in states if s == "FAILED"), None))
+
     def watch(self):
         folders = [name for name in os.listdir(self.procpath)
                    if os.path.isdir(os.path.join(self.procpath, name))]
@@ -992,22 +1059,9 @@ class ProcessingWatcher(WatcherBase):
             for psf_name in self.datasets[pin]:
                 if "REJECTED" in self.datasets[pin][psf_name]:
                     continue
-                psf = os.path.join(pin_folder_path, psf_name)
-                logs = self._pipeline_logs(psf)
-                if not logs:
-                    continue
-                statuses = [self._read_pipeline_log(l) for l in logs]
-                statuses = [(s, m) for s, m in statuses if s is not None]
-                if not statuses:
-                    continue
-                if any(s == "FAILED" for s, _ in statuses):
-                    failed_msg = next(m for s, m in statuses if s == "FAILED")
-                    self.datasets[pin][psf_name] = ("FAILED", failed_msg)
-                elif all(s == "FINISHED" for s, _ in statuses):
-                    self.datasets[pin][psf_name] = ("FINISHED", None)
-                else:
-                    last_s, last_m = statuses[-1]
-                    self.datasets[pin][psf_name] = (last_s, last_m)
+                status = self._psf_status(os.path.join(pin_folder_path, psf_name))
+                if status != (None, None):
+                    self.datasets[pin][psf_name] = status
 
     def tail_logs(self, log_file=None):
         """Print any new lines added to pipeline.log files since last call."""

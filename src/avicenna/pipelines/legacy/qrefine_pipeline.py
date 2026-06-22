@@ -7,7 +7,7 @@ import stat
 import subprocess
 import sys
 sys.path.insert(0, str(pathlib.Path(__file__).parents[2]))
-from avicenna.utils.utils import format_log_line, QRefineWatcher
+from avicenna.utils.utils import format_log_line, QRefineWatcher, qsub_terse
 
 parser = argparse.ArgumentParser(prog="vic.refine")
 parser.add_argument("-d", "--data", type=pathlib.Path,
@@ -790,9 +790,11 @@ pandda.analyse \\
 
         submit_path = self._write_qsub_submit(qsub_list, njob)
 
+        job_id = None
         if not self.dry_run:
-            subprocess.run(["qsub", str(submit_path)])
+            job_id = qsub_terse([submit_path])
             self._write_pandda_template(mr_params)
+        return job_id
 
 
 def main():

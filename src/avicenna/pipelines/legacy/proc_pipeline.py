@@ -27,7 +27,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "src"))
-from avicenna.utils.utils import BRAVAIS_LATTICES, QRefineWriter, format_log_line, ProcessingWatcher, sg_lookup, count_hdf5_images
+from avicenna.utils.utils import BRAVAIS_LATTICES, QRefineWriter, format_log_line, ProcessingWatcher, sg_lookup, count_hdf5_images, qsub_terse
 from avicenna.utils.software import find_xds, find_ccp4, find_phenix, suite_setup_sources
 
 
@@ -1286,7 +1286,7 @@ RunProcess(params).{method}()
         submit_script_path.chmod(
             submit_script_path.stat().st_mode | stat.S_IXUSR | stat.S_IRUSR | stat.S_IWUSR
         )
-        subprocess.run(["qsub", str(submit_script_path)])
+        return qsub_terse([submit_script_path])
 
     # ------------------------------------------------------------------
     # Per-step dispatch helpers
@@ -1589,8 +1589,9 @@ RunProcess(params).{method}()
                     fh.write(f"{collection_id}_{series_key}\n")
 
         submit_sh = self.process_dir / "xds_pipeline_index_qsub_submit.sh"
-        self._submit_sge_array(qsub_list, submit_sh, h_rt="06:00:00", logs_dir=self._logs_dir)
+        job_id = self._submit_sge_array(qsub_list, submit_sh, h_rt="06:00:00", logs_dir=self._logs_dir)
         print(f"Done in {time.time() - _run_start:.1f}s")
+        return job_id
 
     def run_single(self):
         """

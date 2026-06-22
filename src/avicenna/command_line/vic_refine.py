@@ -10,6 +10,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "src"))
 from avicenna.utils.utils import QRefineWatcher, QRefineScraper, QRefineWriter, ProgressBar
 from avicenna.pipelines.legacy.qrefine_pipeline import RunQRefine
 from avicenna.pipelines.refinement import RefinementOrchestrator
+from avicenna.pipelines.sentinel import RefinementSentinel
 from avicenna.utils.phil import RefinePHIL
 from avicenna.utils.software import check_programs
 
@@ -155,7 +156,7 @@ refine {{
                 )
                 if steps:
                     phil.adopt_phil_string(f"refine {{\n  steps {{\n{steps}  }}\n}}\n")
-            RefinementOrchestrator(
+            main_job_id = RefinementOrchestrator(
                 process_dir=args.output,
                 dataset_list=args.list,
                 params_file=args.params,
@@ -163,6 +164,10 @@ refine {{
                 fill=not args.no_fill,
                 phil_string=phil.diff_phil_string(),
             ).run()
+            # Finalization (scrape + analysis.phil) runs on job completion via an
+            # SGE sentinel, so it survives --silent / a dropped connection.
+            if main_job_id:
+                RefinementSentinel(os.path.abspath(args.output)).submit(main_job_id)
 
         if args.silent:
             return

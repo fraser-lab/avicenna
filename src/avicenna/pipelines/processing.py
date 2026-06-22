@@ -77,6 +77,12 @@ class ProcessingOrchestrator(RunProcess):
     known_symmetry.txt / xds_input_parameters.txt files).
     """
 
+    # Wall-clock cap for a forced-integration job (scratch copy + all steps).
+    # On expiry the worker writes a FAILED line to its pipeline.log and exits, so
+    # a stuck forced lattice (these can otherwise run for hours) is marked failed
+    # instead of stalling the run.  Overridable per-run via params["forced_job_timeout_s"].
+    FORCED_JOB_TIMEOUT_S = 900
+
     def _known_symmetry_entries(self):
         """Build symmetry entries from the PHIL ``processing.known_symmetry``
         scope when enabled; otherwise fall back to the legacy file-based source.
@@ -135,6 +141,28 @@ class ProcessingOrchestrator(RunProcess):
         Path(pipeline_subdir, "params.json").write_text(
             json.dumps(per_params, indent=2, default=str)
         )
+
+        # Forced-integration jobs get a wall-clock timeout: on expiry the worker
+        # writes a FAILED line to pipeline.log (so the watcher/sentinel see a
+        # terminal status) and exits.  Covers the whole job, incl. scratch copy.
+        if forced:
+            _timeout = int(per_params.get("forced_job_timeout_s") or self.FORCED_JOB_TIMEOUT_S)
+            _timeout_block = (
+                "import signal\n"
+                "def _on_timeout(signum, frame):\n"
+                "    from avicenna.utils.utils import format_log_line\n"
+                "    with open('pipeline.log', 'a') as _fh:\n"
+                f"        _fh.write(format_log_line('ERROR', 'forced job exceeded {_timeout}s wall-clock timeout -- marked failed', context=params.get('pin_id')))\n"
+                "    os._exit(1)\n"
+                "signal.signal(signal.SIGALRM, _on_timeout)\n"
+                f"signal.alarm({_timeout})\n"
+            )
+            _run_call = ("ProcessingPipelineInterpreter(params).run(forced=True)\n"
+                         "signal.alarm(0)\n")
+        else:
+            _timeout_block = ""
+            _run_call = "ProcessingPipelineInterpreter(params).run(forced=False)\n"
+
         script = Path(pipeline_subdir) / "run_pipeline.py"
         script.write_text(f"""\
 #!/usr/bin/env python3
@@ -165,8 +193,7 @@ print(f"workdir      : {{params.get('pipeline_subdir', 'n/a')}}")
 print(f"space_group  : {{params.get('sg', 'n/a')}}")
 print(f"cell         : {{params.get('cell', 'n/a')}}")
 print("=" * 60, flush=True)
-ProcessingPipelineInterpreter(params).run(forced={forced!r})
-""")
+{_timeout_block}{_run_call}""")
         script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IRUSR | stat.S_IWUSR)
 
 

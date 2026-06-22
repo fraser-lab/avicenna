@@ -8,29 +8,12 @@ import subprocess
 import time
 from importlib.metadata import version, PackageNotFoundError
 sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "src"))
-from avicenna.utils.utils import DataFinder, ParamWriter, Watcher, ProcessingScraper, ProcessingFilter, ProgressBar
+from avicenna.utils.utils import DataFinder, ParamWriter, Watcher, ProcessingScraper, ProgressBar
 from avicenna.pipelines.legacy.proc_pipeline import RunProcess
 from avicenna.pipelines.processing import ProcessingOrchestrator
-from avicenna.utils.phil import ProcessingPHIL, RefinePHIL
+from avicenna.pipelines.sentinel import ProcessingSentinel
+from avicenna.utils.phil import ProcessingPHIL
 from avicenna.utils.software import check_programs
-
-
-def _write_refine_phil(project_dir):
-    """Emit refine.phil (defaults + run-specific paths) so the user can edit the
-    reference PDB and run vic.refine next -- the PHIL replacement for the legacy
-    qrefine_input_parameters.txt.  Looks like `vic.refine --dry_run` output."""
-    phil = RefinePHIL()
-    phil.adopt_phil_string(
-        f'refine {{\n  input {{\n'
-        f'    output_dir = "{project_dir}"\n'
-        f'    dataset_list = "qrefine_list.txt"\n'
-        f'  }}\n}}\n'
-    )
-    out = os.path.join(project_dir, "refine.phil")
-    with open(out, "w") as fh:
-        fh.write(phil.full_phil_string())
-    print(f"Written: {out}")
-    print("  -> edit input.reference_pdb to point to your reference model, then run: vic.refine")
 
 try:
     _version = version("avicenna")
@@ -306,12 +289,20 @@ processing {{
         else:
             if args.xds_root:
                 params["xds_root"] = args.xds_root
+            main_job_id = None
             with contextlib.redirect_stdout(_Tee(sys.stdout, omnibus)):
                 if args.legacy:
                     RunProcess(params).run()
                 else:
                     params["phil_string"] = phil.diff_phil_string()
-                    ProcessingOrchestrator(params).run()
+                    main_job_id = ProcessingOrchestrator(params).run()
+            # All finalization (filtered qrefine_list.txt + refine.phil) is done by
+            # an SGE completion sentinel held on the main array, so it runs on job
+            # completion in every mode -- interactive, --silent, or after the
+            # submitting shell disconnects.  The sentinel is the sole arbiter of
+            # completion; the foreground watcher below is display-only.
+            if not args.legacy and main_job_id:
+                ProcessingSentinel(project_dir, no_filter=args.no_filter).submit(main_job_id)
 
         if args.silent or args.dry_run:
             return
@@ -331,17 +322,12 @@ processing {{
         watcher.tail_logs(log_file=omnibus)
         print()
         watcher.print_summary(omnibus=omnibus)
+        # Display-only: show the live results table.  The authoritative filtered
+        # qrefine_list.txt + refine.phil are written by the sentinel on completion.
         with contextlib.redirect_stdout(_Tee(sys.stdout, omnibus)):
             scraper = ProcessingScraper(procpath)
             scraper.scrape_all()
             scraper.print_info()
-            if not args.no_filter:
-                scraper.results = ProcessingFilter().run(scraper.results)
-            scraper.write_qrefine_list(
-                path=os.path.join(os.path.abspath(args.output), 'qrefine_list.txt')
-            )
-            if not args.legacy:
-                _write_refine_phil(os.path.abspath(args.output))
     except KeyboardInterrupt:
         print("\nInterrupted. Any submitted jobs are still running on the cluster.")
         sys.exit(1)
