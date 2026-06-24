@@ -7,7 +7,7 @@ import pathlib
 import time
 from importlib.metadata import version, PackageNotFoundError
 sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "src"))
-from avicenna.utils.utils import QRefineWatcher, QRefineScraper, QRefineWriter, ProgressBar
+from avicenna.utils.utils import QRefineWatcher, QRefineScraper, QRefineWriter, ProgressBar, log_phil_diff, wait_for_sentinel
 from avicenna.pipelines.legacy.qrefine_pipeline import RunQRefine
 from avicenna.pipelines.refinement import RefinementOrchestrator
 from avicenna.pipelines.sentinel import RefinementSentinel
@@ -19,7 +19,8 @@ try:
 except PackageNotFoundError:
     _version = "unknown"
 
-_DEFAULT_PHIL = "refine.phil"
+_DEFAULT_PHIL  = "refine.phil"          # effective settings, written each run
+_TEMPLATE_PHIL = "refine_default.phil"  # defaults template, written by --dry_run
 
 parser = argparse.ArgumentParser(prog="vic.refine")
 parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {_version}")
@@ -35,13 +36,13 @@ parser.add_argument("-p", "--params", type=pathlib.Path,
                     default=pathlib.Path("qrefine_input_parameters.txt"),
                     help="MR parameter file (default: qrefine_input_parameters.txt)")
 parser.add_argument("--dry_run", action="store_true",
-                    help=f"Scan processing output and write qrefine_list.txt, qrefine_input_parameters.txt, and {_DEFAULT_PHIL} without submitting jobs")
+                    help=f"Scan processing output and write qrefine_list.txt, qrefine_input_parameters.txt, and {_TEMPLATE_PHIL} without submitting jobs")
 parser.add_argument("--legacy", action="store_true",
                     help="Use the hard-coded legacy pipeline instead of the PHIL-driven interpreter")
 parser.add_argument("--silent", action="store_true",
                     help="Submit jobs without tailing the log")
-parser.add_argument("--prog_log", action="store_true",
-                    help="Tail pipeline logs with a compact progress bar pinned below")
+parser.add_argument("--no-prog-log", dest="no_prog_log", action="store_true",
+                    help="Disable the multiline progress bar; show plain progress updates instead")
 parser.add_argument("--no_fill", action="store_true",
                     help="Skip populating missing/invalid reflections in the final MTZ (not recommended for panDDA input)")
 _phil_group = parser.add_mutually_exclusive_group()
@@ -117,21 +118,25 @@ def main():
 
         check_programs(phil._params.refine.programs)
 
-        if args.dry_run:
-            QRefineWriter(args.output).write()
-            phil.adopt_phil_string(f"""\
+        # Inject the resolved run paths so the written PHIL is self-contained.
+        _input_snap = f"""\
 refine {{
   input {{
     output_dir = "{pathlib.Path(args.output).resolve()}"
     dataset_list = "{args.list}"
     params_file = "{args.params}"
   }}
-}}""")
-            with open(_DEFAULT_PHIL, "w") as _f:
+}}"""
+
+        if args.dry_run:
+            QRefineWriter(args.output).write()
+            phil.adopt_phil_string(_input_snap)
+            with open(_TEMPLATE_PHIL, "w") as _f:
                 _f.write(phil.full_phil_string())
-            print(f"Written: {_DEFAULT_PHIL}")
+            print(f"Written: {_TEMPLATE_PHIL}")
             return
 
+        sentinel_submitted = False
         if args.legacy:
             RunQRefine(
                 process_dir=args.output,
@@ -156,6 +161,14 @@ refine {{
                 )
                 if steps:
                     phil.adopt_phil_string(f"refine {{\n  steps {{\n{steps}  }}\n}}\n")
+            # Snapshot the effective PHIL for this run (after CLI overrides), with
+            # the resolved run paths injected.  Written on every run, even when
+            # identical to the defaults; refine_default.phil stays the template.
+            phil.adopt_phil_string(_input_snap)
+            with open(_DEFAULT_PHIL, "w") as _f:
+                _f.write(phil.full_phil_string())
+            print(f"Wrote {_DEFAULT_PHIL} (effective settings for this run)")
+            log_phil_diff(phil, os.path.join(os.path.abspath(args.output), "qrefine.log"))
             main_job_id = RefinementOrchestrator(
                 process_dir=args.output,
                 dataset_list=args.list,
@@ -168,6 +181,7 @@ refine {{
             # SGE sentinel, so it survives --silent / a dropped connection.
             if main_job_id:
                 RefinementSentinel(os.path.abspath(args.output)).submit(main_job_id)
+                sentinel_submitted = True
 
         if args.silent:
             return
@@ -175,9 +189,7 @@ refine {{
         procpath = os.path.abspath(args.output)
         omnibus = os.path.join(procpath, "qrefine.log")
         watcher = QRefineWatcher(procpath=procpath)
-        if args.prog_log:
-            _watch_with_bar(watcher, omnibus)
-        else:
+        if args.no_prog_log:
             while True:
                 watcher.tail_logs(log_file=omnibus)
                 buf = io.StringIO()
@@ -186,8 +198,16 @@ refine {{
                 if not still_running:
                     break
                 time.sleep(1)
+        else:
+            _watch_with_bar(watcher, omnibus)
         watcher.tail_logs(log_file=omnibus)
         print()
+        # Wait for the held SGE sentinel to record completion (it also writes
+        # analysis.phil) before declaring the run done.  Safe to Ctrl-C.
+        if sentinel_submitted:
+            if not wait_for_sentinel(omnibus):
+                print("Sentinel marker not seen within the timeout; it will still "
+                      "finalize on the cluster (analysis.phil).")
         watcher.print_summary(omnibus=omnibus)
         scraper = QRefineScraper(procpath)
         scraper.scrape_all()

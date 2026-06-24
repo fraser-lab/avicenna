@@ -34,11 +34,13 @@ Context dict keys (passed to every step handler)
 
 import importlib
 import json
+import os
 import pkgutil
 import stat
 from pathlib import Path
 
 from avicenna.pipelines.legacy.proc_pipeline import RunProcess
+from avicenna.pipelines.jobbase import SubPipelineJob
 from avicenna.utils.phil.processing import ProcessingPHIL
 from avicenna.utils.software import suite_setup_sources
 from avicenna.utils.utils import QRefineWriter, sg_lookup
@@ -75,13 +77,11 @@ class ProcessingOrchestrator(RunProcess):
     _write_worker_script (emit interpreter scripts) and _known_symmetry_entries
     (read symmetry from the PHIL known_symmetry scope rather than the legacy
     known_symmetry.txt / xds_input_parameters.txt files).
-    """
 
-    # Wall-clock cap for a forced-integration job (scratch copy + all steps).
-    # On expiry the worker writes a FAILED line to its pipeline.log and exits, so
-    # a stuck forced lattice (these can otherwise run for hours) is marked failed
-    # instead of stalling the run.  Overridable per-run via params["forced_job_timeout_s"].
-    FORCED_JOB_TIMEOUT_S = 900
+    Hung-job protection is no longer a per-script wall-clock alarm: every
+    interpreter job runs under the progress-based stall watchdog in
+    ``ProcessingPipelineInterpreter`` (see ``avicenna.pipelines.jobbase``).
+    """
 
     def _known_symmetry_entries(self):
         """Build symmetry entries from the PHIL ``processing.known_symmetry``
@@ -97,10 +97,15 @@ class ProcessingOrchestrator(RunProcess):
             phil.adopt_phil_string(phil_string)
         ks = phil._params.processing.known_symmetry
         # ``isoform`` is .multiple, and the shipped default carries an empty
-        # template instance (space_group=None); freephil APPENDS the user's
-        # isoforms rather than replacing it.  Keep only isoforms that actually
-        # name a space group.
-        isoforms = [iso for iso in ks.isoform if iso.space_group]
+        # template instance (all data fields None); freephil APPENDS the user's
+        # isoforms rather than replacing it.  Keep any isoform that carries real
+        # content in ANY data field -- a space group, a unit cell, or a reference
+        # HKL (which itself encodes the symmetry and cell).  ``id`` is ignored on
+        # purpose: the template's default ``id = isoform_1`` would otherwise make
+        # an otherwise-empty instance look populated.
+        def _has_content(iso):
+            return bool(iso.space_group or iso.unit_cell or iso.reference_hkl)
+        isoforms = [iso for iso in ks.isoform if _has_content(iso)]
         if not (ks.enabled and isoforms):
             return super()._known_symmetry_entries()
 
@@ -142,26 +147,12 @@ class ProcessingOrchestrator(RunProcess):
             json.dumps(per_params, indent=2, default=str)
         )
 
-        # Forced-integration jobs get a wall-clock timeout: on expiry the worker
-        # writes a FAILED line to pipeline.log (so the watcher/sentinel see a
-        # terminal status) and exits.  Covers the whole job, incl. scratch copy.
-        if forced:
-            _timeout = int(per_params.get("forced_job_timeout_s") or self.FORCED_JOB_TIMEOUT_S)
-            _timeout_block = (
-                "import signal\n"
-                "def _on_timeout(signum, frame):\n"
-                "    from avicenna.utils.utils import format_log_line\n"
-                "    with open('pipeline.log', 'a') as _fh:\n"
-                f"        _fh.write(format_log_line('ERROR', 'forced job exceeded {_timeout}s wall-clock timeout -- marked failed', context=params.get('pin_id')))\n"
-                "    os._exit(1)\n"
-                "signal.signal(signal.SIGALRM, _on_timeout)\n"
-                f"signal.alarm({_timeout})\n"
-            )
-            _run_call = ("ProcessingPipelineInterpreter(params).run(forced=True)\n"
-                         "signal.alarm(0)\n")
-        else:
-            _timeout_block = ""
-            _run_call = "ProcessingPipelineInterpreter(params).run(forced=False)\n"
+        # Every job (forced or not) runs under the interpreter's progress-based
+        # stall watchdog (avicenna.pipelines.jobbase.SubPipelineJob), which kills
+        # a job only after it stops writing files -- so a legitimately-long
+        # integration or scratch copy is never killed, but a genuinely hung job
+        # is.  No per-script wall-clock alarm is needed.
+        _run_call = f"ProcessingPipelineInterpreter(params).run(forced={forced})\n"
 
         script = Path(pipeline_subdir) / "run_pipeline.py"
         script.write_text(f"""\
@@ -193,7 +184,7 @@ print(f"workdir      : {{params.get('pipeline_subdir', 'n/a')}}")
 print(f"space_group  : {{params.get('sg', 'n/a')}}")
 print(f"cell         : {{params.get('cell', 'n/a')}}")
 print("=" * 60, flush=True)
-{_timeout_block}{_run_call}""")
+{_run_call}""")
         script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IRUSR | stat.S_IWUSR)
 
 
@@ -201,7 +192,7 @@ print("=" * 60, flush=True)
 # Interpreter
 # ---------------------------------------------------------------------------
 
-class ProcessingPipelineInterpreter:
+class ProcessingPipelineInterpreter(SubPipelineJob):
     """
     Iterate over the PHIL step sequence and execute each step via the
     registered backend handler.  No program names appear in this class;
@@ -227,7 +218,36 @@ class ProcessingPipelineInterpreter:
     # Public entry points
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Stall-watchdog hooks (see avicenna.pipelines.jobbase)
+    # ------------------------------------------------------------------
+
+    def _watch_roots(self):
+        """Watch the dataset working dir (XDS streams its .LP logs here) plus the
+        scratch destination (written during the multi-minute image copy).  The
+        scratch path may not exist when the watchdog starts -- it begins
+        contributing once _setup_scratch creates it."""
+        params = self.params
+        roots = [params["pipeline_subdir"]]
+        tmpdir = os.environ.get("TMPDIR")
+        if tmpdir and params.get("data_format") != "hdf5":
+            img = params.get("original_image_dir") or params.get("image_dir")
+            if img:
+                roots.append(os.path.join(tmpdir, Path(img).name))
+        return roots
+
+    def _stall_log_path(self):
+        return Path(self.params["pipeline_subdir"]) / "pipeline.log"
+
+    def _stall_context(self):
+        return self.params.get("pin_id")
+
     def run(self, forced: bool = False):
+        """Run the single-dataset pipeline under the stall watchdog."""
+        with self._stall_watchdog():
+            return self._run(forced=forced)
+
+    def _run(self, forced: bool = False):
         """Run the sequential single-dataset pipeline.
 
         Parameters

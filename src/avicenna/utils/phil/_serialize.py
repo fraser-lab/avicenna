@@ -22,6 +22,8 @@ Two optional knobs reproduce what freephil ``show()`` offered:
 
 import re
 
+import freephil
+
 # Matches simple PHIL identifiers that don't need quoting.
 _SIMPLE = re.compile(r'^[a-zA-Z0-9_-]+$')
 # Reserved words that must be quoted when they appear as string values.
@@ -34,6 +36,12 @@ def _val_str(v) -> str:
     """Format a scalar value for PHIL output."""
     if v is None:
         return "None"
+    # freephil's Auto sentinel str()s to "Auto"; emit lowercase "auto" so it
+    # reloads as the same sentinel (idempotent round-trip) and reads as the
+    # choice value users write.  A choice loaded from a full "*auto ..." spec is
+    # the string "auto" and renders the same way, so both forms converge.
+    if v is freephil.Auto:
+        return "auto"
     if isinstance(v, bool):           # must precede int check (bool is int)
         return str(v)
     if isinstance(v, (int, float)):

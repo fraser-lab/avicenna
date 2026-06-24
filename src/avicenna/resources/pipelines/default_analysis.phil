@@ -6,6 +6,14 @@ analysis {
     directory = "."
     log_folder = None
   }
+  programs {
+    pandda {
+      root = None
+    }
+    pandda2 {
+      root = None
+    }
+  }
   steps {
     step {
       id = 1_pandda
@@ -18,7 +26,7 @@ analysis {
           reference_mtz = None
         }
         dataset {
-          prefix = "FRS"
+          prefix = FRS
           offset = 0
           suffix = hoh
           ground_state_range = None

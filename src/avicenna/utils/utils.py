@@ -41,6 +41,70 @@ def format_log_line(tag, message, context=None, context_width=None, forced_dir=N
     prefix = f"[{forced_dir}]  " if forced_dir else ""
     return f"[{ts}] {tag_field}  {ctx}{prefix}{message}\n"
 
+
+def log_phil_diff(phil, omnibus_path):
+    """Emit the run's non-default PHIL settings to the console and omnibus log.
+
+    Diffs the effective PHIL against the shipped pipeline defaults
+    (``default_<name>.phil``) via ``phil.default_diff_phil_string()``.  When the
+    run uses only defaults the diff is empty and nothing is emitted.  Otherwise
+    a header block is appended to the omnibus log (so it appears at the top of
+    this run's log) and echoed to the terminal.  Best-effort: any failure to
+    compute or write the diff is swallowed so it can never abort a run.
+    """
+    try:
+        diff = phil.default_diff_phil_string().strip()
+    except Exception:
+        return
+    if not diff:
+        return
+    block = (
+        "=" * 60 + "\n"
+        "Run settings differing from pipeline defaults:\n"
+        + "-" * 60 + "\n"
+        + diff + "\n"
+        + "=" * 60 + "\n\n"
+    )
+    sys.stdout.write(block)
+    sys.stdout.flush()
+    try:
+        with open(omnibus_path, "a") as fh:
+            fh.write(block)
+    except OSError:
+        pass
+
+
+def wait_for_sentinel(omnibus_path, marker="[ sentinel ]", poll=5.0, timeout=3600):
+    """Block until the completion sentinel records its marker in *omnibus_path*.
+
+    The foreground watcher's done-detection is a file-structure sweep, but the
+    authoritative arbiter of completion is the SGE-held sentinel (which also
+    writes the next-stage .phil and the filtered result list).  After the sweep
+    goes idle the foreground waits here for the sentinel's marker so a run is not
+    declared "done" before finalization has actually happened.
+
+    Interruptible with Ctrl-C -- the sentinel runs independently on the cluster,
+    so interrupting the wait does not affect finalization.  Returns True if the
+    marker appeared, False on timeout.
+    """
+    def _seen():
+        try:
+            with open(omnibus_path) as fh:
+                return any(marker in line for line in fh)
+        except OSError:
+            return False
+
+    if _seen():
+        return True
+    deadline = time.time() + timeout if timeout else None
+    with Spinner(height=1, message="Waiting for completion sentinel to finalize..."):
+        while not _seen():
+            if deadline and time.time() > deadline:
+                return False
+            time.sleep(poll)
+    return True
+
+
 # Bravais lattice → list of (sg_number, sg_name) tuples.
 # Derived from xds_lattices.txt in the processing pipeline scripts directory.
 BRAVAIS_LATTICES = {
@@ -236,7 +300,7 @@ class ParamWriter(object):
             'no_symmetry':           'false',
             'scaling':               'correct',
             'recycle_xds':           'false',
-            'refine_cell_integrate': 'both',
+            'refine_cell_integrate': 'true',
             'res_limit':             'cc12',
             'cleanup':               'partial',
         }
@@ -808,6 +872,15 @@ class WatcherBase(object):
         "PREP"   : "PREPARING",
         "RUN"    : "RUNNING",
         "FORCE"  : "RUNNING_FORCE",
+        # BYPASS/SKIP are NON-terminal: a step logging them is recovering or
+        # continuing, not finished.  They must be recognized here, otherwise the
+        # bottom-up scan in _read_pipeline_log skips the unknown tag and falls
+        # back to a preceding ERROR -- making a job that is actively re-running
+        # in place (e.g. the <50%-indexed BYPASS path) look terminally FAILED.
+        # Only FINISHED/FAILED are treated as terminal downstream, so any other
+        # value here counts as in-progress.
+        "BYPASS" : "BYPASSING",
+        "SKIP"   : "SKIPPED",
         "DONE"   : "FINISHED",
         "ERROR"  : "FAILED",
     }

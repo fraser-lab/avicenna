@@ -1,6 +1,7 @@
 import contextlib
 import io
 import os
+import re
 import sys
 import argparse
 import pathlib
@@ -8,7 +9,7 @@ import subprocess
 import time
 from importlib.metadata import version, PackageNotFoundError
 sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "src"))
-from avicenna.utils.utils import DataFinder, ParamWriter, Watcher, ProcessingScraper, ProgressBar
+from avicenna.utils.utils import DataFinder, ParamWriter, Watcher, ProcessingScraper, ProgressBar, log_phil_diff, wait_for_sentinel
 from avicenna.pipelines.legacy.proc_pipeline import RunProcess
 from avicenna.pipelines.processing import ProcessingOrchestrator
 from avicenna.pipelines.sentinel import ProcessingSentinel
@@ -20,7 +21,8 @@ try:
 except PackageNotFoundError:
     _version = "unknown"
 
-_DEFAULT_PHIL = "processing.phil"
+_DEFAULT_PHIL  = "processing.phil"          # effective settings, written each run
+_TEMPLATE_PHIL = "processing_default.phil"  # defaults template, written by --dry_run
 
 parser = argparse.ArgumentParser(prog="vic.process")
 parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {_version}")
@@ -33,9 +35,9 @@ parser.add_argument("--bash", action="store_true", help="Run the bash scripts in
 parser.add_argument("--legacy", action="store_true",
                     help="Use the hard-coded legacy pipeline instead of the PHIL-driven interpreter")
 parser.add_argument("-o", "--output", type=pathlib.Path, default=pathlib.Path(os.curdir), help="Path to output folder (default: current directory)")
-parser.add_argument("--dry_run", action="store_true", help=f"Create pin_list.txt and {_DEFAULT_PHIL} without submitting jobs")
+parser.add_argument("--dry_run", action="store_true", help=f"Create pin_list.txt and {_TEMPLATE_PHIL} without submitting jobs")
 parser.add_argument("--silent",    action="store_true", help="Submit jobs without tailing the log")
-parser.add_argument("--prog_log",  action="store_true", help="Tail pipeline logs with a compact progress bar pinned below")
+parser.add_argument("--no-prog-log", dest="no_prog_log", action="store_true", help="Disable the multiline progress bar; show plain progress updates instead")
 parser.add_argument("--no_filter", action="store_true", help="Skip quality filter when writing qrefine_list.txt; write all completed results")
 parser.add_argument("--xds_root", type=pathlib.Path, help="Path to the XDS install folder, default is an SBGrid install (/programs/<OS>/xds)")
 _phil_group = parser.add_mutually_exclusive_group()
@@ -66,7 +68,7 @@ XDS_PARAM_DEFAULTS = {
     "no_symmetry":           "false",
     "scaling":               "correct",
     "recycle_xds":           "false",
-    "refine_cell_integrate": "both",
+    "refine_cell_integrate": "true",
     "res_limit":             "cc12",
     "cleanup":               "partial",
     "ref_hkl":               "none",
@@ -147,9 +149,57 @@ def _watch_with_bar(watcher, omnibus):
         time.sleep(1)
 
 
+def _auto_enable_known_symmetry(phil, extras):
+    """Auto-set ``known_symmetry.enabled`` when its data fields are supplied as
+    direct CLI ``key=value`` tokens.
+
+    Typing a space group / unit cell / reference HKL on the command line is itself
+    the opt-in, so the explicit ``enabled`` toggle is only required for hand-edited
+    PHIL files (and ``.phil`` files passed on the CLI, which are treated like
+    files and excluded here).  An explicit CLI ``enabled=...`` token is respected
+    -- explicit beats inferred.  Returns True if the toggle was flipped on.
+    """
+    assign = [e for e in extras if "=" in e and not e.endswith(".phil")]
+    if not assign:
+        return False
+    data_set = enabled_explicit = False
+    try:
+        interp = phil._master.command_line_argument_interpreter(home_scope="processing")
+        for obj in interp.process_args(assign):
+            path = obj.as_str().split("=", 1)[0].strip()
+            leaf = path.rsplit(".", 1)[-1]
+            if "known_symmetry" in path:
+                if leaf in ("space_group", "unit_cell", "reference_hkl"):
+                    data_set = True
+                elif leaf == "enabled":
+                    enabled_explicit = True
+    except Exception:
+        return False
+    if data_set and not enabled_explicit and not phil._params.processing.known_symmetry.enabled:
+        phil.adopt_phil_string(
+            "processing {\n  known_symmetry {\n    enabled = True\n  }\n}\n")
+        return True
+    return False
+
+
 def main():
     try:
         args, _extras = parser.parse_known_args()
+
+        # -d/--data is greedy (nargs="+"), so PHIL overrides placed AFTER -d get
+        # swallowed into args.data instead of left as extras.  Re-route any token
+        # that is a PHIL assignment (key=value) or a .phil file back to the
+        # override path so argument order does not matter.
+        if args.data:
+            _kept, _routed = [], []
+            for _d in args.data:
+                _s = str(_d)
+                if re.match(r"^[A-Za-z_]\w*(\.\w+)*=", _s) or (_s.endswith(".phil") and os.path.isfile(_s)):
+                    _routed.append(_s)
+                else:
+                    _kept.append(_d)
+            args.data = _kept or None
+            _extras = _routed + _extras
 
         if args.phil or args.phil_expert_level is not None or args.phil_attrs:
             sys.stdout.write(ProcessingPHIL().full_phil_string(
@@ -176,6 +226,8 @@ def main():
                 print("Applied PHIL overrides: " + " ".join(_extras))
             except ValueError as e:
                 sys.exit(f"ERROR: {e}")
+            if _auto_enable_known_symmetry(phil, _extras):
+                print("known_symmetry data supplied on CLI -> known_symmetry.enabled = True")
 
         check_programs(phil._params.processing.programs)
 
@@ -198,7 +250,7 @@ def main():
                 parser.error("--dry_run is incompatible with --pinlist and --xdsparams")
             if not args.data:
                 parser.error("--dry_run requires -d/--data")
-            for fname in ("pin_list.txt", _DEFAULT_PHIL):
+            for fname in ("pin_list.txt", _TEMPLATE_PHIL):
                 if os.path.isfile(fname):
                     os.rename(fname, fname + ".bak")
                     print(f"Backed up {fname} -> {fname}.bak")
@@ -215,9 +267,9 @@ processing {{
     directory = "{output_str}"
   }}
 }}""")
-            with open(_DEFAULT_PHIL, "w") as _f:
+            with open(_TEMPLATE_PHIL, "w") as _f:
                 _f.write(phil.full_phil_string())
-            print(f"Written: {_DEFAULT_PHIL}")
+            print(f"Written: {_TEMPLATE_PHIL}")
             print("Dry run complete.")
             sys.exit(0)
 
@@ -278,6 +330,7 @@ processing {{
         project_dir = os.path.abspath(args.output)
         procpath    = os.path.join(project_dir, "processing")
         omnibus     = os.path.join(project_dir, "processing.log")
+        sentinel_submitted = False
 
         if args.bash:        # run Galen's original bash scripts for XDS processing
             if (os.path.isfile('./pin_list.txt') and os.path.isfile('./xds_input_parameters.txt')):
@@ -290,6 +343,26 @@ processing {{
             if args.xds_root:
                 params["xds_root"] = args.xds_root
             main_job_id = None
+            if not args.legacy:
+                # Snapshot the effective PHIL actually used for this run (after CLI
+                # overrides), with the resolved data/output injected so the file is
+                # self-contained and re-runnable.  Written on every run, even when
+                # identical to the defaults; processing_default.phil (from --dry_run)
+                # remains the pristine template.
+                _snap = ["processing {", "  input {"]
+                if args.data:
+                    _snap.append("    data = " + " ".join(f'"{d}"' for d in args.data))
+                _snap.append(f'    pinlist = "{args.pinlist or "pin_list.txt"}"')
+                _snap += ["  }", "  output {", f'    directory = "{project_dir}"', "  }", "}"]
+                phil.adopt_phil_string("\n".join(_snap) + "\n")
+                # Drop the shipped empty isoform template when a real isoform was
+                # supplied (CLI/file), so the as-run record (and the phil_string
+                # below) is not cluttered with the all-None template.
+                phil.prune_empty_isoforms()
+                with open(_DEFAULT_PHIL, "w") as _f:
+                    _f.write(phil.full_phil_string())
+                print(f"Wrote {_DEFAULT_PHIL} (effective settings for this run)")
+                log_phil_diff(phil, omnibus)
             with contextlib.redirect_stdout(_Tee(sys.stdout, omnibus)):
                 if args.legacy:
                     RunProcess(params).run()
@@ -303,14 +376,13 @@ processing {{
             # completion; the foreground watcher below is display-only.
             if not args.legacy and main_job_id:
                 ProcessingSentinel(project_dir, no_filter=args.no_filter).submit(main_job_id)
+                sentinel_submitted = True
 
         if args.silent or args.dry_run:
             return
 
         watcher = Watcher(procpath=procpath)
-        if args.prog_log:
-            _watch_with_bar(watcher, omnibus)
-        else:
+        if args.no_prog_log:
             while True:
                 watcher.tail_logs(log_file=omnibus)
                 buf = io.StringIO()
@@ -319,8 +391,17 @@ processing {{
                 if not still_running:
                     break
                 time.sleep(1)
+        else:
+            _watch_with_bar(watcher, omnibus)
         watcher.tail_logs(log_file=omnibus)
         print()
+        # The file-structure sweep above is idle; wait for the held SGE sentinel
+        # to record completion (it also writes the filtered qrefine_list.txt +
+        # refine.phil) before declaring the run done.  Safe to Ctrl-C.
+        if sentinel_submitted:
+            if not wait_for_sentinel(omnibus):
+                print("Sentinel marker not seen within the timeout; it will still "
+                      "finalize on the cluster (qrefine_list.txt + refine.phil).")
         watcher.print_summary(omnibus=omnibus)
         # Display-only: show the live results table.  The authoritative filtered
         # qrefine_list.txt + refine.phil are written by the sentinel on completion.

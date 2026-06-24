@@ -1,4 +1,5 @@
 refine {
+  water = both
   input {
     output_dir = "."
     dataset_list = "qrefine_list.txt"
@@ -10,25 +11,35 @@ refine {
     directory = "."
     log_folder = None
   }
+  programs {
+    ccp4 {
+      root = None
+      version = latest
+    }
+    phenix {
+      root = None
+      version = latest
+    }
+  }
   steps {
     step {
-      id = 1_rigid_body
-      program = phenix.refine
-      phenix {
-        strategy = rigid_body
-        number_of_macro_cycles = 5
-        hydrogens = riding
-      }
-    }
-    step {
-      id = 2_phaser
-      program = phenix.phaser
+      id = 1_phaser
+      program = "phenix.phaser"
       phaser {
         rfree_threshold = 0.45
+        tncs = False
+        alt_search_model = None
+        asu_composition {
+          derive_from_pdb = True
+          num_copies = 1
+          mw = 0.0
+          seq_id = 90.0
+        }
+        extra_args = None
       }
     }
     step {
-      id = 3_jelly
+      id = 2_jelly
       program = refmac5
       refmac {
         ncycles = 4
@@ -36,7 +47,7 @@ refine {
       }
     }
     step {
-      id = 4_refmac5
+      id = 3_refmac5
       program = refmac5
       refmac {
         ncycles = 8
@@ -44,7 +55,7 @@ refine {
       }
     }
     step {
-      id = 5_fill
+      id = 4_fill
       program = fill
       fill {
         enabled = True

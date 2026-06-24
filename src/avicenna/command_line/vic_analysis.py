@@ -6,7 +6,8 @@ from avicenna.pipelines.legacy.pandda_pipeline import PanDDAPreparer
 from avicenna.utils.phil import AnalysisPHIL
 from avicenna.utils.software import check_programs
 
-_DEFAULT_PHIL = "analysis.phil"
+_DEFAULT_PHIL  = "analysis.phil"          # effective settings, written each run
+_TEMPLATE_PHIL = "analysis_default.phil"  # defaults template, written by --dry_run
 
 parser = argparse.ArgumentParser(prog="vic.analysis")
 parser.add_argument("--settings", type=pathlib.Path, metavar="FILE",
@@ -41,7 +42,7 @@ parser.add_argument("--log_time_out", type=int, default=0, metavar="MINUTES",
 parser.add_argument("--legacy", action="store_true",
                     help="Use the hard-coded legacy pipeline instead of the PHIL-driven interpreter")
 parser.add_argument("--dry_run", action="store_true",
-                    help=f"Show what would be done without copying or submitting; writes {_DEFAULT_PHIL}")
+                    help=f"Show what would be done without copying or submitting; writes {_TEMPLATE_PHIL}")
 _phil_group = parser.add_mutually_exclusive_group()
 _phil_group.add_argument("-c", dest="phil", action="store_true",
                          help="Print analysis PHIL parameters and exit")
@@ -81,7 +82,7 @@ def _build_pin_map(sources):
     return pin_map
 
 
-def _write_analysis_phil(args, phil: AnalysisPHIL):
+def _write_analysis_phil(args, phil: AnalysisPHIL, target=_DEFAULT_PHIL):
     lines = [
         "analysis {", "  steps {", "    step {",
         "      id = pandda1", "      program = pandda",
@@ -121,9 +122,9 @@ def _write_analysis_phil(args, phil: AnalysisPHIL):
         "}",
     ]
     phil.adopt_phil_string("\n".join(lines))
-    with open(_DEFAULT_PHIL, "w") as _f:
+    with open(target, "w") as _f:
         _f.write(phil.full_phil_string())
-    print(f"Written: {_DEFAULT_PHIL}")
+    print(f"Written: {target}")
 
 
 def main():
@@ -164,6 +165,11 @@ def main():
         ground_state_datasets = []
         if args.ground_state_range:
             ground_state_datasets = _parse_ground_state_range(args.ground_state_range)
+        # On a real run, snapshot the effective PHIL (after CLI overrides) to
+        # analysis.phil before starting; analysis_default.phil (from --dry_run)
+        # stays the pristine template.  Written even if identical to the defaults.
+        if not args.dry_run and not args.legacy:
+            _write_analysis_phil(args, phil, _DEFAULT_PHIL)
         if args.legacy:
             PanDDAPreparer(
                 process_dirs=list(args.sources),
@@ -201,7 +207,7 @@ def main():
                 pin_map=_build_pin_map(args.sources),
             ).run()
         if args.dry_run:
-            _write_analysis_phil(args, phil)
+            _write_analysis_phil(args, phil, _TEMPLATE_PHIL)
     except KeyboardInterrupt:
         print("\nInterrupted.")
 

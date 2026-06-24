@@ -99,6 +99,34 @@ def _source_overlay(dst, src):
             index[so.name] = so
 
 
+def _coalesce_duplicate_scopes(scope):
+    """Merge sibling sub-scopes that share a name into a single instance.
+
+    A command line cannot express two distinct ``.multiple`` instances (there is
+    no way to delimit them), yet freephil's command-line interpreter emits one
+    instance per leaf assignment -- so ``space_group=.. unit_cell=..`` both under
+    ``known_symmetry.isoform`` produce two half-filled isoforms.  This collapses
+    same-named sibling scopes back into one, recursively, merging their children
+    via ``_source_overlay``.  Purely structural (matches by object ``.name``);
+    intended for the CLI-derived phil only, never for user phil files (which can
+    legitimately carry multiple instances).  Mutates *scope* in place."""
+    seen = {}
+    kept = []
+    for o in scope.objects:
+        if hasattr(o, "objects"):                 # sub-scope
+            if o.name in seen:
+                _source_overlay(seen[o.name], o)
+            else:
+                seen[o.name] = o
+                kept.append(o)
+        else:                                     # definition
+            kept.append(o)
+    scope.objects = kept
+    for o in kept:
+        if hasattr(o, "objects"):
+            _coalesce_duplicate_scopes(o)
+
+
 class PhilBase:
     """Abstract base for all Avicenna PHIL parameter objects.
 
@@ -201,7 +229,16 @@ class PhilBase:
         that step's other shipped settings.
         """
         phil_string = _normalize_choice_case(phil_string, self._choice_names)
-        user_phil = freephil.parse(phil_string)
+        self._adopt_parsed(freephil.parse(phil_string))
+
+    def _adopt_parsed(self, user_phil):
+        """Merge an already-parsed user phil scope into the current params.
+
+        Shared by ``adopt_phil_string`` and ``adopt_cli_args``.  Taking a parsed
+        scope (rather than re-stringifying) matters for the CLI path: a coalesced
+        ``.multiple`` instance, if round-tripped through ``as_str()``, would be
+        re-emitted as separate dotted leaf lines and split apart again on reparse.
+        """
         current_phil = freephil.parse(self.as_phil_string())
         self._merge_user_steps(current_phil, user_phil)
         self._params = self._master.fetch(sources=[current_phil, user_phil]).extract()
@@ -236,7 +273,17 @@ class PhilBase:
             # so CLI callers can catch it with a normal handler.
             raise ValueError(str(e)) from None
         if working:
-            self.adopt_phil_string("\n".join(w.as_str() for w in working))
+            # The interpreter emits one object per arg, so several leaf
+            # assignments into the same .multiple scope arrive as separate
+            # instances.  Coalesce them into one before adopting (a command line
+            # cannot mean two distinct instances), then adopt the parsed scope
+            # directly -- round-tripping through as_str() would re-split it.
+            # See _coalesce_duplicate_scopes / _adopt_parsed.
+            joined = _normalize_choice_case(
+                "\n".join(w.as_str() for w in working), self._choice_names)
+            combined = freephil.parse(joined)
+            _coalesce_duplicate_scopes(combined)
+            self._adopt_parsed(combined)
         return args
 
     def from_dict(self, d: dict, scope: str = ""):
@@ -291,6 +338,24 @@ class PhilBase:
         Choice parameters are rendered as single selected values rather than
         the full ``*selected other1 other2`` freephil notation."""
         diff = self._master.fetch_diff(
+            sources=[freephil.parse(self.as_phil_string())],
+        )
+        return _simplify_choices(diff.as_str())
+
+    def default_diff_phil_string(self) -> str:
+        """Return only parameters that differ from the shipped DEFAULT PHIL.
+
+        Unlike ``diff_phil_string`` -- which diffs against the bare master
+        schema defaults and therefore always re-emits the full shipped step
+        list -- this diffs against the ``default_<name>.phil`` resource that
+        ships the pipeline defaults.  A run that uses only defaults yields an
+        empty string; only the user's actual overrides appear.  Intended for
+        logging "what is non-default about this run" at the top of a run log.
+
+        Choice parameters are rendered as single selected values rather than
+        the full ``*selected other1 other2`` freephil notation."""
+        default_master = self._master.fetch(sources=self._default_sources)
+        diff = default_master.fetch_diff(
             sources=[freephil.parse(self.as_phil_string())],
         )
         return _simplify_choices(diff.as_str())

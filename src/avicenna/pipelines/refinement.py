@@ -35,6 +35,7 @@ import pathlib
 import pkgutil
 import sys
 
+from avicenna.pipelines.jobbase import SubPipelineJob
 from avicenna.pipelines.legacy.qrefine_pipeline import QRefineWorker, RunQRefine
 from avicenna.utils.phil.refine import RefinePHIL
 from avicenna.utils.software import find_ccp4, find_phenix, suite_setup_sources
@@ -64,7 +65,7 @@ def _build_registry() -> dict:
 # Interpreter
 # ---------------------------------------------------------------------------
 
-class RefinementPipelineInterpreter:
+class RefinementPipelineInterpreter(SubPipelineJob):
     """Iterate over the PHIL refine step sequence and execute each step.
 
     Parameters
@@ -89,7 +90,30 @@ class RefinementPipelineInterpreter:
             fh.write(line)
         print(line, end="", flush=True)
 
+    # ------------------------------------------------------------------
+    # Stall-watchdog hooks (see avicenna.pipelines.jobbase).  Refinement
+    # programs stream their logs to job_dir (see qrefine._run_cmd), so the
+    # job dir's newest mtime is the progress signal.
+    # ------------------------------------------------------------------
+
+    def _job_dir(self):
+        return pathlib.Path(self.params.get("job_dir", ".")).resolve()
+
+    def _watch_roots(self):
+        return [self._job_dir()]
+
+    def _stall_log_path(self):
+        return self._job_dir() / "pipeline.log"
+
+    def _stall_context(self):
+        return self.params.get("job_id", self.params.get("pin", "?"))
+
     def run(self):
+        """Run the refinement step sequence under the stall watchdog."""
+        with self._stall_watchdog():
+            return self._run()
+
+    def _run(self):
         params  = self.params
         suffix  = params["suffix"]
         job_dir = pathlib.Path(params.get("job_dir", ".")).resolve()

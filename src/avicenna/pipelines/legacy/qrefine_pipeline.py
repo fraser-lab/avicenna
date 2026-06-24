@@ -81,28 +81,43 @@ class QRefineDataset:
         self.mtz_path = None
         self.job_dir = None
 
+    @staticmethod
+    def _rfree_dir(parent):
+        """Locate the ``*_rfree`` step dir under *parent*.
+
+        Don't hardcode the step number: the PHIL processing pipeline numbers
+        R-free ``10_rfree`` (sequence ends ...9_aimless, 10_rfree, 11_xtriage),
+        while older/legacy layouts used ``11_rfree``.  Match by suffix (as the
+        scrapers do) and take the highest-numbered if several exist.  Falls back
+        to the current ``10_rfree`` name when *parent* is missing (so a missing
+        MTZ still surfaces as a clear path)."""
+        try:
+            cands = [d for d in parent.iterdir()
+                     if d.is_dir() and d.name.endswith("_rfree")]
+        except OSError:
+            cands = []
+        if cands:
+            cands.sort(key=lambda d: int(d.name.split("_")[0])
+                       if d.name.split("_")[0].isdigit() else 0)
+            return cands[-1]
+        return parent / "10_rfree"
+
     def resolve(self):
         crystal_dir = (f"{self.crystal_name}_{self.cell_refined}"
                        if self.cell_refined else self.crystal_name)
         index_dir = self.index.replace(' ', '_')
+        base = (self.process_dir / "processing" / self.pin /
+                crystal_dir / f"index_{index_dir}")
         if self.integration == 'integration not forced':
             self.forced = 'not_forced'
-            self.mtz_path = (
-                self.process_dir / "processing" / self.pin /
-                crystal_dir /
-                f"index_{index_dir}" / "11_rfree" / "XDS_ASCII_ctruncate.mtz"
-            )
+            parent = base
         else:
             parts = self.integration.split()
             forced_sg     = parts[3]
             forced_prefix = parts[4]
             self.forced = f"forced_{forced_sg}_{forced_prefix}"
-            self.mtz_path = (
-                self.process_dir / "processing" / self.pin /
-                crystal_dir /
-                f"index_{index_dir}" /
-                f"{forced_prefix}_{forced_sg}_force" / "11_rfree" / "XDS_ASCII_ctruncate.mtz"
-            )
+            parent = base / f"{forced_prefix}_{forced_sg}_force"
+        self.mtz_path = self._rfree_dir(parent) / "XDS_ASCII_ctruncate.mtz"
         cell_refined_part = f"_{self.cell_refined}" if self.cell_refined else ""
         self.job_dir = (
             self.process_dir / "qrefine" /

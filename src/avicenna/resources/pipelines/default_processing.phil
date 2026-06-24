@@ -1,7 +1,14 @@
 processing {
   input {
     data = None
+    pinlist = None
     reference_mtz = None
+  }
+  dataset {
+    indexing_images = first_half
+    refine_cell_integrate = true
+    no_symmetry = False
+    reference_hkl = None
   }
   output {
     directory = "."
@@ -16,33 +23,46 @@ processing {
       reference_hkl = None
     }
   }
+  programs {
+    xds {
+      root = None
+    }
+    ccp4 {
+      root = None
+      version = latest
+    }
+    phenix {
+      root = None
+      version = latest
+    }
+  }
+  xds {
+    ncpu = 8
+    detector_edge = 0.8
+    res_limit = cc12
+    scaling = correct
+  }
   steps {
     step {
       id = 1_xds
       program = xds
       xds {
         generate_inp = True
-        on_indexing_failure = *auto retry reject bypass
+        on_indexing_failure = auto
+        retry_mode = auto
+        on_integration_failure = reject
         recycle_geometry = False
         update_symmetry = False
         skip_if_no_improvement = False
-        ncpu = 8
         xds_inp = None
-        detector_edge = 0.8
-        indexing_images = first_half
-        retry_mode = *auto p1 best top_ten
-        on_integration_failure = reject
-        no_symmetry = False
-        res_limit = cc12
-        cleanup = partial
-        refine_cell_integrate = both
-        ref_hkl = None
-        ref_mtz = None
       }
     }
     step {
       id = 2_pointless
       program = pointless
+      pointless {
+        enforce_spacegroup = False
+      }
     }
     step {
       id = 3_aimless
@@ -57,25 +77,20 @@ processing {
       xds {
         generate_inp = False
         on_indexing_failure = reject
+        retry_mode = auto
+        on_integration_failure = reject
         recycle_geometry = True
         update_symmetry = False
         skip_if_no_improvement = False
-        ncpu = 8
         xds_inp = None
-        detector_edge = 0.8
-        indexing_images = first_half
-        on_integration_failure = reject
-        no_symmetry = False
-        res_limit = cc12
-        cleanup = partial
-        refine_cell_integrate = both
-        ref_hkl = None
-        ref_mtz = None
       }
     }
     step {
       id = 5_pointless
       program = pointless
+      pointless {
+        enforce_spacegroup = False
+      }
     }
     step {
       id = 6_aimless
@@ -90,20 +105,12 @@ processing {
       xds {
         generate_inp = False
         on_indexing_failure = reject
+        retry_mode = auto
+        on_integration_failure = reject
         recycle_geometry = True
         update_symmetry = True
         skip_if_no_improvement = True
-        ncpu = 8
         xds_inp = None
-        detector_edge = 0.8
-        indexing_images = first_half
-        on_integration_failure = reject
-        no_symmetry = False
-        res_limit = cc12
-        cleanup = partial
-        refine_cell_integrate = both
-        ref_hkl = None
-        ref_mtz = None
       }
     }
     step {
@@ -123,10 +130,14 @@ processing {
     step {
       id = 10_rfree
       program = rfree
+      rfree {
+      }
     }
     step {
       id = 11_xtriage
       program = xtriage
+      xtriage {
+      }
     }
   }
 }

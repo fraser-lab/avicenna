@@ -61,10 +61,10 @@ processing
       .short_caption = Indexing images
       .help = Which images to index (first_half, last_half, all, quarters, eighths, or an explicit range).
       .expert_level = 1
-    refine_cell_integrate = *both true false
+    refine_cell_integrate = both *true false
       .type = choice
       .short_caption = Cell refinement mode
-      .help = Refine the unit cell during integration -- both spawns two branches (cell-refined and not).
+      .help = Refine the unit cell during integration (XDS REFINE(INTEGRATE) CELL term). true refines the cell during integration (default. on a 245-dataset HUWE1 analysis it never did worse than off and occasionally better). false holds the indexed cell fixed. both spawns two branches (cell-refined and not).
       .expert_level = 1
     no_symmetry = False
       .type = bool
@@ -283,3 +283,23 @@ class ProcessingPHIL(PhilBase):
     _resource_file = "default_processing.phil"
     _scope_name = "processing"
     _program_blocks = PROGRAM_BLOCKS
+
+    def prune_empty_isoforms(self):
+        """Drop the shipped content-less ``known_symmetry.isoform`` template when
+        at least one real isoform is present.
+
+        ``isoform`` is ``.multiple`` and the defaults ship one empty template
+        instance (all data fields ``None``); freephil APPENDS a user's isoform
+        after it rather than replacing it, so the serialized PHIL would carry both
+        the template and the real one.  The template is harmless at run time (it
+        is skipped by ``_known_symmetry_entries``' content check), but it is noise
+        in the written ``processing.phil``.  Mirror that content check here and
+        keep only the real isoforms.  When there are NO real isoforms, the lone
+        template is kept so a free-run / default file still documents the
+        structure.  Mutates ``_params`` in place.
+        """
+        ks = self._params.processing.known_symmetry
+        real = [i for i in ks.isoform
+                if i.space_group or i.unit_cell or i.reference_hkl]
+        if real:
+            ks.isoform = real

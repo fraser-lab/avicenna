@@ -8,8 +8,9 @@ dict that is loaded from params_{suffix}.json on the compute node.
 
 Context dict keys set and consumed by these handlers
 -----------------------------------------------------
-  rfree_after_rigid_body  : float — set by rigid_body
-  jelly_input             : str   — set by rigid_body (initial), updated by phaser
+  rfree_after_rigid_body  : float — set by a phenix.refine (rigid_body) step, if any
+  jelly_input             : str   — set by phaser (default) or a rigid_body step, used by refmac jelly
+  data_mtz                : str   — set by phaser; the data MTZ (in the solution frame) refmac refines against
   rfree_threshold         : float — set by phaser (for downstream skip decisions)
   phaser_succeeded        : bool  — set by phaser
   jelly_succeeded         : bool  — set by refmac (jelly)
@@ -55,12 +56,12 @@ phenix
     "phenix.phaser": """\
 phaser
   .short_caption = Phaser MR
-  .help = Phenix Phaser molecular replacement.  Runs only when rigid-body refinement leaves Rfree above rfree_threshold.
+  .help = Phenix Phaser molecular replacement.  The default first step -- Phaser also resolves the enantiomorphic space group (e.g. P41212 vs P43212), which a bare rigid-body step cannot.  If a refinement step (e.g. phenix.refine rigid body) precedes it and already reaches Rfree <= rfree_threshold, Phaser is skipped.
 {
   rfree_threshold = 0.45
     .type = float
     .short_caption = Rfree threshold
-    .help = MR is attempted only when the rigid-body Rfree exceeds this value.
+    .help = When a preceding refinement step has set an Rfree, MR is attempted only if that Rfree exceeds this value.  With no preceding step (the default), MR always runs.
     .expert_level = 0
   tncs = False
     .type = bool
@@ -150,23 +151,70 @@ def _log(tag, message, params, job_dir):
 
 
 def _run_cmd(cmd, job_dir, stdin=None, log=None):
-    result = subprocess.run(
-        cmd, input=stdin, text=True,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        cwd=job_dir,
-    )
-    if log:
-        (job_dir / log).write_text(result.stdout)
+    """Run *cmd* in *job_dir*, streaming combined stdout+stderr to a log file as
+    it is produced; return the process return code.
+
+    Streaming straight to disk -- rather than buffering in memory and writing the
+    log once the program exits -- keeps the log file's mtime advancing throughout
+    a long run, which is the progress signal a stall watchdog relies on to tell a
+    legitimately-long job from a hung one.  It also leaves a partial log behind if
+    the job is killed mid-run, which is invaluable for debugging.  Most
+    crystallography programs write their logs this way already.
+
+    *log* names the file; when omitted it defaults to ``<program>.log`` (stdout
+    that was previously discarded is now kept).
+    """
+    log_path = job_dir / (log or f"{pathlib.Path(cmd[0]).name}.log")
+    with open(log_path, "w") as fh:
+        result = subprocess.run(
+            cmd, input=stdin, text=True,
+            stdout=fh, stderr=subprocess.STDOUT,
+            cwd=job_dir,
+        )
     return result.returncode
 
 
+def _rfree_from_phenix_pdb(pdb_path):
+    """Parse R-free from a phenix.refine output PDB's REMARK 3 'FREE R VALUE' record.
+
+    Reading the model the step actually produced is the most robust signal: it is
+    the canonical refined statistic, stable across phenix versions, and consistent
+    with how final results are scraped elsewhere (REMARK 3).  The matching record
+    is ``REMARK   3   FREE R VALUE                     :  0.2305`` -- distinct from
+    the ``FREE R VALUE TEST SET ...`` / ``... (WORKING + TEST SET)`` lines, which we
+    exclude.  Returns None when the PDB is absent or carries no parseable value
+    (e.g. the refinement aborted and wrote no model), so the caller can fall back.
+    """
+    try:
+        for line in pdb_path.read_text().splitlines():
+            if not line.startswith("REMARK   3"):
+                continue
+            if "FREE R VALUE" in line and not any(
+                    k in line for k in ("TEST", "SET", "BIN", "ERROR")):
+                try:
+                    val = float(line.split(":")[-1].strip())
+                except ValueError:
+                    continue
+                if 0.0 <= val <= 1.0:
+                    return val
+    except OSError:
+        pass
+    return None
+
+
 def _rfree_from_phenix_log(log_path):
-    """Parse final Rfree from a phenix.refine log (last 'Final R-work =' line)."""
+    """Parse final R-free from a phenix.refine log ('Final R-work = .., R-free = ..').
+
+    Fallback for when the output PDB is unavailable.  The summary line is
+    ``Final R-work = 0.2305, R-free = 0.2305``; commas are stripped before
+    tokenising (the value token is otherwise ``'0.2305,'`` and float() chokes),
+    and R-free -- not R-work -- is the field we want.
+    """
     try:
         for line in reversed(log_path.read_text().splitlines()):
             if "Final R-work =" in line:
-                parts = line.split()
-                return float(parts[parts.index("R-work") + 2])
+                parts = line.replace(",", " ").split()
+                return float(parts[parts.index("R-free") + 2])
     except (OSError, ValueError, IndexError):
         pass
     return 1.0
@@ -289,20 +337,30 @@ def _run_phenix(step, ctx, params, suffix, job_dir):
     # Housekeeping + I/O plumbing set by the pipeline (not user-facing).
     cmd += [
         "write_eff_file=false", "write_geo_file=false", "write_def_file=false",
+        # Select BOTH the data array (F,SIGF) and the R-free flag array
+        # (FreeR_flag) explicitly.  These XDS-derived MTZs also carry an integer
+        # ISYM column that phenix.refine sometimes deems an equally-suitable
+        # R-free array, aborting with "Multiple equally suitable arrays of R-free
+        # flags found".  Naming the two arrays we want (a second miller_array
+        # selection) excludes ISYM and makes the choice unambiguous for every
+        # phenix.refine step, not just rigid body.
         "miller_array.labels.name=F,SIGF",
+        "miller_array.labels.name=FreeR_flag",
         f"output.prefix=01-rigid-body_{suffix}",
     ]
     # Verbatim pass-through: forwarded as-is, validated by phenix.refine itself.
     cmd += list(s.extra_args or [])
 
-    _run_cmd(cmd, job_dir)
+    _run_cmd(cmd, job_dir, log=f"01-rigid-body_{suffix}_stdout.log")
 
-    log_path = job_dir / f"01-rigid-body_{suffix}_001.log"
-    rfree = _rfree_from_phenix_log(log_path)
+    out_pdb = job_dir / f"01-rigid-body_{suffix}_001.pdb"
+    rfree = _rfree_from_phenix_pdb(out_pdb)
+    if rfree is None:   # no model written (e.g. aborted) -- try the log, else 1.0
+        rfree = _rfree_from_phenix_log(job_dir / f"01-rigid-body_{suffix}_001.log")
 
     return {
         "status": "completed",
-        "message": f"01-rigid-body: rfree={rfree:.4f}",
+        "message": f"rfree={rfree:.4f}",
         "ctx_updates": {
             "rfree_after_rigid_body": rfree,
             "jelly_input": str(job_dir / f"01-rigid-body_{suffix}_001.pdb"),
@@ -310,16 +368,81 @@ def _run_phenix(step, ctx, params, suffix, job_dir):
     }
 
 
+# Enantiomorphic space-group pairs, by international number.  A Phaser hand flip
+# between the two members of a pair is a pure relabel: the hkl set is unchanged,
+# so R-free flags from the original MTZ correspond reflection-for-reflection and
+# carry over when the space group is re-stamped.  (There are exactly 11 such
+# pairs among the 3D space groups.)
+_ENANTIOMORPH_PAIRS = frozenset(frozenset(p) for p in [
+    (76, 78), (91, 95), (92, 96), (144, 145), (151, 153), (152, 154),
+    (169, 173), (170, 172), (178, 179), (180, 181), (212, 213),
+])
+
+
+def _mtz_space_group_number(mtz_path):
+    """Return the international space-group number stored in an MTZ, or None."""
+    try:
+        out = subprocess.run(["phenix.mtz.dump", str(mtz_path)],
+                             capture_output=True, text=True).stdout
+        for line in out.splitlines():
+            if "Space group number from file:" in line:
+                return int(line.split(":")[1])
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _refmac_data_mtz(phaser_mtz, orig_mtz, suffix, job_dir):
+    """Return the data MTZ (F, SIGF, FreeR_flag) downstream refinement should use.
+
+    Modularity: after MR, refinement consumes PHASER's result frame rather than
+    reaching back to the original input.  Phaser may resolve a space-group
+    ambiguity (commonly an enantiomorph flip, e.g. P41212 -> P43212); its output
+    MTZ holds F/SIGF in the chosen frame but carries no R-free flags.  We restore
+    them per the user's policy -- transfer from the original ctruncate MTZ when
+    feasible, generate fresh otherwise:
+
+    * Solution space group == input: the original ctruncate MTZ is already in the
+      right frame and keeps its flags -- use it unchanged (the usual isomorphous
+      case; no extra work).
+    * Enantiomorphic flip: a pure relabel (hkl unchanged), so re-stamp the
+      original's space group to the solution.  F/SIGF AND the original FreeR_flag
+      (e.g. a test set copied from the reference) carry over intact.
+    * Any other change: indices may not correspond, so use Phaser's (correctly
+      transformed) F/SIGF and generate a fresh FreeR_flag with freerflag.
+    """
+    in_sg  = _mtz_space_group_number(orig_mtz)
+    sol_sg = _mtz_space_group_number(phaser_mtz)
+    if in_sg is not None and in_sg == sol_sg:
+        return str(orig_mtz)
+
+    out = job_dir / f"02-phaser_{suffix}_data.mtz"
+    if (in_sg is not None and sol_sg is not None
+            and frozenset((in_sg, sol_sg)) in _ENANTIOMORPH_PAIRS):
+        # Pure relabel: re-stamp the space group, keeping all columns + flags.
+        _run_cmd(["cad", "hklin1", str(orig_mtz), "hklout", str(out)],
+                 job_dir, stdin=f"LABIN FILE 1 ALL\nSYMMETRY {sol_sg}\nEND\n",
+                 log=f"02-phaser_{suffix}_data.log")
+        if out.is_file():
+            return str(out)
+
+    # Transfer not feasible: Phaser's F/SIGF + a freshly generated R-free set.
+    _run_cmd(["freerflag", "hklin", str(phaser_mtz), "hklout", str(out)],
+             job_dir, stdin="UNIQUE\nEND\n", log=f"02-phaser_{suffix}_data.log")
+    return str(out) if out.is_file() else str(orig_mtz)
+
+
 def _run_phaser(step, ctx, params, suffix, job_dir):
     s         = step.phaser
     mtz       = params["mtz"]
     reference = params["mr_pdb"]
 
-    # MR is only needed when rigid-body refinement didn't get close enough.
+    # Skip MR only if a preceding refinement step already reached the threshold.
+    # With no such step (the default), rfree defaults to 1.0 so MR always runs.
     rfree = ctx.get("rfree_after_rigid_body", 1.0)
     if rfree <= s.rfree_threshold:
         return {"status": "skipped",
-                "message": f"phaser: rfree={rfree:.4f} ≤ {s.rfree_threshold} — MR not needed",
+                "message": f"rfree={rfree:.4f} ≤ {s.rfree_threshold} — MR not needed",
                 "ctx_updates": {"phaser_succeeded": False,
                                 "rfree_threshold": s.rfree_threshold}}
 
@@ -353,9 +476,11 @@ def _run_phaser(step, ctx, params, suffix, job_dir):
         f"phaser.keywords.general.root={prefix}",
     ]
     if mw:   # omit mol_weight when 0/None so Phaser estimates it itself
-        cmd.append(f"phaser.mol_weight={mw}")
+        # phaser.mol_weight is integer-typed; a derived (fractional) MW must be
+        # rounded or phaser aborts ("Error interpreting ... as an integer").
+        cmd.append(f"phaser.mol_weight={int(round(mw))}")
     cmd += list(s.extra_args or [])
-    _run_cmd(cmd, job_dir)
+    _run_cmd(cmd, job_dir, log=f"02-phaser_{suffix}_stdout.log")
 
     succeeded = out_pdb.is_file()
     if succeeded and suffix == "hoh":
@@ -363,20 +488,28 @@ def _run_phaser(step, ctx, params, suffix, job_dir):
         out_pdb.write_text(text)
 
     jelly_input = str(out_pdb) if succeeded else ctx.get("jelly_input")
+    ctx_updates = {
+        "phaser_succeeded": succeeded,
+        "jelly_input": jelly_input,
+        "rfree_threshold": s.rfree_threshold,
+    }
+    if succeeded:
+        # Hand the corrected data forward: downstream refmac refines against
+        # Phaser's solution frame (its space group / hand), not params["mtz"].
+        ctx_updates["data_mtz"] = _refmac_data_mtz(
+            job_dir / f"02-phaser_{suffix}.1.mtz", params["mtz"], suffix, job_dir)
     return {
         "status": "completed",
-        "message": f"phaser: {'success' if succeeded else 'failed'}",
-        "ctx_updates": {
-            "phaser_succeeded": succeeded,
-            "jelly_input": jelly_input,
-            "rfree_threshold": s.rfree_threshold,
-        },
+        "message": "success" if succeeded else "failed",
+        "ctx_updates": ctx_updates,
     }
 
 
 def _run_refmac(step, ctx, params, suffix, job_dir):
     s       = step.refmac
-    mtz     = params["mtz"]
+    # Consume the upstream step's data frame (Phaser's solution, if it ran),
+    # falling back to the original input MTZ when nothing corrected it.
+    mtz     = ctx.get("data_mtz", params["mtz"])
     jelly   = s.jelly
     ncycles = s.ncycles
 
@@ -387,23 +520,21 @@ def _run_refmac(step, ctx, params, suffix, job_dir):
         flag = "jelly_succeeded" if jelly else None
         updates = {flag: False} if flag else {}
         return {"status": "skipped",
-                "message": f"refmac (jelly={jelly}): phaser failed and rfree too high",
+                "message": f"phaser failed and rfree too high (jelly={jelly})",
                 "ctx_updates": updates}
     if jelly:
         xyz_in  = ctx.get("jelly_input", "")
         xyz_out = job_dir / f"03-jelly_{suffix}.pdb"
         hkl_out = job_dir / f"03-jelly_{suffix}.mtz"
         log_out = f"03-jelly_{suffix}.log"
-        label   = "03-jelly"
     else:
         if not ctx.get("jelly_succeeded", False):
             return {"status": "skipped",
-                    "message": "refmac (restrained): jelly failed or skipped"}
+                    "message": "jelly failed or skipped"}
         xyz_in  = str(job_dir / f"03-jelly_{suffix}.pdb")
         xyz_out = job_dir / f"final_{suffix}.pdb"
         hkl_out = job_dir / f"final_{suffix}.mtz"
         log_out = f"04-refmac_{suffix}.log"
-        label   = "04-refmac"
 
     stdin_kw = (
         "make newligand continue\n"
@@ -432,50 +563,62 @@ def _run_refmac(step, ctx, params, suffix, job_dir):
 
     return {
         "status": "completed",
-        "message": f"{label}: completed",
+        "message": "completed",
         "ctx_updates": ctx_updates,
     }
 
 
 def _run_fill(step, ctx, params, suffix, job_dir):
     if not step.fill.enabled:
-        return {"status": "skipped", "message": "fill: disabled"}
+        return {"status": "skipped", "message": "disabled"}
 
     pdb_path = job_dir / f"final_{suffix}.pdb"
     mtz_path = job_dir / f"final_{suffix}.mtz"
     if not (pdb_path.is_file() and mtz_path.is_file()):
         return {"status": "error", "fatal": False,
-                "message": "fill: no final PDB/MTZ pair found"}
+                "message": "no final PDB/MTZ pair found"}
 
     _run_cmd(
         ["uniqueify", "-f", "FreeR_flag", str(mtz_path), "fill_01_unique.mtz"],
         job_dir, log="fill_01_unique.log",
     )
     if not (job_dir / "fill_01_unique.mtz").is_file():
-        return {"status": "error", "fatal": False, "message": "fill: uniqueify failed"}
+        return {"status": "error", "fatal": False, "message": "uniqueify failed"}
 
+    # NB: no "resolution file 1 ..." line here.  An earlier version carried a
+    # literal "resolution file 1 999.0 HIGHRES" placeholder whose unsubstituted
+    # HIGHRES token made CAD's resolution window invalid -- it rejected *every*
+    # reflection (leaving a 1-reflection MTZ), so phenix.maps downstream aborted
+    # with "No array of observed xray data found".  We want the full reflection
+    # list passed through unchanged, so the resolution restriction is omitted.
     _run_cmd(
         ["cad", "hklin1", "fill_01_unique.mtz", "hklout", "fill_02_cad.mtz"],
         job_dir,
-        stdin="monitor BRIEF\nlabin file 1 ALL\nresolution file 1 999.0 HIGHRES\nEND\n",
+        stdin="monitor BRIEF\nlabin file 1 ALL\nEND\n",
         log="fill_02_cad.log",
     )
     if not (job_dir / "fill_02_cad.mtz").is_file():
-        return {"status": "error", "fatal": False, "message": "fill: CAD failed"}
+        return {"status": "error", "fatal": False, "message": "CAD failed"}
 
     _run_cmd(
         ["phenix.maps", str(pdb_path), "fill_02_cad.mtz"],
         job_dir, log="fill_03_maps.log",
     )
+    # phenix.maps names its coefficient MTZ after the input *model* stem, so the
+    # file is "final_{suffix}_map_coeffs.mtz" -- not "fill_02_cad_*".  Prefer that
+    # deterministic name, then fall back to a glob to stay robust against phenix
+    # naming changes (e.g. "_map_coefficients").
     dest = job_dir / f"final_{suffix}_filled.mtz"
-    for candidate in ("fill_02_cad_map_coeffs.mtz", "fill_02_cad_map_coefficients.mtz"):
-        src = job_dir / candidate
+    candidates = [job_dir / f"final_{suffix}_map_coeffs.mtz"]
+    candidates += sorted(job_dir.glob("*_map_coeffs.mtz"))
+    candidates += sorted(job_dir.glob("*_map_coefficients.mtz"))
+    for src in candidates:
         if src.is_file():
             src.rename(dest)
-            return {"status": "completed", "message": f"fill: {dest.name} written"}
+            return {"status": "completed", "message": f"{dest.name} written"}
 
     return {"status": "error", "fatal": False,
-            "message": "fill: phenix.maps output not found"}
+            "message": "phenix.maps output not found"}
 
 
 # ---------------------------------------------------------------------------
