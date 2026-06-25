@@ -85,10 +85,13 @@ xds
   .short_caption = XDS settings
   .help = Dataset-wide XDS settings (apply to every XDS step).
 {
-  ncpu = 8
+  ncpu = auto
     .type = int
     .short_caption = CPUs per job
-    .help = Number of CPUs allocated to each XDS SGE job.
+    .help = CPUs allocated to each XDS SGE job. auto sizes the request from the \
+            dataset frame count (split across MAXIMUM_NUMBER_OF_JOBS and \
+            MAXIMUM_NUMBER_OF_PROCESSORS). An explicit integer forces that many \
+            processors with a single XDS job.
     .expert_level = 0
   detector_edge = 0.8
     .type = float
@@ -160,7 +163,7 @@ def run_step(step, ctx, rp, pipeline_subdir, forced):
                         "fatal": True,
                         "error_type": "needs_forced_integration",
                         "retry_mode": retry_mode,
-                        "message": f"{step_id}: {err}",
+                        "message": f"{err}",
                     }
                 elif on_indexing_failure == "bypass":
                     rp._log(pipeline_subdir, "ERROR",
@@ -170,25 +173,25 @@ def run_step(step, ctx, rp, pipeline_subdir, forced):
                     rp._xds(step_id, params, "xds_bypass_indexing_failure")
                     if rp._xds_ascii_ok(pipeline_subdir, step_id):
                         return {"status": "completed",
-                                "message": f"{step_id}: completed (bypass)"}
+                                "message": f"completed (bypass)"}
                     err2 = (rp._xds_error(pipeline_subdir, step_id)
                             or "XDS did not produce XDS_ASCII.HKL after bypass")
                     return {"status": "error", "fatal": True,
-                            "message": f"{step_id}: {err2}"}
+                            "message": f"{err2}"}
                 else:  # reject
-                    return {"status": "error", "fatal": True, "message": f"{step_id}: {err}"}
+                    return {"status": "error", "fatal": True, "message": f"{err}"}
 
             elif xparm and integrate_hkl:
                 # CORRECT failure: on_integration_failure governs
                 if xds_p.on_integration_failure == "bypass":
                     return {"status": "error", "fatal": False,
-                            "message": f"{step_id}: {err} (bypassed)"}
+                            "message": f"{err} (bypassed)"}
                 else:  # reject
-                    return {"status": "error", "fatal": True, "message": f"{step_id}: {err}"}
+                    return {"status": "error", "fatal": True, "message": f"{err}"}
 
             else:
                 # No XPARM.XDS: hard stop regardless of params
-                return {"status": "error", "fatal": True, "message": f"{step_id}: {err}"}
+                return {"status": "error", "fatal": True, "message": f"{err}"}
 
     else:
         if xds_p.skip_if_no_improvement and not forced:
@@ -205,7 +208,7 @@ def run_step(step, ctx, rp, pipeline_subdir, forced):
                 if float(res_last) <= float(res_prev):
                     return {
                         "status": "skipped",
-                        "message": (f"{step_id}: skipped "
+                        "message": (f"skipped "
                                     f"(no CC½ improvement: {res_prev} → {res_last} Å)"),
                         "ctx_updates": {"_skip_n_steps": 2},
                     }
@@ -222,6 +225,6 @@ def run_step(step, ctx, rp, pipeline_subdir, forced):
 
         if not rp._xds_ascii_ok(pipeline_subdir, step_id):
             err = rp._xds_error(pipeline_subdir, step_id) or "XDS did not produce XDS_ASCII.HKL"
-            return {"status": "error", "fatal": True, "message": f"{step_id}: {err}"}
+            return {"status": "error", "fatal": True, "message": f"{err}"}
 
-    return {"status": "completed", "message": f"{step_id}: completed"}
+    return {"status": "completed", "message": f"completed"}

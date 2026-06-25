@@ -64,7 +64,7 @@ XDS_PARAM_DEFAULTS = {
     "on_indexing_failure":   "auto",
     "retry_mode":            "auto",
     "on_integration_failure": "reject",
-    "ncpu":                  "8",
+    "ncpu":                  "auto",
     "no_symmetry":           "false",
     "scaling":               "correct",
     "recycle_xds":           "false",

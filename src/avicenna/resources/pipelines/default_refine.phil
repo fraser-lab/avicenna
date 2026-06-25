@@ -1,5 +1,6 @@
 refine {
   water = both
+  ncpu = auto
   input {
     output_dir = "."
     dataset_list = "qrefine_list.txt"

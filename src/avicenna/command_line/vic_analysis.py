@@ -9,6 +9,19 @@ from avicenna.utils.software import check_programs
 _DEFAULT_PHIL  = "analysis.phil"          # effective settings, written each run
 _TEMPLATE_PHIL = "analysis_default.phil"  # defaults template, written by --dry_run
 
+def _cpus_arg(value):
+    """argparse type for --cpus: a positive int, or the string 'auto'."""
+    if str(value).strip().lower() == "auto":
+        return "auto"
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"--cpus must be a positive integer or 'auto', got {value!r}")
+    if n < 1:
+        raise argparse.ArgumentTypeError("--cpus must be >= 1")
+    return n
+
+
 parser = argparse.ArgumentParser(prog="vic.analysis")
 parser.add_argument("--settings", type=pathlib.Path, metavar="FILE",
                     help=f"PHIL settings file (default: auto-load {_DEFAULT_PHIL} if present)")
@@ -27,8 +40,9 @@ parser.add_argument("--reference_mtz", type=pathlib.Path,
                     help="Reference MTZ for pandda.analyse")
 parser.add_argument("--ground_state_range", type=str, metavar="START-END",
                     help="Dataset number range for ground state, e.g. '1-44'")
-parser.add_argument("--cpus", type=int, default=32,
-                    help="CPUs for pandda.analyse (default: 32)")
+parser.add_argument("--cpus", type=_cpus_arg, default="auto", metavar="N|auto",
+                    help="CPUs for pandda.analyse, or 'auto' to size from the "
+                         "dataset count (default: auto)")
 parser.add_argument("--min_build", type=int, default=30,
                     help="min_build_datasets (default: 30)")
 parser.add_argument("--max_build", type=int, default=50,

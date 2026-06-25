@@ -67,10 +67,12 @@ pandda
     .short_caption = pandda.analyse options
     .help = Resource and quality parameters passed to pandda.analyse or pandda2.analyse.
   {
-    cpus = 32
+    cpus = auto
       .type = int
       .short_caption = CPUs
-      .help = Number of CPUs.
+      .help = CPUs for pandda.analyse. auto requests one core per dataset (PanDDA \
+              parallelises across datasets), capped. An explicit integer is used \
+              verbatim.
       .expert_level = 1
     min_build_datasets = 30
       .type = int
@@ -125,7 +127,7 @@ def _run_pandda(step, ctx):
     sources = list(p.input.sources or [])
     if not sources:
         return {"status": "error", "fatal": True,
-                "message": "pandda: input.sources is empty"}
+                "message": "input.sources is empty"}
 
     ground_state = []
     if p.dataset.ground_state_range:
@@ -152,7 +154,7 @@ def _run_pandda(step, ctx):
         dry_run=p.run.dry_run,
     )
     preparer.run()
-    return {"status": "completed", "message": "pandda: pandda.analyse finished"}
+    return {"status": "completed", "message": "pandda.analyse finished"}
 
 
 def _run_pandda2(step, ctx):
@@ -179,5 +181,5 @@ def run_step(step, ctx):
     handler  = _HANDLERS.get(analyser)
     if handler is None:
         return {"status": "error", "fatal": True,
-                "message": f"pandda: unknown analyser '{analyser}'"}
+                "message": f"unknown analyser '{analyser}'"}
     return handler(step, ctx)

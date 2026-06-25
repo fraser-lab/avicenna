@@ -174,65 +174,145 @@ def _run_cmd(cmd, job_dir, stdin=None, log=None):
     return result.returncode
 
 
-def _rfree_from_phenix_pdb(pdb_path):
-    """Parse R-free from a phenix.refine output PDB's REMARK 3 'FREE R VALUE' record.
+def _pdb_stats(pdb_path):
+    """Return ``(rwork, rfree, res_high)`` from a refined PDB's REMARK 3 records.
 
-    Reading the model the step actually produced is the most robust signal: it is
-    the canonical refined statistic, stable across phenix versions, and consistent
-    with how final results are scraped elsewhere (REMARK 3).  The matching record
-    is ``REMARK   3   FREE R VALUE                     :  0.2305`` -- distinct from
-    the ``FREE R VALUE TEST SET ...`` / ``... (WORKING + TEST SET)`` lines, which we
-    exclude.  Returns None when the PDB is absent or carries no parseable value
-    (e.g. the refinement aborted and wrote no model), so the caller can fall back.
-    """
+    Reads the standard PDB REMARK 3 fields written by BOTH phenix.refine and
+    REFMAC5 -- ``R VALUE            (WORKING SET) :``, ``FREE R VALUE
+    :`` (the padded standalone record, distinct from the ``FREE R VALUE TEST
+    SET ...`` / ``BIN FREE R VALUE ...`` lines), and ``RESOLUTION RANGE HIGH
+    (ANGSTROMS) :``.  Reading the model a step actually produced is the most
+    robust signal: it is the canonical refined statistic and matches how final
+    results are scraped elsewhere (see utils.ScrapeRefine._parse_pdb_stats).
+    Any field that is absent or unparseable comes back None so the caller can
+    format only what is available (e.g. the model was never written)."""
+    rwork = rfree = res = None
     try:
         for line in pdb_path.read_text().splitlines():
             if not line.startswith("REMARK   3"):
                 continue
-            if "FREE R VALUE" in line and not any(
-                    k in line for k in ("TEST", "SET", "BIN", "ERROR")):
+            if "R VALUE            (WORKING SET) :" in line:
                 try:
-                    val = float(line.split(":")[-1].strip())
+                    rwork = float(line.split(":")[-1])
                 except ValueError:
-                    continue
-                if 0.0 <= val <= 1.0:
-                    return val
+                    pass
+            elif "FREE R VALUE                     :" in line:
+                try:
+                    rfree = float(line.split(":")[-1])
+                except ValueError:
+                    pass
+            elif "RESOLUTION RANGE HIGH (ANGSTROMS) :" in line:
+                try:
+                    res = float(line.split(":")[-1])
+                except ValueError:
+                    pass
     except OSError:
         pass
-    return None
+    return rwork, rfree, res
 
 
-def _rfree_from_phenix_log(log_path):
-    """Parse final R-free from a phenix.refine log ('Final R-work = .., R-free = ..').
+def _rwork_rfree_from_phenix_log(log_path):
+    """Parse final ``(rwork, rfree)`` from a phenix.refine log.
 
     Fallback for when the output PDB is unavailable.  The summary line is
-    ``Final R-work = 0.2305, R-free = 0.2305``; commas are stripped before
-    tokenising (the value token is otherwise ``'0.2305,'`` and float() chokes),
-    and R-free -- not R-work -- is the field we want.
-    """
+    ``Final R-work = 0.2305, R-free = 0.2451``; commas are stripped before
+    tokenising (the value token is otherwise ``'0.2305,'`` and float() chokes).
+    Returns ``(None, None)`` when no parseable summary line is present."""
     try:
         for line in reversed(log_path.read_text().splitlines()):
             if "Final R-work =" in line:
                 parts = line.replace(",", " ").split()
-                return float(parts[parts.index("R-free") + 2])
+                return (float(parts[parts.index("R-work") + 2]),
+                        float(parts[parts.index("R-free") + 2]))
     except (OSError, ValueError, IndexError):
         pass
-    return 1.0
+    return None, None
 
 
-def _final_rfree_from_refmac_log(log_path):
-    """Parse final Rfree from a REFMAC5 log ('Final results' block)."""
+def _rwork_rfree_from_refmac_log(log_path):
+    """Parse final ``(rwork, rfree)`` from a REFMAC5 'Final results' block.
+
+    The block lists Initial and Final columns; we take the Final (last) value::
+
+        $TEXT:Result: $$ Final results $$
+                              Initial    Final
+                   R factor    0.2207   0.2159
+                     R free    0.2287   0.2312
+
+    NB: the ``R free`` row carries only four whitespace-separated tokens, so the
+    old positional ``parts[4]`` read never matched -- this keys off the field
+    name instead and reads the final column.  Returns ``(None, None)`` when the
+    block is absent."""
+    rwork = rfree = None
     try:
         lines = log_path.read_text().splitlines()
         for i, line in enumerate(lines):
-            if "Final results" in line:
-                for tl in lines[i + 1: i + 4]:
-                    parts = tl.split()
-                    if len(parts) >= 5:
-                        return float(parts[4])
-    except (OSError, ValueError, IndexError):
+            if "Final results" not in line:
+                continue
+            for tl in lines[i + 1: i + 8]:
+                parts = tl.split()
+                if len(parts) < 4 or parts[0] != "R":
+                    continue
+                try:
+                    val = float(parts[-1])
+                except ValueError:
+                    continue
+                if parts[1] == "factor":
+                    rwork = val
+                elif parts[1] == "free":
+                    rfree = val
+            break
+    except OSError:
         pass
-    return 1.0
+    return rwork, rfree
+
+
+def _llg_tfz_from_phaser_log(log_path):
+    """Parse refined ``(llg, tfz)`` from a Phaser log's accepted-solution record.
+
+    The accepted solution is summarised on a ``SOLU SET`` line that carries the
+    start figures followed by the refined ones, e.g.::
+
+        SOLU SET  RF*0 TF*0 LLG=25115 TFZ==173.0 PAK=1 LLG=25117 TFZ==173.0
+
+    Tokens are scanned left-to-right so the LAST ``LLG=`` / ``TFZ(=)`` win and
+    the refined figures are reported (``TFZ==`` splits to the value on the final
+    ``=``).  Returns ``(None, None)`` when no such line is found (MR failed)."""
+    llg = tfz = None
+    try:
+        for line in reversed(log_path.read_text().splitlines()):
+            if "SOLU SET" in line and "LLG=" in line:
+                for tok in line.split():
+                    if tok.startswith("LLG="):
+                        try:
+                            llg = float(tok.split("=")[-1])
+                        except ValueError:
+                            pass
+                    elif tok.startswith("TFZ="):
+                        try:
+                            tfz = float(tok.split("=")[-1])
+                        except ValueError:
+                            pass
+                break
+    except OSError:
+        pass
+    return llg, tfz
+
+
+def _fmt_r_stats(rwork, rfree, res=None):
+    """Format the available R-stats into a compact log detail.
+
+    Order is resolution, Rwork, Rfree (the completed-job line passes all three;
+    per-step refinement lines omit resolution).  Returns "" when nothing is
+    available, so callers can fall back to a plain status word."""
+    parts = []
+    if res is not None:
+        parts.append(f"res={res:.2f}A")
+    if rwork is not None:
+        parts.append(f"Rwork={rwork:.4f}")
+    if rfree is not None:
+        parts.append(f"Rfree={rfree:.4f}")
+    return " ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -354,15 +434,19 @@ def _run_phenix(step, ctx, params, suffix, job_dir):
     _run_cmd(cmd, job_dir, log=f"01-rigid-body_{suffix}_stdout.log")
 
     out_pdb = job_dir / f"01-rigid-body_{suffix}_001.pdb"
-    rfree = _rfree_from_phenix_pdb(out_pdb)
-    if rfree is None:   # no model written (e.g. aborted) -- try the log, else 1.0
-        rfree = _rfree_from_phenix_log(job_dir / f"01-rigid-body_{suffix}_001.log")
+    rwork, rfree, _ = _pdb_stats(out_pdb)
+    if rfree is None:   # no model written (e.g. aborted) -- try the log
+        rwork, rfree = _rwork_rfree_from_phenix_log(
+            job_dir / f"01-rigid-body_{suffix}_001.log")
 
+    # rfree gates the downstream Phaser skip; default to 1.0 (always run MR) when
+    # unknown so a parse miss never silently suppresses molecular replacement.
+    rfree_ctx = rfree if rfree is not None else 1.0
     return {
         "status": "completed",
-        "message": f"rfree={rfree:.4f}",
+        "message": _fmt_r_stats(rwork, rfree) or "completed",
         "ctx_updates": {
-            "rfree_after_rigid_body": rfree,
+            "rfree_after_rigid_body": rfree_ctx,
             "jelly_input": str(job_dir / f"01-rigid-body_{suffix}_001.pdb"),
         },
     }
@@ -498,9 +582,24 @@ def _run_phaser(step, ctx, params, suffix, job_dir):
         # Phaser's solution frame (its space group / hand), not params["mtz"].
         ctx_updates["data_mtz"] = _refmac_data_mtz(
             job_dir / f"02-phaser_{suffix}.1.mtz", params["mtz"], suffix, job_dir)
+
+    if succeeded:
+        # phenix.phaser writes its log to <root>.log; fall back to the captured
+        # stdout if that is missing.
+        llg, tfz = _llg_tfz_from_phaser_log(job_dir / f"{prefix}.log")
+        if llg is None and tfz is None:
+            llg, tfz = _llg_tfz_from_phaser_log(job_dir / f"{prefix}_stdout.log")
+        stats = []
+        if llg is not None:
+            stats.append(f"LLG={llg:.0f}")
+        if tfz is not None:
+            stats.append(f"TFZ={tfz:.1f}")
+        message = "success" + (f" ({' '.join(stats)})" if stats else "")
+    else:
+        message = "failed"
     return {
         "status": "completed",
-        "message": "success" if succeeded else "failed",
+        "message": message,
         "ctx_updates": ctx_updates,
     }
 
@@ -555,15 +654,25 @@ def _run_refmac(step, ctx, params, suffix, job_dir):
         job_dir, stdin=stdin_kw, log=log_out,
     )
 
+    # Report R-stats from the model this step produced (REMARK 3, the canonical
+    # refined statistic), falling back to the log's 'Final results' block.
+    rwork, rfree, res = _pdb_stats(xyz_out)
+    if rwork is None and rfree is None:
+        rwork, rfree = _rwork_rfree_from_refmac_log(job_dir / log_out)
+
     ctx_updates = {}
     if jelly:
         ctx_updates["jelly_succeeded"] = xyz_out.is_file()
     else:
-        ctx_updates["final_rfree"] = _final_rfree_from_refmac_log(job_dir / log_out)
+        if rfree is not None:
+            ctx_updates["final_rfree"] = rfree
+        # Hand the completed-job summary (resolution + R-stats) to the
+        # interpreter's DONE line; this is the last refinement step.
+        ctx_updates["final_summary"] = _fmt_r_stats(rwork, rfree, res)
 
     return {
         "status": "completed",
-        "message": "completed",
+        "message": _fmt_r_stats(rwork, rfree) or "completed",
         "ctx_updates": ctx_updates,
     }
 

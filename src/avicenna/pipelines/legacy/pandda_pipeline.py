@@ -6,6 +6,8 @@ import time
 
 _src_dir = str(pathlib.Path(__file__).parents[3] / "src")
 
+from avicenna.utils import resources
+
 
 class PanDDAPreparer:
     """Prepare pandda input from qrefine output and submit pandda.analyse.
@@ -148,6 +150,12 @@ class PanDDAPreparer:
             return
 
         mapping = self._prepare_data_dir(all_jobs)
+
+        # Resolve cpus now that the dataset count is known: PanDDA parallelises
+        # across datasets, so auto requests one core per dataset (capped).
+        if resources.is_auto(self.cpus):
+            self.cpus = resources.pandda_cpus(len(mapping))
+            print(f"Auto-set pandda.analyse cpus = {self.cpus} (for {len(mapping)} datasets)")
 
         if self.dry_run:
             gs_set = set(self.ground_state_datasets)

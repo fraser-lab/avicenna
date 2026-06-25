@@ -126,3 +126,131 @@ class SubPipelineJob:
                 pass
         sys.stderr.write(line)
         sys.stderr.flush()
+
+
+class SubPipelineInterpreter(SubPipelineJob):
+    """Shared logging + step-execution loop for every sub-pipeline interpreter
+    (processing, refinement, analysis).
+
+    Logging is uniform across sub-pipelines: one ``_log(tag, message)`` writes a
+    ``format_log_line`` to the sub-pipeline's ``pipeline.log`` (when
+    ``_log_path()`` is set) and echoes it to stdout.  The interpreter owns the
+    ``<step.id>:`` label -- backends return a DETAIL-ONLY message and never their
+    own step/program label, so a user's custom step name flows through unchanged.
+
+    A "just run it" sub-pipeline (e.g. analysis/PanDDA) sets
+    ``STREAMS_PROGRAM_OUTPUT = True``: its backend lets the child program's stdout
+    flow straight to the terminal (PanDDA shows its own progress), while these
+    status lines are still emitted around it.  This flag is documentation of that
+    backend behaviour; capture-vs-stream lives in the backend (refinement/
+    processing capture to per-step logs for the stall watchdog; analysis does
+    not).
+
+    Subclasses provide ``_log_context()``/``_log_path()`` and ``_invoke(step,
+    ctx)`` (calls the registered handler with the sub-pipeline's own signature),
+    and may override ``_pre_step`` / ``_on_fatal`` for sub-pipeline-specific flow.
+    """
+
+    STREAMS_PROGRAM_OUTPUT = False
+
+    # -- logging -------------------------------------------------------------
+
+    def _log_context(self):
+        """Bracketed context label (job/dataset id), or None."""
+        return None
+
+    def _log_context_width(self):
+        return getattr(self, "params", {}).get("context_width")
+
+    def _log_path(self):
+        """Path to this sub-pipeline's pipeline.log, or None for stdout only."""
+        return None
+
+    def _log_forced_dir(self):
+        """Bracketed retry-job tag inserted before the message (processing's
+        forced-integration jobs), or None."""
+        return None
+
+    def _log(self, tag, message):
+        from avicenna.utils.utils import format_log_line
+        line = format_log_line(tag, message, context=self._log_context(),
+                               context_width=self._log_context_width(),
+                               forced_dir=self._log_forced_dir())
+        path = self._log_path()
+        if path:
+            try:
+                with open(path, "a") as fh:
+                    fh.write(line)
+            except OSError:
+                pass
+        print(line, end="", flush=True)
+
+    # -- step loop -----------------------------------------------------------
+
+    def _invoke(self, step, ctx):
+        """Call the registered handler for *step* with the sub-pipeline's own
+        argument signature and return its result dict."""
+        raise NotImplementedError
+
+    def _pre_step(self, step, ctx):
+        """Hook run before the branching guards.  Return True to consume the step
+        (the override is responsible for its own logging/bookkeeping); False to
+        proceed normally."""
+        return False
+
+    def _on_fatal(self, step, ctx, result):
+        """Hook invoked on a fatal error, before the loop breaks."""
+        return None
+
+    def _run_steps(self, steps, ctx):
+        """Execute *steps* in order, logging one ``<tag> <step.id>: <message>``
+        line each.  Returns True if a fatal error broke the loop.
+
+        ctx must already carry the bookkeeping sets/maps (``last_by_program``,
+        ``history_by_program``, ``completed_steps``, ``failed_steps``)."""
+        for step in steps:
+            if self._pre_step(step, ctx):
+                continue
+
+            req_succeeded = step.run_if_succeeded
+            req_failed    = step.run_if_failed
+            if req_succeeded and req_succeeded not in ctx["completed_steps"]:
+                self._log("SKIP", f"{step.id}: skipped "
+                                  f"('{req_succeeded}' has not succeeded)")
+                ctx["failed_steps"].add(step.id)
+                continue
+            if req_failed and req_failed not in ctx["failed_steps"]:
+                self._log("SKIP", f"{step.id}: skipped "
+                                  f"('{req_failed}' has not failed)")
+                continue
+
+            program = step.program
+            if self._registry.get(program) is None:
+                self._log("ERROR",
+                          f"{step.id}: no backend registered for program '{program}'")
+                return True
+
+            result  = self._invoke(step, ctx)
+            status  = result.get("status", "completed")
+            message = result.get("message", status)
+            line    = f"{step.id}: {message}"
+
+            if status == "completed":
+                self._log("RUN", line)
+                ctx["last_by_program"][program] = step.id
+                ctx["history_by_program"].setdefault(program, []).append(step.id)
+                ctx.update(result.get("ctx_updates", {}))
+                ctx["completed_steps"].add(step.id)
+            elif status == "skipped":
+                self._log("SKIP", line)
+                ctx["last_by_program"][program] = step.id
+                ctx["history_by_program"].setdefault(program, []).append(step.id)
+                ctx.update(result.get("ctx_updates", {}))
+                ctx["failed_steps"].add(step.id)
+            elif status == "error":
+                self._log("ERROR", line)
+                ctx["failed_steps"].add(step.id)
+                if result.get("fatal", False):
+                    self._on_fatal(step, ctx, result)
+                    return True
+        return False

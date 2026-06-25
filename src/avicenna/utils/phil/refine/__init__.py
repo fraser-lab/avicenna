@@ -27,6 +27,12 @@ refine
     .short_caption = Water handling
     .help = Refine with ordered waters retained (hoh), stripped (nohoh), or both as parallel jobs per dataset.
     .expert_level = 0
+  ncpu = auto
+    .type = int
+    .short_caption = CPUs per job
+    .help = CPUs per refinement SGE job. auto resolves to 1 (the refinement is \
+            REFMAC5-dominated and effectively serial). Set an integer to force more.
+    .expert_level = 1
   input
     .short_caption = Input
     .help = Input files for the refinement run.

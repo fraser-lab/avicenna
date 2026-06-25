@@ -40,7 +40,7 @@ import stat
 from pathlib import Path
 
 from avicenna.pipelines.legacy.proc_pipeline import RunProcess
-from avicenna.pipelines.jobbase import SubPipelineJob
+from avicenna.pipelines.jobbase import SubPipelineInterpreter
 from avicenna.utils.phil.processing import ProcessingPHIL
 from avicenna.utils.software import suite_setup_sources
 from avicenna.utils.utils import QRefineWriter, sg_lookup
@@ -192,7 +192,7 @@ print("=" * 60, flush=True)
 # Interpreter
 # ---------------------------------------------------------------------------
 
-class ProcessingPipelineInterpreter(SubPipelineJob):
+class ProcessingPipelineInterpreter(SubPipelineInterpreter):
     """
     Iterate over the PHIL step sequence and execute each step via the
     registered backend handler.  No program names appear in this class;
@@ -215,8 +215,40 @@ class ProcessingPipelineInterpreter(SubPipelineJob):
         self._registry = _build_registry()
 
     # ------------------------------------------------------------------
-    # Public entry points
+    # Logging + dispatch + flow hooks (see SubPipelineInterpreter)
     # ------------------------------------------------------------------
+
+    def _log_context(self):
+        return self.params.get("pin_id")
+
+    def _log_path(self):
+        return Path(self.params["pipeline_subdir"]) / "pipeline.log"
+
+    def _log_forced_dir(self):
+        if self.params.get("force_integration") == "true":
+            return Path(self.params["pipeline_subdir"]).name
+        return None
+
+    def _invoke(self, step, ctx):
+        handler = self._registry[step.program]
+        return handler(step, ctx, self.rp, ctx["pipeline_subdir"], ctx["forced"])
+
+    def _pre_step(self, step, ctx):
+        # Step-skip counter: a handler may ask to skip the next N steps.
+        if ctx["_skip_n_steps"] > 0:
+            ctx["_skip_n_steps"] -= 1
+            self._log("SKIP", f"{step.id}: skipped (prior step did not improve)")
+            ctx["failed_steps"].add(step.id)
+            return True
+        return False
+
+    def _on_fatal(self, step, ctx, result):
+        if result.get("error_type") == "needs_forced_integration":
+            ctx["triggered_forced"] = True
+            self._log("FORCE", "submitting forced integration jobs")
+            self.rp._run_forced_integration(
+                self.params, ctx["pipeline_subdir"],
+                retry_mode=result.get("retry_mode"))
 
     # ------------------------------------------------------------------
     # Stall-watchdog hooks (see avicenna.pipelines.jobbase)
@@ -272,8 +304,8 @@ class ProcessingPipelineInterpreter(SubPipelineJob):
         else:
             sg, cell = params.get("known_sg", "none"), params.get("known_cell", "none")
             label = pipeline_subdir.parent.name
-        self.rp._log(pipeline_subdir, "START",
-                     f"{params.get('pin_id', '?')} | {label} | sg={sg} cell={cell}")
+        self._log("START",
+                  f"{params.get('pin_id', '?')} | {label} | sg={sg} cell={cell}")
 
         self.rp._setup_scratch(params)
 
@@ -283,80 +315,19 @@ class ProcessingPipelineInterpreter(SubPipelineJob):
             "pipeline_subdir":    pipeline_subdir,
             "forced":             forced,
             "_skip_n_steps":      0,
+            "triggered_forced":   False,
             "completed_steps":    set(),
             "failed_steps":       set(),
         }
 
-        fatal_break = False
-        triggered_forced = False
+        fatal_break = self._run_steps(steps, ctx)
 
-        for step in steps:
-            # Step-skip counter: set by a handler to skip the next N steps.
-            if ctx["_skip_n_steps"] > 0:
-                ctx["_skip_n_steps"] -= 1
-                self.rp._log(pipeline_subdir, "RUN",
-                             f"{step.id}: skipped (prior step did not improve)")
-                ctx["failed_steps"].add(step.id)
-                continue
-
-            # Branching guards
-            req_succeeded = step.run_if_succeeded
-            req_failed    = step.run_if_failed
-            if req_succeeded and req_succeeded not in ctx["completed_steps"]:
-                self.rp._log(pipeline_subdir, "SKIP",
-                             f"{step.id}: skipped ('{req_succeeded}' has not succeeded)")
-                ctx["failed_steps"].add(step.id)
-                continue
-            if req_failed and req_failed not in ctx["failed_steps"]:
-                self.rp._log(pipeline_subdir, "SKIP",
-                             f"{step.id}: skipped ('{req_failed}' has not failed)")
-                continue
-
-            program = step.program
-            handler = self._registry.get(program)
-            if handler is None:
-                self.rp._log(pipeline_subdir, "ERROR",
-                             f"{step.id}: no backend registered for program '{program}'")
-                fatal_break = True
-                break
-
-            result  = handler(step, ctx, self.rp, pipeline_subdir, forced)
-            status  = result.get("status", "completed")
-            message = result.get("message", f"{step.id}: {status}")
-
-            if status == "completed":
-                self.rp._log(pipeline_subdir, "RUN", message)
-                ctx["last_by_program"][program] = step.id
-                ctx["history_by_program"].setdefault(program, []).append(step.id)
-                ctx.update(result.get("ctx_updates", {}))
-                ctx["completed_steps"].add(step.id)
-
-            elif status == "skipped":
-                self.rp._log(pipeline_subdir, "RUN", message)
-                ctx.update(result.get("ctx_updates", {}))
-                ctx["failed_steps"].add(step.id)
-
-            elif status == "error":
-                self.rp._log(pipeline_subdir, "ERROR", message)
-                ctx["failed_steps"].add(step.id)
-                if result.get("fatal", False):
-                    if result.get("error_type") == "needs_forced_integration":
-                        triggered_forced = True
-                        self.rp._log(pipeline_subdir, "FORCE",
-                                     "submitting forced integration jobs")
-                        self.rp._run_forced_integration(
-                            params, pipeline_subdir,
-                            retry_mode=result.get("retry_mode"))
-                    fatal_break = True
-                    break
-                # Non-fatal error: log and continue.
-
-        if not fatal_break and not triggered_forced:
+        if not fatal_break and not ctx["triggered_forced"]:
             last_aimless = ctx["last_by_program"].get("aimless")
             if last_aimless:
                 summary = self.rp._aimless_summary(
                     pipeline_subdir / last_aimless / f"{last_aimless}.log")
-                self.rp._log(pipeline_subdir, "DONE", summary)
+                self._log("DONE", summary)
             # PHIL path: emit only the dataset list.  MR settings now live in
             # refine.phil (written by vic.process), so qrefine_input_parameters.txt
             # is legacy-only and intentionally not produced here.

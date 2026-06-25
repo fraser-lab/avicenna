@@ -74,7 +74,7 @@ def log_phil_diff(phil, omnibus_path):
         pass
 
 
-def wait_for_sentinel(omnibus_path, marker="[ sentinel ]", poll=5.0, timeout=3600):
+def wait_for_sentinel(omnibus_path, marker="[ sentinel ]", poll=3.0, timeout=3600):
     """Block until the completion sentinel records its marker in *omnibus_path*.
 
     The foreground watcher's done-detection is a file-structure sweep, but the
@@ -1569,7 +1569,17 @@ class Spinner:
             j = i % n
             sys.stdout.write(f"\033[{self.height}A" + self._draw(self._rows[j], self._chars[j]))
             sys.stdout.flush()
-        sys.stdout.write(f"\033[{self.height}A" + "   \n" * self.height)
+        # Clear the spinner area and park the cursor at the start of its first
+        # row WITHOUT a trailing newline, so the caller's next print() overwrites
+        # the spinner line in place instead of leaving a dead line behind it.
+        sys.stdout.write(f"\033[{self.height}A\r")
+        for r in range(self.height):
+            sys.stdout.write("\033[2K")
+            if r < self.height - 1:
+                sys.stdout.write("\033[1B")
+        if self.height > 1:
+            sys.stdout.write(f"\033[{self.height - 1}A")
+        sys.stdout.write("\r")
         sys.stdout.flush()
 
     def start(self):

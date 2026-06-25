@@ -8,6 +8,7 @@ import subprocess
 import sys
 sys.path.insert(0, str(pathlib.Path(__file__).parents[2]))
 from avicenna.utils.utils import format_log_line, QRefineWatcher, qsub_terse
+from avicenna.utils import resources
 
 parser = argparse.ArgumentParser(prog="vic.refine")
 parser.add_argument("-d", "--data", type=pathlib.Path,
@@ -595,6 +596,15 @@ class RunQRefine:
         self.model        = pathlib.Path(model) if model else None
         self.dry_run      = dry_run
         self.fill         = fill
+        # SGE slots per refinement job; "auto" -> 1 (REFMAC5 is serial).  The
+        # PHIL orchestrator overrides this from refine.ncpu.
+        self.ncpu         = "auto"
+
+    def _refine_slots(self):
+        """Resolve the -pe smp request for a refinement job."""
+        if resources.is_auto(self.ncpu):
+            return resources.refine_slots()
+        return int(self.ncpu)
 
     def _pin_ccp4_version(self):
         sbgrid_conf = pathlib.Path.home() / ".sbgrid.conf"
@@ -649,7 +659,7 @@ class RunQRefine:
             "#$ -cwd\n"
             f"#$ -t 1-{njob}\n"
             "#$ -j y\n"
-            "#$ -pe smp 1\n"
+            f"#$ -pe smp {self._refine_slots()}\n"
             "#$ -l mem_free=2G\n"
             "#$ -l h_rt=02:00:00\n"
             f"#$ -o {logs_dir}\n\n"

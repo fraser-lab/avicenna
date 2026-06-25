@@ -35,11 +35,10 @@ import pathlib
 import pkgutil
 import sys
 
-from avicenna.pipelines.jobbase import SubPipelineJob
+from avicenna.pipelines.jobbase import SubPipelineInterpreter
 from avicenna.pipelines.legacy.qrefine_pipeline import QRefineWorker, RunQRefine
 from avicenna.utils.phil.refine import RefinePHIL
 from avicenna.utils.software import find_ccp4, find_phenix, suite_setup_sources
-from avicenna.utils.utils import format_log_line
 
 
 # ---------------------------------------------------------------------------
@@ -65,7 +64,7 @@ def _build_registry() -> dict:
 # Interpreter
 # ---------------------------------------------------------------------------
 
-class RefinementPipelineInterpreter(SubPipelineJob):
+class RefinementPipelineInterpreter(SubPipelineInterpreter):
     """Iterate over the PHIL refine step sequence and execute each step.
 
     Parameters
@@ -81,14 +80,18 @@ class RefinementPipelineInterpreter(SubPipelineJob):
         self.params    = params
         self._registry = _build_registry()
 
-    def _log(self, tag, message, job_dir):
-        params = self.params
-        job_id = params.get("job_id", params.get("pin", "?"))
-        line   = format_log_line(tag, message, context=job_id,
-                                 context_width=params.get("context_width"))
-        with open(job_dir / "pipeline.log", "a") as fh:
-            fh.write(line)
-        print(line, end="", flush=True)
+    # -- logging + dispatch (see SubPipelineInterpreter) ---------------------
+
+    def _log_context(self):
+        return self.params.get("job_id", self.params.get("pin", "?"))
+
+    def _log_path(self):
+        return self._job_dir() / "pipeline.log"
+
+    def _invoke(self, step, ctx):
+        handler = self._registry[step.program]
+        return handler(step, ctx, self.params, self.params["suffix"],
+                       self._job_dir())
 
     # ------------------------------------------------------------------
     # Stall-watchdog hooks (see avicenna.pipelines.jobbase).  Refinement
@@ -116,7 +119,6 @@ class RefinementPipelineInterpreter(SubPipelineJob):
     def _run(self):
         params  = self.params
         suffix  = params["suffix"]
-        job_dir = pathlib.Path(params.get("job_dir", ".")).resolve()
 
         phil = RefinePHIL()
         if "phil_string" in params:
@@ -128,7 +130,7 @@ class RefinementPipelineInterpreter(SubPipelineJob):
         params["mr_pdb"] = phil._params.refine.input.reference_pdb
         steps = phil._params.refine.steps.step
 
-        self._log("START", f"suffix={suffix}", job_dir)
+        self._log("START", f"suffix={suffix}")
 
         ctx = {
             "last_by_program":    {},
@@ -137,62 +139,14 @@ class RefinementPipelineInterpreter(SubPipelineJob):
             "failed_steps":       set(),
         }
 
-        fatal_break = False
-
-        for step in steps:
-            program = step.program
-
-            # Branching guards
-            req_succeeded = step.run_if_succeeded
-            req_failed    = step.run_if_failed
-            if req_succeeded and req_succeeded not in ctx["completed_steps"]:
-                self._log("SKIP",
-                          f"{step.id}: skipped ('{req_succeeded}' has not succeeded)",
-                          job_dir)
-                ctx["failed_steps"].add(step.id)
-                continue
-            if req_failed and req_failed not in ctx["failed_steps"]:
-                self._log("SKIP",
-                          f"{step.id}: skipped ('{req_failed}' has not failed)",
-                          job_dir)
-                continue
-
-            handler = self._registry.get(program)
-            if handler is None:
-                self._log("ERROR",
-                          f"{step.id}: no backend registered for '{program}'",
-                          job_dir)
-                fatal_break = True
-                break
-
-            result  = handler(step, ctx, params, suffix, job_dir)
-            status  = result.get("status", "completed")
-            message = result.get("message", f"{step.id}: {status}")
-
-            if status == "completed":
-                self._log("RUN", f"{step.id}: {message}", job_dir)
-                ctx["last_by_program"][program] = step.id
-                ctx["history_by_program"].setdefault(program, []).append(step.id)
-                ctx.update(result.get("ctx_updates", {}))
-                ctx["completed_steps"].add(step.id)
-
-            elif status == "skipped":
-                self._log("SKIP", f"{step.id}: {message}", job_dir)
-                ctx["last_by_program"][program] = step.id
-                ctx["history_by_program"].setdefault(program, []).append(step.id)
-                ctx.update(result.get("ctx_updates", {}))
-                ctx["failed_steps"].add(step.id)
-
-            elif status == "error":
-                self._log("ERROR", f"{step.id}: {message}", job_dir)
-                ctx["failed_steps"].add(step.id)
-                if result.get("fatal", False):
-                    fatal_break = True
-                    break
-                # Non-fatal: log and continue
-
-        if not fatal_break:
-            self._log("DONE", f"suffix={suffix} complete", job_dir)
+        if not self._run_steps(steps, ctx):
+            # A backend (the final refmac step) may stash a resolution + R-stats
+            # summary for the completed job; append it when present.
+            summary = ctx.get("final_summary")
+            message = f"suffix={suffix} complete"
+            if summary:
+                message += f" — {summary}"
+            self._log("DONE", message)
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +209,8 @@ class RefinementOrchestrator(RunQRefine):
             phil.adopt_phil_string(phil_string)
         self._water         = phil._params.refine.water
         self._reference_pdb = phil._params.refine.input.reference_pdb
+        # Drive the -pe smp request from refine.ncpu (auto -> 1; REFMAC5 serial).
+        self.ncpu           = phil._params.refine.ncpu
 
     # --- input seams: source from refine.phil, ignore qrefine_input_parameters.txt ---
 

@@ -93,7 +93,7 @@ def _run_pointless(step, ctx, rp, pipeline_subdir):
 
     if prev_xds_id is None:
         return {"status": "error", "fatal": True,
-                "message": f"{step_id}: no prior XDS step succeeded"}
+                "message": f"no prior XDS step succeeded"}
 
     job_dir = pipeline_subdir / step_id
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -143,9 +143,9 @@ def _run_pointless(step, ctx, rp, pipeline_subdir):
     if not mtz.exists():
         err = _read_log_error(log_path)
         return {"status": "error", "fatal": True,
-                "message": f"{step_id}: Pointless failed: {err}"}
+                "message": f"Pointless failed: {err}"}
 
-    return {"status": "completed", "message": f"{step_id}: completed"}
+    return {"status": "completed", "message": f"completed"}
 
 
 def _run_aimless(step, ctx, rp, pipeline_subdir):
@@ -159,9 +159,9 @@ def _run_aimless(step, ctx, rp, pipeline_subdir):
     if not mtz.exists():
         err = _read_log_error(pipeline_subdir / step_id / f"{step_id}.log")
         return {"status": "error", "fatal": True,
-                "message": f"{step_id}: Aimless failed: {err}"}
+                "message": f"Aimless failed: {err}"}
 
-    return {"status": "completed", "message": f"{step_id}: completed"}
+    return {"status": "completed", "message": f"completed"}
 
 
 def _run_rfree(step, ctx, rp, pipeline_subdir):

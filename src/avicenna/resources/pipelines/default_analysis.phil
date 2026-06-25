@@ -32,7 +32,7 @@ analysis {
           ground_state_range = None
         }
         analyse {
-          cpus = 32
+          cpus = auto
           min_build_datasets = 30
           max_build_datasets = 50
           max_new_datasets = 1500

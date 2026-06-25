@@ -29,6 +29,7 @@ from pathlib import Path
 sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "src"))
 from avicenna.utils.utils import BRAVAIS_LATTICES, QRefineWriter, format_log_line, ProcessingWatcher, sg_lookup, count_hdf5_images, qsub_terse
 from avicenna.utils.software import find_xds, find_ccp4, find_phenix, suite_setup_sources
+from avicenna.utils import resources
 
 
 
@@ -96,7 +97,11 @@ class RunXDS(RunBase):
         self.image_dir         = Path(params.get("image_dir"))
         self.pipeline_subdir   = Path(params.get("pipeline_subdir"))
         self.image_range       = params.get("image_range", "").replace("-", " ")
+        # ncpu / xds_jobs are resolved to concrete ints at submit time (see
+        # RunProcess.run); kept raw here so a stray "auto" can still be resolved
+        # from the frame count in _set_xds_processors rather than crashing.
         self.ncpu              = params.get("ncpu", 8)
+        self.njobs             = params.get("xds_jobs", 1)
         self.force_integration = params.get("force_integration", "false")
         self.known_first_pass  = params.get("known_first_pass", "none")
         self.known_sg          = params.get("known_sg", "none")
@@ -236,6 +241,24 @@ class RunXDS(RunBase):
             text = re.sub(r"REFLECTING_RANGE=.*", reflecting_range, text)
             xds_inp.write_text(text)
 
+    def _xds_processor_settings(self):
+        """Return ``(processors, jobs)`` for this XDS run.
+
+        Normally both are concrete ints baked into params.json at submit time
+        (RunProcess.run).  If 'auto' leaks through (e.g. a direct/legacy caller),
+        size them here from the frame count of the range being processed so the
+        run never crashes on a string."""
+        procs, jobs = self.ncpu, self.njobs
+        if resources.is_auto(procs):
+            rng  = self.data_range if self.data_range != "false" else self.image_range
+            nums = [int(x) for x in str(rng).split() if x.lstrip("-").isdigit()]
+            if len(nums) >= 2:
+                frames = nums[-1] - nums[0] + 1
+            else:
+                frames = nums[0] if nums else 1
+            _, jobs, procs = resources.xds_slots(frames)
+        return int(procs), int(jobs)
+
     # ------------------------------------------------------------------
     # Scenario methods
     # ------------------------------------------------------------------
@@ -273,9 +296,16 @@ class RunXDS(RunBase):
         xds_inp = job_dir / "XDS.INP"
         text = xds_inp.read_text()
 
-        # Set number of processors
+        # Set the XDS parallelism.  MAXIMUM_NUMBER_OF_JOBS forks processes over
+        # frame batches (COLSPOT / INTEGRATE); MAXIMUM_NUMBER_OF_PROCESSORS
+        # threads within each (and drives the phases that do not fork).  Both are
+        # resolved from ncpu -- normally concrete ints baked at submit time, with
+        # an 'auto' fallback sized here from the frame count.
+        procs, jobs = self._xds_processor_settings()
         text = text.replace("MAXIMUM_NUMBER_OF_PROCESSORS=1",
-                            f"MAXIMUM_NUMBER_OF_PROCESSORS={self.ncpu}")
+                            f"MAXIMUM_NUMBER_OF_PROCESSORS={procs}")
+        text = text.replace("MAXIMUM_NUMBER_OF_JOBS=1",
+                            f"MAXIMUM_NUMBER_OF_JOBS={jobs}")
 
         # Override data range if specified
         if self.data_range != "false":
@@ -987,7 +1017,9 @@ class RunProcess:
         self._output_dir   = self.process_dir / "processing"
         self._logs_dir     = self.process_dir / "processing_logs"
         self.transfer_dir  = Path(params.get("image_dir", ""))
-        self.ncpu          = int(params.get("ncpu", 8))
+        # Kept raw: "auto" (the default) is resolved per dataset from the frame
+        # count at submit time (run); an explicit integer is used verbatim.
+        self.ncpu          = params.get("ncpu", "auto")
         self.indexing_images = params.get("indexing_images", "first_half")
         self.no_symmetry   = params.get("no_symmetry", "false")
         self.retry_mode    = params.get("retry_mode", params.get("try_alt_sym", "auto")).lower()
@@ -1258,8 +1290,13 @@ RunProcess(params).{method}()
 """)
         script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IRUSR | stat.S_IWUSR)
 
-    def _submit_sge_array(self, job_list_path, submit_script_path, h_rt="06:00:00", logs_dir=None):
-        """Write and qsub an SGE array job over the paths listed in job_list_path."""
+    def _submit_sge_array(self, job_list_path, submit_script_path, h_rt="06:00:00",
+                          logs_dir=None, slots=None):
+        """Write and qsub an SGE array job over the paths listed in job_list_path.
+
+        *slots* is the ``-pe smp`` request (one value for the whole array, so it
+        is the max of the per-dataset XDS sizing).  When None it falls back to
+        ``self.ncpu`` for an explicit override, or 1 when ncpu is 'auto'."""
         if not Path(job_list_path).is_file():
             print(f"No jobs found — {job_list_path} was not created. Check that datasets exist and have >= {self.MIN_IMAGES} images.")
             return
@@ -1267,6 +1304,8 @@ RunProcess(params).{method}()
         njob  = len(lines)
         if njob == 0:
             return
+        if slots is None:
+            slots = 1 if resources.is_auto(self.ncpu) else int(self.ncpu)
         logs_line = f"#$ -o {logs_dir}\n" if logs_dir else ""
         submit_script_path.write_text(
             "#!/bin/bash\n"
@@ -1274,7 +1313,7 @@ RunProcess(params).{method}()
             "#$ -cwd\n"
             f"#$ -t 1-{njob}\n"
             "#$ -j y\n"
-            f"#$ -pe smp {self.ncpu}\n"
+            f"#$ -pe smp {slots}\n"
             "#$ -l mem_free=2G\n"
             f"#$ -l h_rt={h_rt}\n"
             "#$ -l scratch=20G\n"
@@ -1374,8 +1413,11 @@ RunProcess(params).{method}()
         self._log(None, "REJECT", reason)
 
     def _aimless_summary(self, log_path):
-        """Extract SG, resolution, completeness, multiplicity, and Rpim
-        from the last 100 lines of an aimless log. Returns a string."""
+        """Extract resolution, SG, unit cell, completeness, Rpim, and CC1/2
+        from the last 100 lines of an aimless log. Returns a string.
+
+        Completeness, Rpim, and CC1/2 are read from the overall column (first
+        number); resolution is the high-resolution-limit (last column)."""
         summary = {}
         if not Path(log_path).is_file():
             return "completed"
@@ -1394,21 +1436,24 @@ RunProcess(params).{method}()
                 nums = [s for s in line.split() if s.replace(".", "", 1).isdigit()]
                 if nums:
                     summary["comp"] = nums[0]
-            if "Multiplicity" in line and "mult" not in summary:
-                nums = [s for s in line.split() if s.replace(".", "", 1).isdigit()]
-                if nums:
-                    summary["mult"] = nums[0]
             if "Rpim (within I+/I-)" in line and "rpim" not in summary:
                 nums = [s for s in line.split() if s.replace(".", "", 1).isdigit()]
                 if nums:
                     summary["rpim"] = nums[0]
+            # The summary block's CC1/2 row is "Mn(I) half-set correlation
+            # CC(1/2)  0.999  0.999  0.315"; "half-set correlation" uniquely
+            # identifies it (other CC(1/2) lines are table/graph headers).
+            if "half-set correlation" in line and "cchalf" not in summary:
+                nums = [s for s in line.split() if s.replace(".", "", 1).isdigit()]
+                if nums:
+                    summary["cchalf"] = nums[0]
         parts = []
-        if "sg"   in summary: parts.append(f"SG={summary['sg']}")
-        if "res"  in summary: parts.append(f"res={summary['res']}Å")
-        if "uc"   in summary: parts.append(f"UC={summary['uc']}")
-        if "comp" in summary: parts.append(f"comp={summary['comp']}")
-        if "mult" in summary: parts.append(f"mult={summary['mult']}")
-        if "rpim" in summary: parts.append(f"rpim={summary['rpim']}")
+        if "res"    in summary: parts.append(f"res={summary['res']}Å")
+        if "sg"     in summary: parts.append(f"SG={summary['sg']}")
+        if "uc"     in summary: parts.append(f"UC={summary['uc']}")
+        if "comp"   in summary: parts.append(f"comp={summary['comp']}")
+        if "rpim"   in summary: parts.append(f"rpim={summary['rpim']}")
+        if "cchalf" in summary: parts.append(f"CC½={summary['cchalf']}")
         return " ".join(parts) if parts else "completed"
 
     def _xds_error(self, pipeline_subdir, step_id):
@@ -1446,6 +1491,7 @@ RunProcess(params).{method}()
             shutil.rmtree(rejected_dir)
 
         sym_entries = self._known_symmetry_entries()
+        sge_slots   = 1   # max XDS slot count across the array (see -pe smp below)
 
         self._context_width = ProcessingWatcher(procpath=self._output_dir).context_width
 
@@ -1541,6 +1587,18 @@ RunProcess(params).{method}()
 
                 index_ranges = self._indexing_ranges(image_count, first_image)
 
+                # Resolve the XDS parallelism for this dataset.  auto sizes it
+                # from the frame count (split into forked jobs x threads); an
+                # explicit ncpu forces that many processors with one XDS job.
+                # The SGE slot request (-pe smp, one value for the whole array)
+                # is the max across all datasets, so no task is oversubscribed.
+                if resources.is_auto(self.ncpu):
+                    slots, xds_jobs, xds_procs = resources.xds_slots(image_count or 1)
+                else:
+                    xds_procs, xds_jobs = int(self.ncpu), 1
+                    slots = xds_procs
+                sge_slots = max(sge_slots, slots)
+
                 for sym in sym_entries:
                     crystal_number        = sym["crystal_number"]
                     refine_cell_integrate = sym["refine_cell_integrate"]
@@ -1580,6 +1638,8 @@ RunProcess(params).{method}()
                             "cell":                  "none",
                             "data_range":            data_range,
                             "data_format":           data_format,
+                            "ncpu":                  xds_procs,
+                            "xds_jobs":              xds_jobs,
                         }
                         self._write_worker_script(pipeline_subdir, per_params, method="run_single")
                         with open(qsub_list, "a") as fh:
@@ -1589,7 +1649,8 @@ RunProcess(params).{method}()
                     fh.write(f"{collection_id}_{series_key}\n")
 
         submit_sh = self.process_dir / "xds_pipeline_index_qsub_submit.sh"
-        job_id = self._submit_sge_array(qsub_list, submit_sh, h_rt="06:00:00", logs_dir=self._logs_dir)
+        job_id = self._submit_sge_array(qsub_list, submit_sh, h_rt="06:00:00",
+                                        logs_dir=self._logs_dir, slots=sge_slots)
         print(f"Done in {time.time() - _run_start:.1f}s")
         return job_id
 
@@ -1774,7 +1835,14 @@ RunProcess(params).{method}()
         self._log(pipeline_subdir, "FORCE",
                   f"submitting {len(sg_list)} job(s): {', '.join(sg_list)}")
         submit_sh = pipeline_subdir / "xds_pipeline_lattice_qsub_submit.sh"
-        self._submit_sge_array(lattice_list, submit_sh, h_rt="02:00:00", logs_dir=self._logs_dir)
+        # Forced jobs reuse the dataset's resolved XDS sizing (baked into params);
+        # the slot request is processors x jobs.
+        if resources.is_auto(params.get("ncpu", "auto")):
+            forced_slots = None
+        else:
+            forced_slots = int(params["ncpu"]) * int(params.get("xds_jobs", 1))
+        self._submit_sge_array(lattice_list, submit_sh, h_rt="02:00:00",
+                               logs_dir=self._logs_dir, slots=forced_slots)
 
     def run_single_forced(self):
         """

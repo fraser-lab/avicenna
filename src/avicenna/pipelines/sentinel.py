@@ -63,7 +63,8 @@ class PipelineSentinel:
     _SUBDIR = ""
     _TAG = "run"
     MARKER = "Run complete."
-    POLL_INTERVAL = 30          # seconds between is_running() sweeps
+    POLL_INTERVAL = 30          # seconds between sweeps while work is still running
+    CONFIRM_INTERVAL = 8        # seconds between the (idle) confirmation sweeps
     IDLE_CONFIRMATIONS = 2      # consecutive idle sweeps required to declare done
 
     def __init__(self, project_dir):
@@ -97,7 +98,12 @@ class PipelineSentinel:
         while idle < self.IDLE_CONFIRMATIONS:
             idle = 0 if self._watcher().is_running() else idle + 1
             if idle < self.IDLE_CONFIRMATIONS:
-                time.sleep(self.POLL_INTERVAL)
+                # Poll slowly while work remains (keeps NFS sweep load low over a
+                # long run); once the first idle sweep lands, confirm quickly so
+                # finalization isn't delayed by a full poll interval.  Stragglers
+                # (forced-integration arrays) run for minutes, so the short
+                # confirmation gap still catches them reliably.
+                time.sleep(self.CONFIRM_INTERVAL if idle else self.POLL_INTERVAL)
         try:
             self.on_complete()
         finally:

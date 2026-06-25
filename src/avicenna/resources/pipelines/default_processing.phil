@@ -37,7 +37,7 @@ processing {
     }
   }
   xds {
-    ncpu = 8
+    ncpu = auto
     detector_edge = 0.8
     res_limit = cc12
     scaling = correct
