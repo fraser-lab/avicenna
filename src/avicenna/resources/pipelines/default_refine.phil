@@ -1,5 +1,5 @@
 refine {
-  water = both
+  water = hoh
   ncpu = auto
   input {
     output_dir = "."

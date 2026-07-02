@@ -22,10 +22,10 @@ refine
   .short_caption = Refinement
   .help = Parameters for the crystallographic refinement sub-pipeline.
 {
-  water = *both hoh nohoh
+  water = *hoh nohoh
     .type = choice
     .short_caption = Water handling
-    .help = Refine with ordered waters retained (hoh), stripped (nohoh), or both as parallel jobs per dataset.
+    .help = Refine with ordered waters retained (hoh) or stripped (nohoh). A single variant is produced -- refine emits one canonical final_refined pdb/mtz pair, and the downstream analysis stage consumes exactly one. hoh is preferred: ordered solvent improves refinement (especially at high resolution), and a water-free model for panDDA is better obtained by stripping waters at the analysis stage (pandda.remove_waters) than by refining without them.
     .expert_level = 0
   ncpu = auto
     .type = int

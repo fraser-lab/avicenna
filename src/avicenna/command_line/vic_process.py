@@ -229,8 +229,6 @@ def main():
             if _auto_enable_known_symmetry(phil, _extras):
                 print("known_symmetry data supplied on CLI -> known_symmetry.enabled = True")
 
-        check_programs(phil._params.processing.programs)
-
         # PHIL input/output values take precedence; CLI args are the fallback.
         _pi = phil._params.processing.input
         _po = phil._params.processing.output
@@ -272,6 +270,12 @@ processing {{
             print(f"Written: {_TEMPLATE_PHIL}")
             print("Dry run complete.")
             sys.exit(0)
+
+        # Software check only on a real run (dry_run already exited above).
+        _steps = phil._params.processing.steps.step
+        check_programs(phil._params.processing.programs,
+                       used_programs={s.program for s in _steps},
+                       program_choices=set(phil._program_blocks))
 
         params = {}
         data_path = None
@@ -403,12 +407,12 @@ processing {{
                 print("Sentinel marker not seen within the timeout; it will still "
                       "finalize on the cluster (qrefine_list.txt + refine.phil).")
         watcher.print_summary(omnibus=omnibus)
-        # Display-only: show the live results table.  The authoritative filtered
-        # qrefine_list.txt + refine.phil are written by the sentinel on completion.
-        with contextlib.redirect_stdout(_Tee(sys.stdout, omnibus)):
-            scraper = ProcessingScraper(procpath)
-            scraper.scrape_all()
-            scraper.print_info()
+        # Short-form summary to the main log.  The full per-dataset table is a
+        # deep-analysis tool available via `vic.summary -V`.  The authoritative
+        # filtered qrefine_list.txt + refine.phil are written by the sentinel.
+        scraper = ProcessingScraper(procpath)
+        scraper.scrape_all()
+        scraper.print_summary(omnibus=omnibus)
     except KeyboardInterrupt:
         print("\nInterrupted. Any submitted jobs are still running on the cluster.")
         sys.exit(1)

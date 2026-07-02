@@ -226,7 +226,7 @@ class RefinementSentinel(PipelineSentinel):
         phil = AnalysisPHIL()
         phil.adopt_phil_string(
             f'analysis {{\n  input {{\n'
-            f'    data_directory = "{self.project_dir}"\n'
+            f'    input_datasets = "{self.project_dir}"\n'
             f'  }}\n}}\n'
         )
         (self.project_dir / "analysis.phil").write_text(phil.full_phil_string())

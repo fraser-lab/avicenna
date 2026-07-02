@@ -1,60 +1,26 @@
 import sys
 import argparse
 import pathlib
+from importlib.metadata import version, PackageNotFoundError
 sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "src"))
-from avicenna.pipelines.legacy.pandda_pipeline import PanDDAPreparer
+from avicenna.pipelines.analysis import AnalysisPipelineInterpreter
 from avicenna.utils.phil import AnalysisPHIL
 from avicenna.utils.software import check_programs
+
+try:
+    _version = version("avicenna")
+except PackageNotFoundError:
+    _version = "unknown"
 
 _DEFAULT_PHIL  = "analysis.phil"          # effective settings, written each run
 _TEMPLATE_PHIL = "analysis_default.phil"  # defaults template, written by --dry_run
 
-def _cpus_arg(value):
-    """argparse type for --cpus: a positive int, or the string 'auto'."""
-    if str(value).strip().lower() == "auto":
-        return "auto"
-    try:
-        n = int(value)
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"--cpus must be a positive integer or 'auto', got {value!r}")
-    if n < 1:
-        raise argparse.ArgumentTypeError("--cpus must be >= 1")
-    return n
-
-
 parser = argparse.ArgumentParser(prog="vic.analysis")
+parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {_version}")
 parser.add_argument("--settings", type=pathlib.Path, metavar="FILE",
                     help=f"PHIL settings file (default: auto-load {_DEFAULT_PHIL} if present)")
-parser.add_argument("--sources", nargs='+', type=pathlib.Path,
-                    metavar="DIR",
-                    help="Directories of completed qrefine jobs to concatenate")
-parser.add_argument("--prefix", type=str, default="FRS",
-                    help="Prefix for pandda dataset names (default: FRS)")
-parser.add_argument("--offset", type=int, default=0,
-                    help="Numbering offset (default: 0)")
-parser.add_argument("--suffix", choices=["hoh", "nohoh"], default="hoh",
-                    help="Which qrefine output to use (default: hoh)")
-parser.add_argument("--reference_pdb", type=pathlib.Path,
-                    help="Reference PDB for pandda.analyse")
-parser.add_argument("--reference_mtz", type=pathlib.Path,
-                    help="Reference MTZ for pandda.analyse")
-parser.add_argument("--ground_state_range", type=str, metavar="START-END",
-                    help="Dataset number range for ground state, e.g. '1-44'")
-parser.add_argument("--cpus", type=_cpus_arg, default="auto", metavar="N|auto",
-                    help="CPUs for pandda.analyse, or 'auto' to size from the "
-                         "dataset count (default: auto)")
-parser.add_argument("--min_build", type=int, default=30,
-                    help="min_build_datasets (default: 30)")
-parser.add_argument("--max_build", type=int, default=50,
-                    help="max_build_datasets (default: 50)")
-parser.add_argument("--max_new", type=int, default=1500,
-                    help="max_new_datasets (default: 1500)")
-parser.add_argument("--no_lr_comp_check", action="store_true",
-                    help="Disable low-resolution completeness check in pandda.analyse")
-parser.add_argument("--log_time_out", type=int, default=0, metavar="MINUTES",
-                    help="Stop waiting for pandda log after N minutes (default: 0 = no timeout)")
 parser.add_argument("--legacy", action="store_true",
-                    help="Use the hard-coded legacy pipeline instead of the PHIL-driven interpreter")
+                    help="Run pandda.analyse directly, bypassing the PHIL-driven interpreter")
 parser.add_argument("--dry_run", action="store_true",
                     help=f"Show what would be done without copying or submitting; writes {_TEMPLATE_PHIL}")
 _phil_group = parser.add_mutually_exclusive_group()
@@ -65,6 +31,10 @@ _phil_group.add_argument("-e", dest="phil_expert_level", type=int, metavar="LEVE
 parser.add_argument("-a", dest="phil_attrs", action="store_true",
                     help="Show PHIL parameter attributes (use with -c or -e)")
 
+# All run parameters live in the PHIL (see `vic.analysis -c`).  Pass overrides as
+# key=value tokens on the command line, e.g.:
+#   vic.analysis input.input_datasets=/path/to/refine_out pandda.analyse.cpus=32
+
 
 def _apply_phil_file(phil_obj, path: pathlib.Path):
     try:
@@ -74,71 +44,12 @@ def _apply_phil_file(phil_obj, path: pathlib.Path):
         sys.exit(f"ERROR: Invalid PHIL in {path}:\n  {e}")
 
 
-def _parse_ground_state_range(range_str):
-    start, _, end = range_str.partition('-')
-    return [f"x{i:04d}" for i in range(int(start), int(end) + 1)]
-
-
-def _build_pin_map(sources):
-    pin_map = {}
-    for src in sources:
-        list_file = pathlib.Path(src) / "qrefine_list.txt"
-        if not list_file.is_file():
-            continue
-        for line in list_file.read_text().splitlines():
-            parts = line.strip().split(',')
-            if not parts or not parts[0]:
-                continue
-            full_pin = parts[0]
-            p = full_pin.split('_')
-            if len(p) >= 3:
-                pin_map[full_pin] = '_'.join(p[-3:-1])
-    return pin_map
-
-
-def _write_analysis_phil(args, phil: AnalysisPHIL, target=_DEFAULT_PHIL):
-    lines = [
-        "analysis {", "  steps {", "    step {",
-        "      id = pandda1", "      program = pandda",
-        "      pandda {", "        input {",
-    ]
-    if args.sources:
-        sources_str = " ".join(f'"{s.resolve()}"' for s in args.sources)
-        lines.append(f"          sources = {sources_str}")
-    if args.reference_pdb:
-        lines.append(f'          reference_pdb = "{args.reference_pdb.resolve()}"')
-    if args.reference_mtz:
-        lines.append(f'          reference_mtz = "{args.reference_mtz.resolve()}"')
-    lines += [
-        "        }",
-        "        dataset {",
-        f'          prefix = "{args.prefix}"',
-        f"          offset = {args.offset}",
-        f"          suffix = {args.suffix}",
-    ]
-    if args.ground_state_range:
-        lines.append(f'          ground_state_range = "{args.ground_state_range}"')
-    lines += [
-        "        }",
-        "        analyse {",
-        f"          cpus = {args.cpus}",
-        f"          min_build_datasets = {args.min_build}",
-        f"          max_build_datasets = {args.max_build}",
-        f"          max_new_datasets = {args.max_new}",
-        f"          no_lr_comp_check = {args.no_lr_comp_check}",
-        "        }",
-        "        run {",
-        f"          log_time_out = {args.log_time_out}",
-        "        }",
-        "      }",
-        "    }",
-        "  }",
-        "}",
-    ]
-    phil.adopt_phil_string("\n".join(lines))
-    with open(target, "w") as _f:
-        _f.write(phil.full_phil_string())
-    print(f"Written: {target}")
+def _pandda_step(phil):
+    """First step whose program is pandda, or None."""
+    for s in phil._params.analysis.steps.step:
+        if s.program == "pandda":
+            return s
+    return None
 
 
 def main():
@@ -160,7 +71,8 @@ def main():
         elif pathlib.Path(_DEFAULT_PHIL).exists():
             _apply_phil_file(phil, pathlib.Path(_DEFAULT_PHIL))
 
-        # PHIL overrides given as CLI args (e.g. analysis.pandda1.analyser=pandda2).
+        # All run parameters are PHIL; leftover key=value tokens are PHIL overrides
+        # (e.g. input.input_datasets=<dir> pandda.analyse.cpus=32).
         _flags = [e for e in _extras if e.startswith("-")]
         if _flags:
             parser.error("unrecognized arguments: " + " ".join(_flags))
@@ -171,57 +83,44 @@ def main():
             except ValueError as e:
                 sys.exit(f"ERROR: {e}")
 
-        check_programs(phil._params.analysis.programs)
-
-        if not args.sources:
-            parser.error("--sources is required")
-
-        ground_state_datasets = []
-        if args.ground_state_range:
-            ground_state_datasets = _parse_ground_state_range(args.ground_state_range)
-        # On a real run, snapshot the effective PHIL (after CLI overrides) to
-        # analysis.phil before starting; analysis_default.phil (from --dry_run)
-        # stays the pristine template.  Written even if identical to the defaults.
-        if not args.dry_run and not args.legacy:
-            _write_analysis_phil(args, phil, _DEFAULT_PHIL)
-        if args.legacy:
-            PanDDAPreparer(
-                process_dirs=list(args.sources),
-                prefix=args.prefix,
-                offset=args.offset,
-                suffix=args.suffix,
-                reference_pdb=args.reference_pdb,
-                reference_mtz=args.reference_mtz,
-                ground_state_datasets=ground_state_datasets,
-                cpus=args.cpus,
-                min_build_datasets=args.min_build,
-                max_build_datasets=args.max_build,
-                max_new_datasets=args.max_new,
-                no_lr_comp_check=args.no_lr_comp_check,
-                log_time_out=args.log_time_out,
-                dry_run=args.dry_run,
-                pin_map=_build_pin_map(args.sources),
-            ).run()
-        else:                          # step #3: swap to AnalysisPipelineInterpreter
-            PanDDAPreparer(
-                process_dirs=list(args.sources),
-                prefix=args.prefix,
-                offset=args.offset,
-                suffix=args.suffix,
-                reference_pdb=args.reference_pdb,
-                reference_mtz=args.reference_mtz,
-                ground_state_datasets=ground_state_datasets,
-                cpus=args.cpus,
-                min_build_datasets=args.min_build,
-                max_build_datasets=args.max_build,
-                max_new_datasets=args.max_new,
-                no_lr_comp_check=args.no_lr_comp_check,
-                log_time_out=args.log_time_out,
-                dry_run=args.dry_run,
-                pin_map=_build_pin_map(args.sources),
-            ).run()
+        # --dry_run: just drop the template PHIL (whatever the CLI + defaults
+        # populated, even nothing) and exit.  No requirements, no software check,
+        # no run.
         if args.dry_run:
-            _write_analysis_phil(args, phil, _TEMPLATE_PHIL)
+            with open(_TEMPLATE_PHIL, "w") as _f:
+                _f.write(phil.full_phil_string())
+            print(f"Written: {_TEMPLATE_PHIL}")
+            return
+
+        _steps = phil._params.analysis.steps.step
+        check_programs(phil._params.analysis.programs,
+                       used_programs={s.program for s in _steps},
+                       program_choices=set(phil._program_blocks))
+
+        if not phil._params.analysis.input.input_datasets:
+            parser.error("analysis.input.input_datasets is required (path to the "
+                         "refine output). Set it in the PHIL or pass "
+                         "input.input_datasets=<dir>")
+
+        # Snapshot the effective PHIL for this run (after CLI overrides); the
+        # analysis_default.phil template is written only on --dry_run.
+        with open(_DEFAULT_PHIL, "w") as _f:
+            _f.write(phil.full_phil_string())
+        print(f"Wrote {_DEFAULT_PHIL} (effective settings for this run)")
+
+        if args.legacy:
+            from avicenna.utils.phil.analysis.pandda import make_preparer
+            step = _pandda_step(phil)
+            if step is None:
+                sys.exit("ERROR: --legacy supports program = pandda only")
+            try:
+                make_preparer(phil._params.analysis.input, step.pandda).run()
+            except ValueError as e:
+                sys.exit(f"ERROR: {e}")
+        else:
+            AnalysisPipelineInterpreter(
+                {"phil_string": phil.diff_phil_string()}
+            ).run()
     except KeyboardInterrupt:
         print("\nInterrupted.")
 

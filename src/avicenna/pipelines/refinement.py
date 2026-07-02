@@ -33,6 +33,7 @@ Context dict keys passed between handlers
 import importlib
 import pathlib
 import pkgutil
+import shutil
 import sys
 
 from avicenna.pipelines.jobbase import SubPipelineInterpreter
@@ -140,13 +141,55 @@ class RefinementPipelineInterpreter(SubPipelineInterpreter):
         }
 
         if not self._run_steps(steps, ctx):
-            # A backend (the final refmac step) may stash a resolution + R-stats
-            # summary for the completed job; append it when present.
-            summary = ctx.get("final_summary")
-            message = f"suffix={suffix} complete"
-            if summary:
-                message += f" — {summary}"
-            self._log("DONE", message)
+            # Publish the canonical output BEFORE announcing DONE: a failure to
+            # produce it leaves the next stage with no input, so it must mark the
+            # dataset FAILED (no DONE line) rather than report success.
+            if not self._finalize(suffix):
+                # A backend (the final refmac step) may stash a resolution +
+                # R-stats summary for the completed job; append it when present.
+                summary = ctx.get("final_summary")
+                message = f"suffix={suffix} complete"
+                if summary:
+                    message += f" — {summary}"
+                self._log("DONE", message)
+
+    def _finalize(self, suffix):
+        """Publish the refinement products under canonical fixed names so the
+        analysis sub-pipeline reads a stable filename regardless of which step
+        ran last (the sub-pipeline output contract).  Always runs after a
+        successful step sequence; it is not a user-configurable step.
+
+          final_refined.pdb  <-  final_{suffix}.pdb           (refmac final model)
+          final_refined.mtz  <-  final_{suffix}_filled.mtz    (filled: complete
+                                   low-resolution reflections for panDDA) when the
+                                   fill step produced it, else final_{suffix}.mtz
+                                   (plain refmac output).
+
+        The name carries no suffix: refine emits a single water variant
+        (refine.water is hoh or nohoh, never both), so exactly one pair exists.
+
+        Fails fast -- logs a terminal ERROR (so the watcher/sentinel see the
+        dataset FAILED) and returns True when the expected source is missing,
+        rather than silently handing the next stage nothing.  Returns False on
+        success.
+        """
+        job_dir = self._job_dir()
+        src_pdb = job_dir / f"final_{suffix}.pdb"
+        filled  = job_dir / f"final_{suffix}_filled.mtz"
+        plain   = job_dir / f"final_{suffix}.mtz"
+        src_mtz = filled if filled.is_file() else plain
+
+        missing = [p.name for p in (src_pdb, src_mtz) if not p.is_file()]
+        if missing:
+            self._log("ERROR", "finalize: canonical output source(s) missing: "
+                               + ", ".join(missing))
+            return True
+
+        shutil.copy2(src_pdb, job_dir / "final_refined.pdb")
+        shutil.copy2(src_mtz, job_dir / "final_refined.mtz")
+        self._log("RUN", "finalize: final_refined.pdb + final_refined.mtz "
+                         f"({'filled' if src_mtz is filled else 'refmac'} MTZ)")
+        return False
 
 
 # ---------------------------------------------------------------------------

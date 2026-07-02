@@ -13,6 +13,30 @@ from pathlib import Path
 from avicenna.utils.phil._base import PhilBase
 
 # ---------------------------------------------------------------------------
+# Ligand libraries -- single source of truth for both the ligand_library choice
+# (built into _HEADER) and resolve_ligand_libraries().
+# ---------------------------------------------------------------------------
+
+LIGAND_LIBRARIES = ("DSI_1", "DSI_2", "DSI_3", "EE", "UCSF91_1")
+_LIGAND_DEFAULT = "EE"
+_LIGAND_CHOICE = " ".join(f"*{lib}" if lib == _LIGAND_DEFAULT else lib
+                          for lib in LIGAND_LIBRARIES) + " all"
+
+
+def resolve_ligand_libraries(selected):
+    """Resolve a ``ligand_library`` selection (the list from choice(multi=True)).
+
+    ``"all"`` -- or an empty selection -- expands to every concrete library;
+    otherwise the selected libraries in canonical order.  Call this wherever
+    ligand libraries are consumed so ``"all"`` reliably overrides any other
+    starred choice.
+    """
+    sel = set(selected or [])
+    if not sel or "all" in sel:
+        return list(LIGAND_LIBRARIES)
+    return [lib for lib in LIGAND_LIBRARIES if lib in sel]
+
+# ---------------------------------------------------------------------------
 # Fixed sub-pipeline header
 # ---------------------------------------------------------------------------
 
@@ -23,12 +47,51 @@ analysis
 {
   input
     .short_caption = Input
-    .help = Input files for the analysis run.
+    .help = Input settings for the analysis run (apply to any density-analysis \
+            program).
   {
-    data_directory = None
+    input_datasets = None
       .type = path
-      .short_caption = Processed data directory
-      .help = Directory containing processed MTZ files from vic.process.
+      .short_caption = Input datasets
+      .help = Path to the density-analysis input datasets (the refinement \
+              sub-pipeline output). Required. Pre-populated automatically by \
+              vic.refine. Set manually for standalone runs.
+      .expert_level = 0
+    ground_state_datasets = None
+      .type = path
+      .short_caption = Ground-state datasets folder
+      .help = Optional path to a folder of diffraction datasets collected from \
+              ligand-free (apo) crystals. These become the leading PanDDA \
+              datasets and define dataset.ground_state_range and dataset.offset. \
+              Distinct from reference_pdb/reference_mtz, which are a single \
+              reference model.
+      .expert_level = 0
+    reference_pdb = None
+      .type = path
+      .short_caption = Reference PDB
+      .help = Optional path to a reference structure PDB for pandda.analyse. This \
+              is a single, pre-built model -- either pre-existing or generated \
+              specifically for the experiment -- NOT one of the ground-state \
+              datasets.
+      .expert_level = 0
+    reference_mtz = None
+      .type = path
+      .short_caption = Reference MTZ
+      .help = Optional path to the reference structure MTZ for pandda.analyse, \
+              paired with reference_pdb.
+      .expert_level = 0
+    ligands = None
+      .type = path
+      .short_caption = Ligand structures
+      .help = Optional path to ligand structures and their CIFs, organised by \
+              library and well code.
+      .expert_level = 0
+    ligand_library = {ligand_choice}
+      .type = choice(multi=True)
+      .short_caption = Ligand library
+      .help = Fragment library or libraries soaked into the crystals. Select one \
+              or more. "all" selects every library and overrides any other \
+              selection.
       .expert_level = 0
   }
   output
@@ -139,7 +202,7 @@ def _build_analysis_phil():
     names = list(all_programs.keys())
     choice = " ".join(f"*{n}" if i == 0 else n for i, n in enumerate(names))
     phil_def = (
-        _HEADER
+        _HEADER.replace("{ligand_choice}", _LIGAND_CHOICE)
         + _STEP_HEADER.replace("{choice}", choice)
         + "".join(all_programs.values())
         + _FOOTER

@@ -95,6 +95,7 @@ class AnalysisPipelineInterpreter(SubPipelineInterpreter):
         self._log("START", "analysis pipeline")
 
         ctx = {
+            "input":              phil._params.analysis.input,
             "last_by_program":    {},
             "history_by_program": {},
             "completed_steps":    set(),

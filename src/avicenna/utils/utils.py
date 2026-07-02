@@ -1,11 +1,13 @@
 import math
 import os
 import pathlib
+import re
+import statistics
 import sys
 import threading
 import time
 from datetime import datetime
-# import matplotlib.pyplot as plt
+from html import unescape as html_unescape
 
 # Suffixes appended to crystal directory names to indicate cell-refinement mode.
 # New data uses '_refined'; older data on disk may carry '_true', '_false', or '_both'.
@@ -335,7 +337,118 @@ class ScraperBase(object):
                 result['outcome'] = 'completed'
         self.results = results
 
+    # ------------------------------------------------------------------ #
+    # Standardized summary interface (shared by every sub-pipeline)       #
+    # ------------------------------------------------------------------ #
+    # Subclasses declare KEY_STATS as an ordered list of (label, fmt)
+    # tuples, where fmt is a printf-style format for both the median and
+    # its standard deviation (e.g. "%.3f").  _stat_values(result) returns
+    # {label: float} for one completed result (missing/unparseable stats
+    # are simply omitted).  The base class turns these into counts +
+    # median(stdev) for the short-form summary and works for ANY scraper.
+    KEY_STATS = []
+
+    # Headline label for the total-count line; overridable per pipeline.
+    TOTAL_LABEL = "Total datasets"
+
+    def _stat_values(self, result):
+        """Return {label: float} of numeric key stats for one completed result."""
+        return {}
+
+    def _summary_counts(self):
+        """Hook: pipeline-specific (label, value) count pairs shown after the
+        base counts and before the median block in print_summary().  Values are
+        runtime (computed while scraping), so this is a method rather than a
+        static attribute like KEY_STATS.  The base aligns them.  Default: none."""
+        return []
+
+    def get_counts(self):
+        """Return (total, successes, failed, rejected, unprocessed)."""
+        outcomes = [r.get('outcome') for r in self.results]
+        successes   = outcomes.count('completed')
+        failed      = outcomes.count('failed')
+        rejected    = outcomes.count('rejected')
+        unprocessed = outcomes.count('unprocessed')
+        return len(outcomes), successes, failed, rejected, unprocessed
+
+    def get_stat_summary(self):
+        """Return {label: (n, median, stdev)} over completed results.
+
+        stdev is the sample standard deviation, or None when fewer than two
+        values are available for that stat.
+        """
+        collected = {label: [] for label, _ in self.KEY_STATS}
+        for result in self.results:
+            if result.get('outcome') != 'completed':
+                continue
+            for label, value in self._stat_values(result).items():
+                if value is not None and label in collected:
+                    collected[label].append(value)
+        summary = {}
+        for label, _ in self.KEY_STATS:
+            vals = collected[label]
+            if not vals:
+                summary[label] = (0, None, None)
+            elif len(vals) == 1:
+                summary[label] = (1, vals[0], None)
+            else:
+                summary[label] = (len(vals), statistics.median(vals),
+                                  statistics.stdev(vals))
+        return summary
+
+    def print_summary(self, omnibus=None):
+        """Short-form summary: one item per line (slim for narrow terminals).
+
+        Wrapped in separators above and below.  When omnibus is given, the same
+        block is appended to that log file (so it lands in the main run log).
+        """
+        total, successes, failed, rejected, unprocessed = self.get_counts()
+        failures = failed + rejected
+        lines = [
+            f"Looking in {os.path.abspath(self.result_path)}",
+            f"{self.TOTAL_LABEL}: {total}",
+            f"Successes:      {successes}",
+            f"Failures:       {failures}  (failed {failed}, rejected {rejected})",
+        ]
+        if unprocessed:
+            lines.append(f"Unprocessed:    {unprocessed}")
+        extra = self._summary_counts()
+        if extra:
+            lines.append("")
+            width = max(len(label) for label, _ in extra) + 1
+            for label, value in extra:
+                lines.append(f"{(label + ':').ljust(width)} {value}")
+        if self.KEY_STATS:
+            lines.append("")
+            lines.append(f"Median (stdev) over {successes} successes:")
+            summary = self.get_stat_summary()
+            width = max(len(label) for label, _ in self.KEY_STATS) + 1
+            for label, fmt in self.KEY_STATS:
+                _, median, stdev = summary[label]
+                if median is None:
+                    value = "n/a"
+                elif stdev is None:
+                    value = f"{fmt % median} (n/a)"
+                else:
+                    value = f"{fmt % median} ({fmt % stdev})"
+                lines.append(f"{(label + ':').ljust(width)} {value}")
+        sep = "=" * max(len(line) for line in lines)
+        block = [sep] + lines + [sep]
+        for line in block:
+            print(line)
+        if omnibus:
+            with open(omnibus, "a") as fh:
+                fh.write("\n".join(block) + "\n")
+
     def print_info(self):
+        """Long-form per-dataset table, wrapped in separators with a path header."""
+        header = f"Looking in {os.path.abspath(self.result_path)}"
+        print("=" * len(header))
+        print(header)
+        self._print_table()
+        print("=" * len(header))
+
+    def _print_table(self):
         raise NotImplementedError
 
     @staticmethod
@@ -390,6 +503,41 @@ class ScraperBase(object):
 class ProcessingScraper(ScraperBase):
 
     _ERROR_PATTERNS = ('!!! ERROR', 'Error:', 'FATAL ERROR', 'Sorry:')
+
+    KEY_STATS = [
+        ('Resolution (Å)', '%.2f'),
+        ('Completeness',   '%.1f'),
+        ('Multiplicity',   '%.1f'),
+        ('CC1/2',          '%.3f'),
+        ('Rpim',           '%.3f'),
+        ('Mosaicity',      '%.2f'),
+    ]
+
+    @staticmethod
+    def _overall(value):
+        """First (overall) element of a scraped list-valued stat, as float."""
+        try:
+            return float(value[0])
+        except (TypeError, ValueError, IndexError):
+            return None
+
+    @staticmethod
+    def _scalar(value):
+        """Scraped single-valued stat as float, or None."""
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _stat_values(self, result):
+        return {
+            'Resolution (Å)': self._overall(result.get('High resolution limit')),
+            'Completeness':   self._overall(result.get('Completeness')),
+            'Multiplicity':   self._overall(result.get('Multiplicity')),
+            'CC1/2':          self._overall(result.get('Mn(I) half-set correlation CC(1/2)')),
+            'Rpim':           self._overall(result.get('Rpim (within I+/I-)')),
+            'Mosaicity':      self._scalar(result.get('Average mosaicity')),
+        }
 
     @staticmethod
     def _tail(path, n=50):
@@ -517,7 +665,6 @@ class ProcessingScraper(ScraperBase):
         return None, (None if force_dirs else index_path)
 
     def find_results(self):
-        print(f"Looking in {self.result_path}...")
         results = []
         for dataset_name in sorted(os.listdir(self.result_path)):
             dataset_path = os.path.join(self.result_path, dataset_name)
@@ -617,7 +764,7 @@ class ProcessingScraper(ScraperBase):
 
         return info_dict
 
-    def print_info(self):
+    def _print_table(self):
         HEADERS = ('Dataset', 'Type', 'SG', 'Cell', 'Res', 'Comp', 'Mult', 'CC1/2', 'Rpim', 'Note')
         tagged_rows = []
         for result in self.results:
@@ -687,6 +834,20 @@ class ProcessingScraper(ScraperBase):
 
 
 class QRefineScraper(ScraperBase):
+
+    KEY_STATS = [
+        ('Resolution (Å)', '%.2f'),
+        ('Rwork',          '%.4f'),
+        ('Rfree',          '%.4f'),
+    ]
+
+    def _stat_values(self, result):
+        return {
+            'Resolution (Å)': result.get('resolution'),
+            'Rwork':          result.get('rwork'),
+            'Rfree':          result.get('rfree'),
+        }
+
     def _parse_pdb_stats(self, pdb_path):
         """Extract Rwork, Rfree, and resolution from REMARK 3 in a PDB file."""
         rwork = rfree = res = None
@@ -712,7 +873,6 @@ class QRefineScraper(ScraperBase):
         return rwork, rfree, res
 
     def find_results(self):
-        print(f"Looking in {self.result_path}...")
         qrefine_dir = os.path.join(self.result_path, 'qrefine')
         results = []
         if not os.path.isdir(qrefine_dir):
@@ -757,7 +917,7 @@ class QRefineScraper(ScraperBase):
         info_dict['phaser']     = os.path.isfile(os.path.join(job_dir, f'02-phaser_{s}.1.pdb'))
         return info_dict
 
-    def print_info(self):
+    def _print_table(self):
         HEADERS = ('Job', 'Rwork', 'Rfree', 'Res', 'Phaser', 'Model', 'Note')
         tagged_rows = []
         for result in self.results:
@@ -855,6 +1015,274 @@ class ProcessingFilter(FilterBase):
 
 class RefinementFilter(FilterBase):
     """Filter and deduplicate refinement results. (Not yet implemented.)"""
+
+    def filter_quality(self, results):
+        raise NotImplementedError
+
+    def select_best(self, group):
+        raise NotImplementedError
+
+
+class _PanddaAnalysisBackend:
+    """PanDDA (pandda.analyse) backend for AnalysisScraper.
+
+    Layer 2 of the analysis scraper: knows the on-disk output layout of one
+    analysis program.  All per-dataset and project-level stats come from the
+    single formatted HTML summary that pandda.analyse writes at
+    ``pandda/analyses/html_summaries/pandda_analyse.html`` (the ``analyses``
+    component is a dated symlink, so this path resolves through it).  The
+    ``pandda/pandda.done`` marker is the completion gate.
+
+    parse() returns ``(datasets, summary)`` in the shape AnalysisScraper
+    expects: ``datasets`` is a list of per-dataset result dicts (each with an
+    ``outcome`` already set), and ``summary`` is a dict of project-level counts.
+
+    Adding another backend (e.g. pandda2) = write a sibling class with the same
+    ``name`` / ``detect`` / ``is_complete`` / ``parse`` interface and register
+    it in ``AnalysisScraper._BACKENDS``; AnalysisScraper itself is untouched.
+    """
+
+    name = "pandda"
+    HTML_RELPATH = ("pandda", "analyses", "html_summaries", "pandda_analyse.html")
+    DONE_RELPATH = ("pandda", "pandda.done")
+
+    # PanDDA "Overall" column value -> ScraperBase outcome.
+    _OUTCOME = {
+        "analysed":     "completed",
+        "not analysed": "failed",
+        "rejected":     "rejected",
+    }
+
+    def __init__(self, result_path):
+        self.result_path = str(result_path)
+        self.html_path = os.path.join(self.result_path, *self.HTML_RELPATH)
+        self.done_path = os.path.join(self.result_path, *self.DONE_RELPATH)
+
+    def detect(self):
+        """True when this backend's HTML summary exists under result_path."""
+        return os.path.isfile(self.html_path)
+
+    def is_complete(self):
+        """True when the pandda.done completion marker is present."""
+        return os.path.isfile(self.done_path)
+
+    # ---------------------------------------------------------------- #
+    # HTML parsing helpers                                             #
+    # ---------------------------------------------------------------- #
+    @staticmethod
+    def _cell_text(cell_html):
+        """Collapse one <td>/<th> inner-HTML to clean text."""
+        text = re.sub(r"<[^>]+>", " ", cell_html)
+        return re.sub(r"\s+", " ", html_unescape(text)).strip()
+
+    @classmethod
+    def _row_cells(cls, row_html):
+        return [cls._cell_text(c)
+                for c in re.findall(r"<t[hd][^>]*>(.*?)</t[hd]>", row_html,
+                                    re.S | re.I)]
+
+    @staticmethod
+    def _to_float(text):
+        try:
+            return float(text)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _cluster_count(text):
+        """'1 Clusters' -> 1, '' -> 0."""
+        m = re.match(r"\s*(\d+)", text or "")
+        return int(m.group(1)) if m else 0
+
+    def parse(self):
+        with open(self.html_path) as fh:
+            html = fh.read()
+        datasets = self._parse_datasets(html)
+        summary = self._parse_summary(html, datasets)
+        return datasets, summary
+
+    def _parse_datasets(self, html):
+        """Parse the per-dataset summary table into result dicts.
+
+        Columns are located by header name (not fixed position) so a future
+        pandda column reorder does not silently misread the table.
+        """
+        table = re.search(r"<table.*?</table>", html, re.S | re.I)
+        if not table:
+            return []
+        rows = re.findall(r"<tr.*?</tr>", table.group(0), re.S | re.I)
+        if not rows:
+            return []
+        header = [h.lower() for h in self._row_cells(rows[0])]
+        idx = {name: i for i, name in enumerate(header)}
+
+        def col(cells, name):
+            i = idx.get(name)
+            return cells[i] if i is not None and i < len(cells) else ""
+
+        results = []
+        for row in rows[1:]:
+            cells = self._row_cells(row)
+            if not cells:
+                continue
+            rfree = rwork = None
+            rr = col(cells, "rfree/rwork")
+            if "/" in rr:
+                a, b = rr.split("/", 1)
+                rfree, rwork = self._to_float(a), self._to_float(b)
+            overall = col(cells, "overall")
+            checks = col(cells, "dataset checks")
+            result_text = col(cells, "result")
+            results.append({
+                "dtag":            col(cells, "dataset"),
+                "checks":          checks,
+                "rfree":           rfree,
+                "rwork":           rwork,
+                "resolution":      self._to_float(col(cells, "resolution")),
+                "reference_rmsd":  self._to_float(col(cells, "reference rmsd")),
+                "map_uncertainty": self._to_float(col(cells, "map uncertainty")),
+                "clusters":        self._cluster_count(col(cells, "interesting areas")),
+                "result":          result_text,
+                "interesting":     result_text.lower() == "z-blobs found",
+                "outcome":         self._OUTCOME.get(overall.lower(), "failed"),
+            })
+        return results
+
+    def _parse_summary(self, html, datasets):
+        """Project-level counts, derived from the parsed rows plus the number
+        of 'Identified Site Summary (N)' sections (sites are not in the table).
+        """
+        site_nums = [int(n) for n in
+                     re.findall(r"Identified Site Summary \((\d+)\)", html)]
+        analysed = [d for d in datasets if d["outcome"] == "completed"]
+        return {
+            "total":          len(datasets),
+            "analysed":       len(analysed),
+            "not_analysed":   sum(1 for d in datasets if d["outcome"] == "failed"),
+            "rejected":       sum(1 for d in datasets if d["outcome"] == "rejected"),
+            "interesting":    sum(1 for d in datasets if d["interesting"]),
+            "clusters":       sum(d["clusters"] for d in datasets),
+            "sites":          max(site_nums) if site_nums else 0,
+            "failing_checks": sum(1 for d in datasets
+                                  if d["checks"] and d["checks"].lower() != "ok"),
+        }
+
+
+class AnalysisScraper(ScraperBase):
+    """Scrape analysis-pipeline results into the standardized summary interface.
+
+    Layer 1 (backend-agnostic): implements the ScraperBase contract
+    (find_results / scrape_all / _stat_values / _print_table) and a
+    project-level summary overlay via _summary_counts().  The actual
+    output discovery and parsing is delegated to a backend parser (Layer 2,
+    see _PanddaAnalysisBackend) selected by _select_backend(): an explicit
+    ``backend=`` wins, otherwise the first registered backend whose output is
+    present on disk, otherwise DEFAULT_BACKEND.  New analysis programs plug in
+    by registering a backend in _BACKENDS; this class does not change.
+    """
+
+    # backend name -> parser class (populated below, after the class body)
+    _BACKENDS = {}
+    DEFAULT_BACKEND = "pandda"
+
+    TOTAL_LABEL = "Total datasets"
+
+    KEY_STATS = [
+        ('Resolution (Å)',   '%.2f'),
+        ('RFree',            '%.3f'),
+        ('RWork',            '%.3f'),
+        ('Map Uncertainty',  '%.3f'),
+        ('Interesting areas', '%.1f'),
+    ]
+
+    def __init__(self, result_path, backend=None):
+        super().__init__(result_path)
+        self.backend_name = backend
+        self.backend = None
+        self.summary = {}
+
+    def _select_backend(self):
+        name = self.backend_name
+        if name is None:
+            for cand, cls in self._BACKENDS.items():
+                if cls(self.result_path).detect():
+                    name = cand
+                    break
+            else:
+                name = self.DEFAULT_BACKEND
+        cls = self._BACKENDS.get(name)
+        if cls is None:
+            raise ValueError(f"Unknown analysis backend {name!r} "
+                             f"(known: {', '.join(self._BACKENDS) or 'none'})")
+        return cls(self.result_path)
+
+    def find_results(self):
+        self.backend = self._select_backend()
+        if not self.backend.detect():
+            print(f"vic.summary: no {self.backend.name} analysis output found "
+                  f"under {os.path.abspath(str(self.result_path))}.")
+            return []
+        if not self.backend.is_complete():
+            print(f"vic.summary: {self.backend.name} run not finished "
+                  f"(no completion marker); reporting partial results.")
+        datasets, summary = self.backend.parse()
+        self.summary = summary
+        return datasets
+
+    def scrape_all(self):
+        # The backend parses every dataset from the single HTML summary in one
+        # pass and sets each outcome, so there is no per-log scrape step.
+        self.results = self.find_results()
+
+    def _stat_values(self, result):
+        clusters = result.get('clusters')
+        return {
+            'Resolution (Å)':   result.get('resolution'),
+            'RFree':            result.get('rfree'),
+            'RWork':            result.get('rwork'),
+            'Map Uncertainty':  result.get('map_uncertainty'),
+            # median over interesting datasets only: 0-cluster datasets return
+            # None here so they drop out of the median (an all-datasets median
+            # would just be 0 and carry no information).
+            'Interesting areas': clusters if clusters else None,
+        }
+
+    def _summary_counts(self):
+        s = self.summary
+        if not s:
+            return []
+        return [
+            ("Interesting (hits)", s.get('interesting', 0)),
+            ("Identified sites",   s.get('sites', 0)),
+            ("Total clusters",     s.get('clusters', 0)),
+            ("Failed checks",      s.get('failing_checks', 0)),
+        ]
+
+    def _print_table(self):
+        HEADERS = ('Dataset', 'Res', 'RFree', 'RWork', 'Clusters', 'Result')
+        tagged_rows = []
+        for r in self.results:
+            name = r.get('dtag') or '?'
+            if r['outcome'] == 'completed':
+                res    = f"{r['resolution']:.2f}A" if r.get('resolution') is not None else 'n/a'
+                rfree  = f"{r['rfree']:.3f}"        if r.get('rfree')      is not None else 'n/a'
+                rwork  = f"{r['rwork']:.3f}"        if r.get('rwork')      is not None else 'n/a'
+                clus   = str(r.get('clusters', 0))
+                result = r.get('result') or '-'
+                tagged_rows.append((False, (name, res, rfree, rwork, clus, result)))
+            else:
+                status = 'REJECTED' if r['outcome'] == 'rejected' else 'NOT ANALYSED'
+                tagged_rows.append((status, (name, r.get('checks', ''))))
+        self._print_table_mixed(tagged_rows, HEADERS)
+
+
+AnalysisScraper._BACKENDS = {
+    _PanddaAnalysisBackend.name: _PanddaAnalysisBackend,
+}
+
+
+class AnalysisFilter(FilterBase):
+    """Filter and deduplicate analysis results. (Not yet implemented.)"""
 
     def filter_quality(self, results):
         raise NotImplementedError

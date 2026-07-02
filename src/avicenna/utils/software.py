@@ -300,27 +300,45 @@ def suite_setup_sources(suite_bin_map: dict) -> tuple:
 # Pre-flight checker
 # ---------------------------------------------------------------------------
 
-def check_programs(programs_params) -> dict:
+def check_programs(programs_params, used_programs=None, program_choices=None) -> dict:
     """Locate all suites declared in a PHIL ``programs {}`` scope.
 
     Reads the software registry to discover how to find each suite.  Prints a
-    one-line summary per suite found, then either returns the results dict or
-    exits with a non-zero status if any required suite is missing.
+    one-line summary per suite found.  A missing suite is FATAL (exit non-zero)
+    unless it is an *unused alternative*: a selectable step-program that no step
+    in this run uses (e.g. ``pandda2`` when every step picks ``pandda``).  Those
+    are reported as a non-fatal WARNING -- they become required only if a step
+    selects them.
 
     Parameters
     ----------
     programs_params : freephil scope_extract
         The ``.programs`` sub-object from a pipeline PHIL parameter set.
+    used_programs : iterable[str] or None
+        Program names actually used by this run's steps (``step.program`` values).
+        When None, every listed suite is treated as required (legacy behaviour).
+    program_choices : iterable[str] or None
+        All selectable step-program names (the program-block keys).  A suite is
+        an "alternative" only if its name is among these.
 
     Returns
     -------
     dict[str, dict]
-        ``{suite_name: {"bin": Path, "version": str, ...}}`` for each suite.
+        ``{suite_name: {"bin": Path, "version": str, ...}}`` for each suite found.
     """
     registry = _registry_by_name()
-    found  = {}
-    errors = []
+    found    = {}
+    errors   = []
+    warnings = []
     reported = set()   # avoid double-printing companions
+
+    used    = set(used_programs)   if used_programs   is not None else None
+    choices = set(program_choices) if program_choices is not None else None
+
+    def _is_optional(name):
+        # Optional = a selectable step-program alternative that no step uses.
+        return (choices is not None and name in choices
+                and used is not None and name not in used)
 
     print("Software check:")
     for suite_name, entry in registry.items():
@@ -351,11 +369,19 @@ def check_programs(programs_params) -> dict:
                     found[comp] = {"bin": comp_bin, "version": comp_ver}
                     reported.add(comp)
                 except FileNotFoundError as exc:
-                    errors.append(str(exc))
+                    (warnings if _is_optional(comp) else errors).append(str(exc))
 
         except (FileNotFoundError, KeyError) as exc:
-            errors.append(str(exc))
+            (warnings if _is_optional(suite_name) else errors).append(str(exc))
 
+    if warnings:
+        bar = "!" * 72
+        print(f"\n{bar}")
+        print("WARNING: optional software not found -- no step in this run uses it "
+              "(it becomes required only if a step selects it):")
+        for msg in warnings:
+            print(f"  {msg.splitlines()[0]}")
+        print(f"{bar}\n")
     if errors:
         print("ERROR: Required software not found:")
         for msg in errors:

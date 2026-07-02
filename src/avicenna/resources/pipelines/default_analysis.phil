@@ -1,6 +1,11 @@
 analysis {
   input {
-    data_directory = None
+    input_datasets = None
+    ground_state_datasets = None
+    reference_pdb = None
+    reference_mtz = None
+    ligands = None
+    ligand_library = DSI_1 DSI_2 DSI_3 *EE UCSF91_1 all
   }
   output {
     directory = "."
@@ -19,17 +24,12 @@ analysis {
       id = 1_pandda
       program = pandda
       pandda {
-        analyser = pandda
-        input {
-          sources = None
-          reference_pdb = None
-          reference_mtz = None
-        }
+        prefix = VIC
+        copy_input = True
+        remove_waters = False
         dataset {
-          prefix = FRS
-          offset = 0
-          suffix = hoh
-          ground_state_range = None
+          offset = auto
+          ground_state_range = auto
         }
         analyse {
           cpus = auto

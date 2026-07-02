@@ -28,8 +28,6 @@ import freephil
 _SIMPLE = re.compile(r'^[a-zA-Z0-9_-]+$')
 # Reserved words that must be quoted when they appear as string values.
 _RESERVED = {'None', 'True', 'False'}
-# Strips freephil choice notation: '*selected other1 other2' → 'selected'
-_CHOICE_RE = re.compile(r'(=[ \t]*)(?:\w+[ \t]+)*\*(\w+)(?:[ \t]+\w+)*')
 
 
 def _val_str(v) -> str:
@@ -52,6 +50,24 @@ def _val_str(v) -> str:
     if _SIMPLE.match(s) and s not in _RESERVED:
         return s
     return f'"{s}"'
+
+
+def _render_value(obj, val) -> str:
+    """Format a leaf value, rendering a multi-choice as its full option menu.
+
+    A multi-choice (``.type = choice(multi=True)``) is emitted as every option
+    with ``*`` on the selected ones (e.g. ``DSI_1 DSI_2 *EE all``).  This keeps
+    the menu discoverable AND re-parses correctly -- a bare space-separated list
+    of values parses to an EMPTY selection in freephil.  Everything else falls
+    through to ``_val_str``.
+    """
+    t = getattr(obj, 'type', None)
+    if (t is not None and getattr(t, 'phil_type', None) == 'choice'
+            and getattr(t, 'multi', False)):
+        selected = set(val or [])
+        options  = [w.value.lstrip('*') for w in (obj.words or [])]
+        return ' '.join(f'*{o}' if o in selected else o for o in options)
+    return _val_str(val)
 
 
 def _quote(s) -> str:
@@ -135,7 +151,7 @@ def _format_scope(master_scope, extract, indent="", expert_level=None,
                 lines.extend(sub)
                 lines.append(f"{indent}}}")
         else:
-            lines.append(f"{indent}{name} = {_val_str(val)}")
+            lines.append(f"{indent}{name} = {_render_value(obj, val)}")
             if attributes:
                 lines.extend(_attr_lines(obj, ind2))
     return lines
@@ -170,7 +186,7 @@ def _format_step(master_scope, step_extract, indent="", expert_level=None,
                 lines.append(f"{indent}}}")
         else:
             if val is not None or name in always_show:
-                lines.append(f"{indent}{name} = {_val_str(val)}")
+                lines.append(f"{indent}{name} = {_render_value(obj, val)}")
                 if attributes:
                     lines.extend(_attr_lines(obj, ind2))
     return lines
@@ -200,5 +216,6 @@ def compact_phil_string(phil_base, expert_level=None, attributes=False) -> str:
     lines = _format_scope(phil_base._master, phil_base._params,
                           expert_level=expert_level, attributes=attributes,
                           program_blocks=getattr(phil_base, "_program_blocks", None))
-    text = "\n".join(lines) + "\n"
-    return _CHOICE_RE.sub(r'\1\2', text)
+    # Choice rendering (bare for single, full menu with stars for multi) is done
+    # per-value in _render_value; no post-pass over the assembled text is needed.
+    return "\n".join(lines) + "\n"

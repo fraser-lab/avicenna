@@ -122,7 +122,7 @@ Run with pre-written `pin_list.txt` and `xds_input_parameters.txt` files (see be
 AVICENNA will create a `processing` folder, in which it will store the processing software (`XDS`) output and the queue logs. Two programs can give some information about the results of the processing pipeline's work.
 
 - `vic.watch . -m`  -- issued from the root folder for this AVICENNA run, `vic.watch` will track progress in real time. **NOTE**: to run this (optional) program, open a new terminal and log in through there.
-- `vic.scrape .` -- issued from the root folder _after_ the run concludes, `vic.scrape` will scrape the logfiles and show a summary of the results.
+- `vic.summary .` -- issued from the root folder _after_ the run concludes, `vic.summary` will scrape the logfiles and show a summary of the results (counts plus medians of key stats). Add `-V`/`--verbose` for the full per-dataset table.
 
 
 ## Running the structure solution / refinement pipeline
@@ -199,4 +199,4 @@ You can monitor the in-progress run by opening a new terminal window, logging in
 AVICENNA creates a folder called `qrefine` under the root folder. It will have solved / refined structures that can serve as input into panDDA suite. As above, you can use two programs to monitor / analyze the output:
 
 - `vic.watch . -m --pipeline qrefine` - in a separate terminal window, can be used to monitor the run in progress
-- `vic.scrape . --pipeline qrefine` - after the run concludes, can be used to see the table of results
+- `vic.summary . -p refine` - after the run concludes, shows a summary of the results; add `-V`/`--verbose` for the table of results

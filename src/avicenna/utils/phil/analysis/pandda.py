@@ -1,8 +1,9 @@
-"""PanDDA event-map analysis backend for the analysis sub-pipeline.
+"""PanDDA 1 (pandda.analyse) backend for the analysis sub-pipeline.
 
-Supports pandda.analyse (PanDDA 1, bundled with CCP4 7.0) and
-pandda2.analyse (PanDDA 2, standalone install).  Select with the
-``analyser`` parameter in the step scope.
+Bundled with CCP4 7.0.  Selected by ``program = pandda`` at the step level
+(pandda2 is a sibling backend).  Program-agnostic input (the refine output,
+reference structure, ground-state datasets, ligands) lives in the shared
+``analysis.input`` scope.
 """
 
 SCOPE_NAME = "pandda"
@@ -11,56 +12,47 @@ PROGRAMS = {
     "pandda": """\
 pandda
   .short_caption = PanDDA Parameters
-  .help = Parameters for the PanDDA event-map analysis step.
+  .help = Parameters for the PanDDA (pandda.analyse) event-map analysis step.
 {
-  analyser = *pandda pandda2
-    .type = choice
-    .short_caption = PanDDA version
-    .help = Which PanDDA program to run: pandda (pandda.analyse, requires CCP4 7.0) or pandda2 (pandda2.analyse, standalone install).
+  prefix = "VIC"
+    .type = str
+    .short_caption = Dataset prefix
+    .help = Prefix applied to panDDA dataset names (e.g. VIC -> VIC_x0001). Code may substitute the protein of interest.
     .expert_level = 0
-  input
-    .short_caption = Input
-    .help = Source directories and reference structures.
-  {
-    sources = None
-      .type = strings
-      .short_caption = Source directories
-      .help = One or more directories of completed qRefine jobs to collect into the panDDA dataset.
-      .expert_level = 0
-    reference_pdb = None
-      .type = path
-      .short_caption = Reference PDB
-      .help = Reference PDB file for pandda.analyse.
-      .expert_level = 0
-    reference_mtz = None
-      .type = path
-      .short_caption = Reference MTZ
-      .help = Reference MTZ file for pandda.analyse.
-      .expert_level = 0
-  }
+  copy_input = True
+    .type = bool
+    .short_caption = Copy input
+    .help = True copies the input PDB/MTZ into pandda/data/<prefix>_x#### (conservative. duplicates the final PDB/MTZ per dataset). False creates symlinks to the originals instead (saves space, but the links break if the refine output is moved or deleted).
+    .expert_level = 1
+  remove_waters = False
+    .type = bool
+    .short_caption = Remove waters
+    .help = Strip ordered solvent (HOH records) from each input model before panDDA. A water-free model changes how pandda.analyse builds event maps. Doing it here -- rather than refining without waters -- keeps ordered solvent in refinement (where it helps, especially at high resolution) while still giving panDDA the water-free model. Only HOH is removed. ligands, ions, and structural cofactors are kept. When set, the model is written as a filtered copy even in symlink mode (copy_input=False).
+    .expert_level = 0
   dataset
     .short_caption = Dataset options
     .help = Controls dataset naming and selection.
   {
-    prefix = "FRS"
-      .type = str
-      .short_caption = Dataset prefix
-      .help = Prefix applied to panDDA dataset names (e.g. FRS -> FRS_x0001).
-      .expert_level = 0
-    offset = 0
+    offset = auto
       .type = int
       .short_caption = Numbering offset
-      .help = Integer offset applied to dataset serial numbers.
+      .help = Demarcation between the ground-state and the analysed (ligand) \
+              datasets. Ligand datasets are numbered starting at offset+1, so the \
+              leading offset slots are reserved for ground-state datasets. auto \
+              sets it to the number of ground-state datasets found in \
+              input.ground_state_datasets (contiguous packing). A user value \
+              supersedes the calculation and must be at least the number of \
+              ground-state datasets found.
       .expert_level = 1
-    suffix = *hoh nohoh
-      .type = choice
-      .short_caption = qRefine output variant
-      .help = Which qRefine output to use: with solvent (hoh) or without (nohoh).
-      .expert_level = 1
-    ground_state_range = None
+    ground_state_range = auto
       .type = str
       .short_caption = Ground-state range
-      .help = Dataset number range to treat as ground state, e.g. "1-44".
+      .help = Dataset tag range flagged to pandda.analyse as ground state, e.g. \
+              "x0001-x0030" (or "1-30"). auto flags every dataset found in \
+              input.ground_state_datasets. A user value supersedes the \
+              calculation and must fall within 1..offset (a value beyond offset \
+              is a terminal error). It is ignored when no ground-state folder is \
+              given.
       .expert_level = 0
   }
   analyse
@@ -119,67 +111,85 @@ pandda
 # Step execution
 # ---------------------------------------------------------------------------
 
-def _run_pandda(step, ctx):
-    """Run pandda.analyse via PanDDAPreparer."""
+def _build_pin_map(source):
+    """Map full_pin -> dataset_code from <source>/qrefine_list.txt (info.csv pin codes)."""
+    import pathlib
+    pin_map = {}
+    list_file = pathlib.Path(str(source)) / "qrefine_list.txt"
+    if not list_file.is_file():
+        return pin_map
+    for line in list_file.read_text().splitlines():
+        parts = line.strip().split(",")
+        if not parts or not parts[0]:
+            continue
+        full_pin = parts[0]
+        p = full_pin.split("_")
+        if len(p) >= 3:
+            pin_map[full_pin] = "_".join(p[-3:-1])
+    return pin_map
+
+
+def make_preparer(inp, p, dry_run=None):
+    """Build a PanDDAPreparer from the shared ``input`` scope and a ``pandda``
+    step block.  Shared by the interpreter (run_step) and the CLI --legacy path.
+
+    ``dry_run`` overrides ``p.run.dry_run`` when not None.  Raises ValueError if
+    ``input.input_datasets`` is unset or ``input.ground_state_datasets`` is set
+    but not a directory.  Offset / ground-state-range resolution (and their
+    validation) happens in PanDDAPreparer.run once the dataset counts are known.
+    """
+    import pathlib
     from avicenna.pipelines.legacy.pandda_pipeline import PanDDAPreparer
 
-    p = step.pandda
-    sources = list(p.input.sources or [])
-    if not sources:
-        return {"status": "error", "fatal": True,
-                "message": "input.sources is empty"}
+    source = getattr(inp, "input_datasets", None) if inp is not None else None
+    if not source:
+        raise ValueError("input.input_datasets is not set")
+    ref_pdb = getattr(inp, "reference_pdb", None) if inp is not None else None
+    ref_mtz = getattr(inp, "reference_mtz", None) if inp is not None else None
 
-    ground_state = []
-    if p.dataset.ground_state_range:
-        try:
-            lo, hi = (int(x) for x in p.dataset.ground_state_range.split("-"))
-            ground_state = list(range(lo, hi + 1))
-        except (ValueError, AttributeError):
-            pass
+    # Ground-state (apo) datasets live in their own folder, same layout as the
+    # input datasets (a project dir with qrefine/<job>/final_refined.{pdb,mtz}).
+    # When given, they become the leading PanDDA datasets; offset and the
+    # ground-state tag range are resolved against them in PanDDAPreparer.run.
+    gs_folder = getattr(inp, "ground_state_datasets", None) if inp is not None else None
+    gs_dirs = []
+    if gs_folder:
+        gs_path = pathlib.Path(str(gs_folder))
+        if not gs_path.is_dir():
+            raise ValueError(
+                f"input.ground_state_datasets is not a directory: {gs_folder}")
+        gs_dirs = [gs_path]
 
-    preparer = PanDDAPreparer(
-        process_dirs=sources,
-        prefix=p.dataset.prefix,
+    return PanDDAPreparer(
+        process_dirs=[source],
+        ground_state_dirs=gs_dirs,
+        prefix=p.prefix,
         offset=p.dataset.offset,
-        suffix=p.dataset.suffix,
-        reference_pdb=p.input.reference_pdb,
-        reference_mtz=p.input.reference_mtz,
-        ground_state_datasets=ground_state,
+        reference_pdb=ref_pdb,
+        reference_mtz=ref_mtz,
+        ground_state_range=p.dataset.ground_state_range,
+        copy_input=p.copy_input,
+        remove_waters=p.remove_waters,
         cpus=p.analyse.cpus,
         min_build_datasets=p.analyse.min_build_datasets,
         max_build_datasets=p.analyse.max_build_datasets,
         max_new_datasets=p.analyse.max_new_datasets,
         no_lr_comp_check=p.analyse.no_lr_comp_check,
         log_time_out=p.run.log_time_out,
-        dry_run=p.run.dry_run,
+        dry_run=p.run.dry_run if dry_run is None else dry_run,
+        pin_map=_build_pin_map(source),
     )
-    preparer.run()
-    return {"status": "completed", "message": "pandda.analyse finished"}
-
-
-def _run_pandda2(step, ctx):
-    """Run pandda2.analyse.
-
-    pandda2.analyse has a different CLI from pandda.analyse.
-    This handler is a placeholder; parameter mapping needs verification
-    against the installed pandda2 version before use.
-    """
-    raise NotImplementedError(
-        "pandda2.analyse support is not yet implemented. "
-        "Run pandda2.analyse manually or set analyser=pandda."
-    )
-
-
-_HANDLERS = {
-    "pandda":  _run_pandda,
-    "pandda2": _run_pandda2,
-}
 
 
 def run_step(step, ctx):
-    analyser = step.pandda.analyser
-    handler  = _HANDLERS.get(analyser)
-    if handler is None:
-        return {"status": "error", "fatal": True,
-                "message": f"unknown analyser '{analyser}'"}
-    return handler(step, ctx)
+    """Run pandda.analyse via PanDDAPreparer.
+
+    Program-agnostic input comes from the shared ``analysis.input`` scope,
+    passed in via ``ctx['input']`` by the interpreter.
+    """
+    try:
+        preparer = make_preparer(ctx.get("input"), step.pandda)
+        preparer.run()
+    except ValueError as e:
+        return {"status": "error", "fatal": True, "message": str(e)}
+    return {"status": "completed", "message": "pandda.analyse finished"}

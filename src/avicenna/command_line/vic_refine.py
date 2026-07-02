@@ -116,8 +116,6 @@ def main():
             except ValueError as e:
                 sys.exit(f"ERROR: {e}")
 
-        check_programs(phil._params.refine.programs)
-
         # Inject the resolved run paths so the written PHIL is self-contained.
         _input_snap = f"""\
 refine {{
@@ -135,6 +133,12 @@ refine {{
                 _f.write(phil.full_phil_string())
             print(f"Written: {_TEMPLATE_PHIL}")
             return
+
+        # Software check only on a real run (dry_run never needs the programs).
+        _steps = phil._params.refine.steps.step
+        check_programs(phil._params.refine.programs,
+                       used_programs={s.program for s in _steps},
+                       program_choices=set(phil._program_blocks))
 
         sentinel_submitted = False
         if args.legacy:
@@ -209,9 +213,11 @@ refine {{
                 print("Sentinel marker not seen within the timeout; it will still "
                       "finalize on the cluster (analysis.phil).")
         watcher.print_summary(omnibus=omnibus)
+        # Short-form summary to the main log; the full table is a deep-analysis
+        # tool available via `vic.summary -p refine -V`.
         scraper = QRefineScraper(procpath)
         scraper.scrape_all()
-        scraper.print_info()
+        scraper.print_summary(omnibus=omnibus)
     except KeyboardInterrupt:
         print("\nInterrupted. Any submitted jobs are still running on the cluster.")
         sys.exit(1)

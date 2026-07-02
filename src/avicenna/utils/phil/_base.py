@@ -1,16 +1,35 @@
 """PhilBase: abstract base class for all Avicenna PHIL parameter objects."""
 
 import re
+import sys
 from pathlib import Path
 
 import freephil
 
 
 def _simplify_choices(s: str) -> str:
-    """Collapse freephil choice params from 'word *selected word' to 'selected'."""
+    """Collapse freephil choice notation in a PHIL string.
+
+    A single selection ('a *b c') becomes 'b' (bare -- re-parses for single- and
+    multi-choice alike).  Multiple selections ('*a b *c') become '*a *c': the
+    stars are REQUIRED for a multi-choice to re-parse to more than one value
+    (bare space-separated values parse to an empty selection).  A value run with
+    no '*' is left untouched.  Dotted option names (e.g. phenix.phaser) are
+    handled.
+    """
     s = re.sub(r'[ \t]*\\\n[ \t]*', ' ', s)  # join explicit continuation lines first
-    # Use [ \t] (not \s) so the pattern never crosses a newline into the next param
-    return re.sub(r'(=[ \t]*)(?:\w+[ \t]+)*\*(\w+)(?:[ \t]+\w+)*', r'\1\2', s)
+
+    def _repl(m):
+        prefix, value = m.group(1), m.group(2)
+        starred = [t[1:] for t in value.split() if t.startswith('*')]
+        if not starred:
+            return m.group(0)                       # no selection marker -> as-is
+        if len(starred) == 1:
+            return prefix + starred[0]              # single -> bare value
+        return prefix + ' '.join('*' + v for v in starred)  # multi -> keep stars
+
+    # Use [ \t] (not \s) so a value run never crosses a newline into the next param.
+    return re.sub(r'(=[ \t]*)((?:\*?[\w.]+[ \t]*)+)', _repl, s)
 
 
 def _choice_names_from_def(phil_def: str) -> frozenset:
@@ -69,6 +88,21 @@ def _source_step_id(step_obj):
     """Value of the ``id`` definition inside a parsed step scope, or None."""
     for o in step_obj.objects:
         if o.name == "id" and not hasattr(o, "objects") and o.words:
+            return o.words[0].value
+    return None
+
+
+def _source_step_program(step_obj):
+    """Value of the ``program`` definition inside a parsed step scope, or None.
+
+    Handles choice rendering (``program = *selected other``): the starred token
+    is the selected value.  A plain assignment returns its single value.
+    """
+    for o in step_obj.objects:
+        if o.name == "program" and not hasattr(o, "objects") and o.words:
+            for w in o.words:
+                if w.value.startswith("*"):
+                    return w.value[1:]
             return o.words[0].value
     return None
 
@@ -193,13 +227,67 @@ class PhilBase:
                 by_id[_source_step_id(o)] = o
         for us in [o for o in usr_steps.objects if o.name == "step"]:
             sid = _source_step_id(us)
-            match = by_id.get(sid)
+            if sid is not None:
+                match = by_id.get(sid)
+            else:
+                # A CLI override (e.g. ``pandda.analyse.cpus=32``) arrives as a
+                # step with no id.  Match it to the unique existing step whose
+                # program owns the block it carries, so the override lands on the
+                # real step instead of appending an orphan.  Ambiguous (a program
+                # used by several steps) or unmatched -> warn loudly and leave it
+                # unmatched; the user must name the step by id.  freephil's own
+                # .multiple merge does this inconsistently (works when several
+                # steps exist, not for a lone step).
+                candidates = self._candidate_steps_for(cur_steps, us)
+                if len(candidates) == 1:
+                    match = candidates[0]
+                else:
+                    match = None
+                    self._warn_unmatched_step(us, candidates)
             if match is not None:
                 _source_overlay(match, us)
             else:
                 cur_steps.objects.append(us)
                 by_id[sid] = us
         usr_steps.objects = [o for o in usr_steps.objects if o.name != "step"]
+
+    def _candidate_steps_for(self, cur_steps, user_step):
+        """Current steps whose selected program owns a block present in the
+        id-less *user_step*.  Empty if the step carries no program block."""
+        user_blocks = {o.name for o in user_step.objects if hasattr(o, "objects")}
+        if not user_blocks:
+            return []
+        candidates = []
+        for o in cur_steps.objects:
+            if o.name != "step":
+                continue
+            prog = _source_step_program(o)
+            block = self._program_blocks.get(prog, prog)
+            if block in user_blocks:
+                candidates.append(o)
+        return candidates
+
+    def _warn_unmatched_step(self, user_step, candidates):
+        """Print a prominent stderr warning when an id-less step override could
+        not be applied -- so an eaten parameter is never silent."""
+        blocks = sorted(o.name for o in user_step.objects if hasattr(o, "objects"))
+        if not blocks:
+            return  # nothing block-like to attribute the override to
+        block = ", ".join(blocks)
+        if candidates:
+            ids = ", ".join(str(_source_step_id(c)) for c in candidates)
+            why = (f"its program runs in {len(candidates)} steps ({ids}), so the "
+                   f"target is ambiguous. Name the step by id, e.g. add "
+                   f"`steps.step.id=<one of: {ids}>` to the override")
+        else:
+            why = (f"no step in this pipeline runs the '{block}' program "
+                   f"(check the program name and that a step uses it)")
+        bar = "!" * 72
+        print(f"\n{bar}\n"
+              f"WARNING: PHIL override for '{block}' was IGNORED (not applied to any step).\n"
+              f"  {why}.\n"
+              f"{bar}\n",
+              file=sys.stderr, flush=True)
 
     # ------------------------------------------------------------------
     # Properties

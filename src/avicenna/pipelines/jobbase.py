@@ -209,6 +209,14 @@ class SubPipelineInterpreter(SubPipelineJob):
         ctx must already carry the bookkeeping sets/maps (``last_by_program``,
         ``history_by_program``, ``completed_steps``, ``failed_steps``)."""
         for step in steps:
+            # Every legitimate step has an id.  An id=None step is a stray CLI
+            # override that could not be matched to a real step (see
+            # PhilBase._merge_user_steps); never run it -- that would duplicate a
+            # program (e.g. a second PanDDA pass).
+            if not step.id:
+                self._log("SKIP", "unnamed step (id=None) skipped -- a CLI "
+                                  "override could not be matched to a step")
+                continue
             if self._pre_step(step, ctx):
                 continue
 
