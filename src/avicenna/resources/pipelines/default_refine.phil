@@ -4,7 +4,6 @@ refine {
   input {
     output_dir = "."
     dataset_list = "qrefine_list.txt"
-    params_file = "qrefine_input_parameters.txt"
     reference_mtz = None
     reference_pdb = None
   }

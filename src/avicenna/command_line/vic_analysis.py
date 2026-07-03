@@ -19,8 +19,6 @@ parser = argparse.ArgumentParser(prog="vic.analysis")
 parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {_version}")
 parser.add_argument("--settings", type=pathlib.Path, metavar="FILE",
                     help=f"PHIL settings file (default: auto-load {_DEFAULT_PHIL} if present)")
-parser.add_argument("--legacy", action="store_true",
-                    help="Run pandda.analyse directly, bypassing the PHIL-driven interpreter")
 parser.add_argument("--dry_run", action="store_true",
                     help=f"Show what would be done without copying or submitting; writes {_TEMPLATE_PHIL}")
 _phil_group = parser.add_mutually_exclusive_group()
@@ -42,14 +40,6 @@ def _apply_phil_file(phil_obj, path: pathlib.Path):
         print(f"Loaded settings from {path}")
     except RuntimeError as e:
         sys.exit(f"ERROR: Invalid PHIL in {path}:\n  {e}")
-
-
-def _pandda_step(phil):
-    """First step whose program is pandda, or None."""
-    for s in phil._params.analysis.steps.step:
-        if s.program == "pandda":
-            return s
-    return None
 
 
 def main():
@@ -108,19 +98,9 @@ def main():
             _f.write(phil.full_phil_string())
         print(f"Wrote {_DEFAULT_PHIL} (effective settings for this run)")
 
-        if args.legacy:
-            from avicenna.utils.phil.analysis.pandda import make_preparer
-            step = _pandda_step(phil)
-            if step is None:
-                sys.exit("ERROR: --legacy supports program = pandda only")
-            try:
-                make_preparer(phil._params.analysis.input, step.pandda).run()
-            except ValueError as e:
-                sys.exit(f"ERROR: {e}")
-        else:
-            AnalysisPipelineInterpreter(
-                {"phil_string": phil.diff_phil_string()}
-            ).run()
+        AnalysisPipelineInterpreter(
+            {"phil_string": phil.diff_phil_string()}
+        ).run()
     except KeyboardInterrupt:
         print("\nInterrupted.")
 

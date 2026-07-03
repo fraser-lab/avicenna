@@ -8,7 +8,6 @@ import time
 from importlib.metadata import version, PackageNotFoundError
 sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "src"))
 from avicenna.utils.utils import QRefineWatcher, QRefineScraper, QRefineWriter, ProgressBar, log_phil_diff, wait_for_sentinel
-from avicenna.pipelines.legacy.qrefine_pipeline import RunQRefine
 from avicenna.pipelines.refinement import RefinementOrchestrator
 from avicenna.pipelines.sentinel import RefinementSentinel
 from avicenna.utils.phil import RefinePHIL
@@ -32,13 +31,8 @@ parser.add_argument("-o", "--output", type=pathlib.Path,
 parser.add_argument("-l", "--list", type=pathlib.Path,
                     default=pathlib.Path("qrefine_list.txt"),
                     help="Dataset list file (default: qrefine_list.txt)")
-parser.add_argument("-p", "--params", type=pathlib.Path,
-                    default=pathlib.Path("qrefine_input_parameters.txt"),
-                    help="MR parameter file (default: qrefine_input_parameters.txt)")
 parser.add_argument("--dry_run", action="store_true",
-                    help=f"Scan processing output and write qrefine_list.txt, qrefine_input_parameters.txt, and {_TEMPLATE_PHIL} without submitting jobs")
-parser.add_argument("--legacy", action="store_true",
-                    help="Use the hard-coded legacy pipeline instead of the PHIL-driven interpreter")
+                    help=f"Scan processing output and write qrefine_list.txt and {_TEMPLATE_PHIL} without submitting jobs")
 parser.add_argument("--silent", action="store_true",
                     help="Submit jobs without tailing the log")
 parser.add_argument("--no-prog-log", dest="no_prog_log", action="store_true",
@@ -122,7 +116,6 @@ refine {{
   input {{
     output_dir = "{pathlib.Path(args.output).resolve()}"
     dataset_list = "{args.list}"
-    params_file = "{args.params}"
   }}
 }}"""
 
@@ -141,51 +134,40 @@ refine {{
                        program_choices=set(phil._program_blocks))
 
         sentinel_submitted = False
-        if args.legacy:
-            RunQRefine(
-                process_dir=args.output,
-                dataset_list=args.list,
-                params_file=args.params,
-                dry_run=False,
-                fill=not args.no_fill,
-            ).run()
-        else:
-            if args.no_fill:
-                # Disable any fill step in the PHIL so the interpreter skips it
-                # (the legacy `fill` constructor flag has no effect on this path).
-                fill_ids = [s.id for s in phil._params.refine.steps.step
-                            if s.program == "fill"]
-                steps = "".join(
-                    f"    step {{\n"
-                    f"      id = {sid}\n"
-                    f"      program = fill\n"
-                    f"      fill {{ enabled = False }}\n"
-                    f"    }}\n"
-                    for sid in fill_ids
-                )
-                if steps:
-                    phil.adopt_phil_string(f"refine {{\n  steps {{\n{steps}  }}\n}}\n")
-            # Snapshot the effective PHIL for this run (after CLI overrides), with
-            # the resolved run paths injected.  Written on every run, even when
-            # identical to the defaults; refine_default.phil stays the template.
-            phil.adopt_phil_string(_input_snap)
-            with open(_DEFAULT_PHIL, "w") as _f:
-                _f.write(phil.full_phil_string())
-            print(f"Wrote {_DEFAULT_PHIL} (effective settings for this run)")
-            log_phil_diff(phil, os.path.join(os.path.abspath(args.output), "qrefine.log"))
-            main_job_id = RefinementOrchestrator(
-                process_dir=args.output,
-                dataset_list=args.list,
-                params_file=args.params,
-                dry_run=False,
-                fill=not args.no_fill,
-                phil_string=phil.diff_phil_string(),
-            ).run()
-            # Finalization (scrape + analysis.phil) runs on job completion via an
-            # SGE sentinel, so it survives --silent / a dropped connection.
-            if main_job_id:
-                RefinementSentinel(os.path.abspath(args.output)).submit(main_job_id)
-                sentinel_submitted = True
+        if args.no_fill:
+            # Disable any fill step in the PHIL so the interpreter skips it.
+            fill_ids = [s.id for s in phil._params.refine.steps.step
+                        if s.program == "fill"]
+            steps = "".join(
+                f"    step {{\n"
+                f"      id = {sid}\n"
+                f"      program = fill\n"
+                f"      fill {{ enabled = False }}\n"
+                f"    }}\n"
+                for sid in fill_ids
+            )
+            if steps:
+                phil.adopt_phil_string(f"refine {{\n  steps {{\n{steps}  }}\n}}\n")
+        # Snapshot the effective PHIL for this run (after CLI overrides), with
+        # the resolved run paths injected.  Written on every run, even when
+        # identical to the defaults; refine_default.phil stays the template.
+        phil.adopt_phil_string(_input_snap)
+        with open(_DEFAULT_PHIL, "w") as _f:
+            _f.write(phil.full_phil_string())
+        print(f"Wrote {_DEFAULT_PHIL} (effective settings for this run)")
+        log_phil_diff(phil, os.path.join(os.path.abspath(args.output), "qrefine.log"))
+        main_job_id = RefinementOrchestrator(
+            process_dir=args.output,
+            dataset_list=args.list,
+            dry_run=False,
+            fill=not args.no_fill,
+            phil_string=phil.diff_phil_string(),
+        ).run()
+        # Finalization (scrape + analysis.phil) runs on job completion via an
+        # SGE sentinel, so it survives --silent / a dropped connection.
+        if main_job_id:
+            RefinementSentinel(os.path.abspath(args.output)).submit(main_job_id)
+            sentinel_submitted = True
 
         if args.silent:
             return

@@ -139,7 +139,7 @@ def make_preparer(inp, p, dry_run=None):
     validation) happens in PanDDAPreparer.run once the dataset counts are known.
     """
     import pathlib
-    from avicenna.pipelines.legacy.pandda_pipeline import PanDDAPreparer
+    from avicenna.utils.phil.analysis.pandda_preparer import PanDDAPreparer
 
     source = getattr(inp, "input_datasets", None) if inp is not None else None
     if not source:

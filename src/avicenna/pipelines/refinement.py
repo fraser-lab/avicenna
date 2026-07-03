@@ -1,8 +1,8 @@
 """PHIL-driven pipeline interpreter for the structure-refinement sub-pipeline.
 
-Parallel to ``qrefine_pipeline.RunQRefineJob``, which is retained for
-comparison.  This interpreter replaces ``RunQRefineJob.run()`` on compute
-nodes; the outer orchestration (dataset list, SGE submission) is unchanged.
+Runs the refinement steps on the compute node; the outer orchestration
+(dataset list, SGE submission) lives in ``refinement_runner.RunQRefine``, which
+``RefinementOrchestrator`` below subclasses.
 
 Backend interface
 -----------------
@@ -37,7 +37,7 @@ import shutil
 import sys
 
 from avicenna.pipelines.jobbase import SubPipelineInterpreter
-from avicenna.pipelines.legacy.qrefine_pipeline import QRefineWorker, RunQRefine
+from avicenna.pipelines.refinement_runner import QRefineWorker, RunQRefine
 from avicenna.utils.phil.refine import RefinePHIL
 from avicenna.utils.software import find_ccp4, find_phenix, suite_setup_sources
 
@@ -201,7 +201,7 @@ class _InterpreterWorker(QRefineWorker):
 
     Overrides the three hooks added to the base worker: it injects the user's
     ``phil_string`` into params, sources CCP4/Phenix setup scripts (for CLIBD
-    and friends) after SBGrid, and swaps RunQRefineJob for the PHIL interpreter.
+    and friends) after SBGrid, and runs the PHIL interpreter on the compute node.
     """
 
     def __init__(self, dataset, mr_params, context_width=None, fill=True,
@@ -239,9 +239,9 @@ class RefinementOrchestrator(RunQRefine):
     settings come from refine.phil, NOT qrefine_input_parameters.txt.
     """
 
-    def __init__(self, process_dir, dataset_list, params_file, data=None,
+    def __init__(self, process_dir, dataset_list, data=None,
                  model=None, dry_run=False, fill=True, phil_string=None):
-        super().__init__(process_dir, dataset_list, params_file, data=data,
+        super().__init__(process_dir, dataset_list, data=data,
                          model=model, dry_run=dry_run, fill=fill)
         self.phil_string = phil_string
         self.CCP4_BIN   = find_ccp4()[0]

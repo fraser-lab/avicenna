@@ -283,36 +283,6 @@ class DataFinder(object):
         return self.pin_list, self.image_dir, self.paths[0]
 
 
-class ParamWriter(object):
-    def __init__(self, args):
-        dst = str(args.data)[:-1] if str(args.data).endswith('/') else str(args.data)
-        self.main_path = os.path.abspath(dst)
-
-    def build_parameters(self):
-        image_dir = os.path.dirname(self.main_path)
-        xds_params = {
-            'script_dir':            '../scripts',
-            'image_dir':             image_dir,
-            'detector_edge':         '0.8',
-            'indexing_images':       'first_half',
-            'on_indexing_failure':   'auto',
-            'retry_mode':            'auto',
-            'on_integration_failure': 'reject',
-            'ncpu':                  '8',
-            'no_symmetry':           'false',
-            'scaling':               'correct',
-            'recycle_xds':           'false',
-            'refine_cell_integrate': 'true',
-            'res_limit':             'cc12',
-            'cleanup':               'partial',
-        }
-        xds_param_filepath = f"{os.path.abspath(os.curdir)}/xds_input_parameters.txt"
-        print(xds_param_filepath)
-        with open(xds_param_filepath, 'w') as xpf:
-            for key, value in xds_params.items():
-                xpf.write(f"{key}={value}\n")
-
-
 class ScraperBase(object):
     def __init__(self, result_path):
         self.result_path = result_path
@@ -2031,23 +2001,8 @@ class Spinner:
 class QRefineWriter:
     """
     Scans a completed XDS pipeline output directory, then writes
-    qrefine_list.txt and qrefine_input_parameters.txt.
-
-    qrefine_list.txt             — one row per completed job (MTZ file found)
-    qrefine_input_parameters.txt — one ## crystal ## block per unique
-                                   crystal_name; mr_pdb is a placeholder.
+    qrefine_list.txt (one row per completed job -- MTZ file found).
     """
-
-    _DEFAULT_PARAMS = [
-        ('mr_pdb',          '/path/to/reference.pdb'),
-        ('mr_cutoff',       '0.45'),
-        ('mr_water',        'both'),
-        ('mr_tncs',         'false'),
-        ('mr_copies',       '1'),
-        ('mr_mw',           '100000'),
-        ('mr_seq_id',       '1.0'),
-        ('mr_try_monomer',  'false'),
-    ]
 
     def __init__(self, process_dir):
         self.process_dir = pathlib.Path(process_dir).resolve()
@@ -2098,18 +2053,5 @@ class QRefineWriter:
                 fh.write(f"{pin},{crystal_name},{cell_refined},{index},{integration}\n")
         print(str(out))
 
-    def write_qrefine_input_parameters(self, path=None):
-        entries = self._find_completed()
-        seen = dict.fromkeys(e[1] for e in entries)   # unique crystal_names, insertion order
-        out = pathlib.Path(path) if path else self.process_dir / 'qrefine_input_parameters.txt'
-        with open(out, 'w') as fh:
-            for crystal_name in seen:
-                fh.write('## crystal ##\n')
-                fh.write(f'crystal_name={crystal_name}\n')
-                for key, val in self._DEFAULT_PARAMS:
-                    fh.write(f'{key}={val}\n')
-        print(str(out))
-
     def write(self):
         self.write_qrefine_list()
-        self.write_qrefine_input_parameters()

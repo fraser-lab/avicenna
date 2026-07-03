@@ -4,8 +4,6 @@ import stat
 import subprocess
 import time
 
-_src_dir = str(pathlib.Path(__file__).parents[3] / "src")
-
 from avicenna.utils import resources
 
 

@@ -958,7 +958,7 @@ class RunProcess:
 
     Intended to be importable and callable from other modules::
 
-        from avicenna.pipelines.proc_pipeline import RunProcess
+        from avicenna.pipelines.processing_runner import RunProcess
         proc = RunProcess(params)
         proc.run()
 
@@ -980,7 +980,8 @@ class RunProcess:
       5.  Write and submit xds_pipeline_index_qsub_submit.sh as an SGE array
           (-t 1-N); each task cd's into its pipeline_subdir and calls run_pipeline.py.
 
-    run_single() — sequential per-dataset pipeline:
+    Per-dataset pipeline (executed by ProcessingPipelineInterpreter on the
+    compute node):
       Normal indexing path (1_xds produces XDS_ASCII.HKL):
         1_xds   RunXDS.xds_initial_indexing
         2_pointless  RunPointless  (free SG choice)
@@ -999,7 +1000,7 @@ class RunProcess:
       Forced integration path (on_indexing_failure=retry; 1_xds produces
       XPARM.XDS but not XDS_ASCII.HKL):
         Submits a new SGE job per candidate SG (controlled by retry_mode).
-        run_single_forced() runs the same step sequence with xds_forced_integration
+        The forced path runs the same step sequence with xds_forced_integration
         and all Pointless steps as free runs (prev_aimless_id=None); 7_xds
         always runs (no skip check).
     """
@@ -1240,55 +1241,6 @@ class RunProcess:
                 number, name = sg_list[0]
                 return [("1", name, str(number), cell.replace(" ", "-"))]
         return []
-
-    def _write_worker_script(self, pipeline_subdir, per_params, method="run_single"):
-        """
-        Serialise per_params to params.json and write a run_pipeline.py that
-        imports this module and calls RunProcess(params).{method}().
-        """
-        sh_sources, csh_sources = suite_setup_sources({
-            "ccp4":   self.CCP4_BIN,
-            "phenix": self.PHENIX_BIN,
-        })
-        _sh_extra  = "".join(f" && source {p}" for p in sh_sources)
-        _csh_extra = "".join(f" && source {p}" for p in csh_sources)
-
-        Path(pipeline_subdir, "params.json").write_text(
-            json.dumps(per_params, indent=2, default=str)
-        )
-        script = Path(pipeline_subdir) / "run_pipeline.py"
-        script.write_text(f"""\
-#!/usr/bin/env python3
-import json, os, subprocess, sys
-from pathlib import Path
-sys.path.insert(0, {self._src_dir!r})
-from avicenna.pipelines.legacy.proc_pipeline import RunProcess
-
-shell = os.environ.get('SHELL', '/bin/bash')
-if any(s in shell for s in ('csh', 'tcsh')):
-    _sbgrid_cmd = "tcsh -c 'source /programs/sbgrid.cshrc{_csh_extra} && env'"
-else:
-    _sbgrid_cmd = "bash --norc --noprofile -c 'source /programs/sbgrid.shrc{_sh_extra} && env'"
-_result = subprocess.run(_sbgrid_cmd, shell=True, capture_output=True, text=True)
-for _line in _result.stdout.splitlines():
-    if '=' in _line:
-        _key, _, _val = _line.partition('=')
-        if _key.isidentifier():
-            os.environ[_key] = _val
-
-params = json.loads(Path('params.json').read_text())
-print("=" * 60)
-print(f"pin          : {{params.get('pin', 'n/a')}}")
-print(f"dataset      : {{params.get('pin_id', 'n/a')}}")
-print(f"image_dir    : {{params.get('image_dir', 'n/a')}}")
-print(f"image_range  : {{params.get('image_range', 'n/a')}}")
-print(f"workdir      : {{params.get('pipeline_subdir', 'n/a')}}")
-print(f"space_group  : {{params.get('sg', 'n/a')}}")
-print(f"cell         : {{params.get('cell', 'n/a')}}")
-print("=" * 60, flush=True)
-RunProcess(params).{method}()
-""")
-        script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IRUSR | stat.S_IWUSR)
 
     def _submit_sge_array(self, job_list_path, submit_script_path, h_rt="06:00:00",
                           logs_dir=None, slots=None):
@@ -1654,134 +1606,6 @@ RunProcess(params).{method}()
         print(f"Done in {time.time() - _run_start:.1f}s")
         return job_id
 
-    def run_single(self):
-        """
-        Sequential pipeline for one dataset. Called by run_pipeline.py on a
-        compute node.
-
-        Steps 1–6 always run if XDS succeeds. Step 7_xds (symmetry refinement)
-        runs only when the CC½ resolution from 6_aimless improved over 3_aimless.
-        Steps 10_rfree and 11_xtriage always run on the best available output.
-        """
-        params          = self.params
-        pipeline_subdir = Path(params["pipeline_subdir"])
-        sg   = params.get("known_sg", "none")
-        cell = params.get("known_cell", "none")
-        self._log(pipeline_subdir, "START",
-                  f"{params.get('pin_id','?')} | {pipeline_subdir.parent.name} | sg={sg} cell={cell}")
-
-        self._setup_scratch(params)
-
-        on_fail = params.get("on_indexing_failure", "auto").lower()
-        if on_fail == "auto":
-            on_fail = "bypass" if sg != "none" else "retry"
-
-        # 1_xds: initial indexing
-        self._xds("1_xds", params, "xds_initial_indexing")
-
-        if not self._xds_ascii_ok(pipeline_subdir, "1_xds"):
-            xparm         = (pipeline_subdir / "1_xds" / "XPARM.XDS").is_file()
-            integrate_hkl = (pipeline_subdir / "1_xds" / "INTEGRATE.HKL").is_file()
-            err = self._xds_error(pipeline_subdir, "1_xds") or "XDS did not produce XDS_ASCII.HKL"
-            self._log(pipeline_subdir, "ERROR", f"1_xds: {err}")
-
-            if xparm and not integrate_hkl and on_fail == "retry":
-                self._log(pipeline_subdir, "FORCE", "submitting forced integration jobs")
-                self._run_forced_integration(params, pipeline_subdir)
-                return
-            elif xparm and not integrate_hkl and on_fail == "bypass":
-                self._log(pipeline_subdir, "BYPASS",
-                          "1_xds: re-running in-place: JOB= DEFPIX INTEGRATE CORRECT")
-                self._xds("1_xds", params, "xds_bypass_indexing_failure")
-                if not self._xds_ascii_ok(pipeline_subdir, "1_xds"):
-                    self._log(pipeline_subdir, "ERROR",
-                              f"1_xds: {self._xds_error(pipeline_subdir, '1_xds') or 'bypass failed'}")
-                    return
-                self._log(pipeline_subdir, "RUN", "1_xds: completed (bypass)")
-            else:
-                return
-        else:
-            self._log(pipeline_subdir, "RUN", "1_xds: completed")
-
-        # 2_pointless: first pass, Pointless chooses SG freely
-        self._pointless("2_pointless", params,
-                        prev_xds_id="1_xds", prev_aimless_id=None)
-        self._log(pipeline_subdir, "RUN", "2_pointless: completed")
-
-        # 3_aimless: no resolution cutoff
-        self._aimless("3_aimless", params,
-                      prev_pointless_id="2_pointless", prev_aimless_id=None,
-                      apply_res_cutoff=False)
-        self._log(pipeline_subdir, "RUN", "3_aimless: completed")
-
-        # 4_xds: recycle refined detector geometry from 1_xds
-        self._xds("4_xds", params, "xds_recycle_detector", prev_xds_id="1_xds")
-
-        if not self._xds_ascii_ok(pipeline_subdir, "4_xds"):
-            self._log(pipeline_subdir, "ERROR",
-                      f"4_xds: {self._xds_error(pipeline_subdir, '4_xds') or 'unknown error'}")
-            return
-
-        self._log(pipeline_subdir, "RUN", "4_xds: completed")
-
-        # 5_pointless: enforce SG from 3_aimless
-        self._pointless("5_pointless", params,
-                        prev_xds_id="4_xds", prev_aimless_id="3_aimless")
-        self._log(pipeline_subdir, "RUN", "5_pointless: completed")
-
-        # 6_aimless: CC½ cutoff derived from 3_aimless
-        self._aimless("6_aimless", params,
-                      prev_pointless_id="5_pointless", prev_aimless_id="3_aimless",
-                      apply_res_cutoff=True)
-        self._log(pipeline_subdir, "RUN", "6_aimless: completed")
-
-        def _cc12(log_path):
-            for line in Path(log_path).read_text().splitlines():
-                if "0.30: limit =" in line:
-                    return line.split("=", 1)[1].split("A")[0].strip()
-            return "0.00"
-
-        res_lim_6 = _cc12(pipeline_subdir / "6_aimless" / "6_aimless.log")
-        res_lim_3 = _cc12(pipeline_subdir / "3_aimless" / "3_aimless.log")
-
-        last_aimless_id = "6_aimless"
-        last_xds_id     = "4_xds"
-
-        if float(res_lim_6) > float(res_lim_3):
-            self._log(pipeline_subdir, "RUN",
-                      f"resolution improved ({res_lim_3} → {res_lim_6} Å), running symmetry refinement")
-            self._xds("7_xds", params, "xds_refine_symmetry",
-                      prev_xds_id="4_xds",
-                      prev_aimless_id="6_aimless",
-                      prev_pointless_id="5_pointless")
-
-            if self._xds_ascii_ok(pipeline_subdir, "7_xds"):
-                self._log(pipeline_subdir, "RUN", "7_xds: completed")
-
-                self._pointless("8_pointless", params,
-                                prev_xds_id="7_xds", prev_aimless_id="6_aimless")
-                self._log(pipeline_subdir, "RUN", "8_pointless: completed")
-
-                self._aimless("9_aimless", params,
-                              prev_pointless_id="8_pointless", prev_aimless_id="6_aimless",
-                              apply_res_cutoff=True)
-                self._log(pipeline_subdir, "RUN", "9_aimless: completed")
-
-                last_aimless_id = "9_aimless"
-                last_xds_id     = "7_xds"
-            else:
-                self._log(pipeline_subdir, "ERROR",
-                          f"7_xds: {self._xds_error(pipeline_subdir, '7_xds') or 'unknown error'}")
-
-        self._rfree("10_rfree", params, prev_aimless_id=last_aimless_id)
-        self._log(pipeline_subdir, "RUN", "10_rfree: completed")
-        self._xtriage("11_xtriage", params, prev_xds_id=last_xds_id)
-
-        summary = self._aimless_summary(
-            pipeline_subdir / last_aimless_id / f"{last_aimless_id}.log")
-        self._log(pipeline_subdir, "DONE", summary)
-        QRefineWriter(params["process_dir"]).write()
-
     def _run_forced_integration(self, params, pipeline_subdir, retry_mode=None):
         """
         Enumerate candidate space groups and submit a second SGE array for
@@ -1843,98 +1667,3 @@ RunProcess(params).{method}()
             forced_slots = int(params["ncpu"]) * int(params.get("xds_jobs", 1))
         self._submit_sge_array(lattice_list, submit_sh, h_rt="02:00:00",
                                logs_dir=self._logs_dir, slots=forced_slots)
-
-    def run_single_forced(self):
-        """
-        Forced-integration pipeline for one candidate space group. Called by
-        run_pipeline.py inside a {prefix}_{sg}_force/ directory.
-
-        Runs all three XDS rounds unconditionally (no skip check for 7_xds),
-        because symmetry was externally imposed and a fixed three-round protocol
-        is appropriate.
-        """
-        params          = self.params
-        pipeline_subdir = Path(params["pipeline_subdir"])
-        sg   = params.get("sg", "none")
-        cell = params.get("cell", "none")
-        self._log(pipeline_subdir, "START",
-                  f"{params.get('pin_id','?')} | {pipeline_subdir.name} | sg={sg} cell={cell}")
-
-        self._setup_scratch(params)
-
-        # 1_xds: forced integration
-        self._xds("1_xds", params, "xds_forced_integration")
-
-        if not self._xds_ascii_ok(pipeline_subdir, "1_xds"):
-            self._log(pipeline_subdir, "ERROR",
-                      f"1_xds: {self._xds_error(pipeline_subdir, '1_xds') or 'XDS did not produce XDS_ASCII.HKL'}")
-            return
-
-        self._log(pipeline_subdir, "RUN", "1_xds: completed")
-
-        # 2_pointless: first pass
-        self._pointless("2_pointless", params,
-                        prev_xds_id="1_xds", prev_aimless_id=None)
-        self._log(pipeline_subdir, "RUN", "2_pointless: completed")
-
-        # 3_aimless: no cutoff
-        self._aimless("3_aimless", params,
-                      prev_pointless_id="2_pointless", prev_aimless_id=None,
-                      apply_res_cutoff=False)
-        self._log(pipeline_subdir, "RUN", "3_aimless: completed")
-
-        # 4_xds: recycle detector geometry
-        self._xds("4_xds", params, "xds_recycle_detector", prev_xds_id="1_xds")
-
-        if not self._xds_ascii_ok(pipeline_subdir, "4_xds"):
-            self._log(pipeline_subdir, "ERROR",
-                      f"4_xds: {self._xds_error(pipeline_subdir, '4_xds') or 'unknown error'}")
-            return
-
-        self._log(pipeline_subdir, "RUN", "4_xds: completed")
-
-        # 5_pointless: free run — forced SG may differ from the true SG found by 2_pointless
-        self._pointless("5_pointless", params,
-                        prev_xds_id="4_xds", prev_aimless_id=None)
-        self._log(pipeline_subdir, "RUN", "5_pointless: completed")
-
-        # 6_aimless: with cutoff
-        self._aimless("6_aimless", params,
-                      prev_pointless_id="5_pointless", prev_aimless_id="3_aimless",
-                      apply_res_cutoff=True)
-        self._log(pipeline_subdir, "RUN", "6_aimless: completed")
-
-        # 7_xds: refine symmetry (always runs for forced path)
-        self._xds("7_xds", params, "xds_refine_symmetry",
-                  prev_xds_id="4_xds",
-                  prev_aimless_id="6_aimless",
-                  prev_pointless_id="5_pointless")
-
-        if not self._xds_ascii_ok(pipeline_subdir, "7_xds"):
-            self._log(pipeline_subdir, "ERROR",
-                      f"7_xds: {self._xds_error(pipeline_subdir, '7_xds') or 'unknown error'}")
-            return
-
-        self._log(pipeline_subdir, "RUN", "7_xds: completed")
-
-        # 8_pointless: free run — all forced-path Pointless steps are SG-agnostic
-        self._pointless("8_pointless", params,
-                        prev_xds_id="7_xds", prev_aimless_id=None)
-        self._log(pipeline_subdir, "RUN", "8_pointless: completed")
-
-        # 9_aimless
-        self._aimless("9_aimless", params,
-                      prev_pointless_id="8_pointless", prev_aimless_id="6_aimless",
-                      apply_res_cutoff=True)
-        self._log(pipeline_subdir, "RUN", "9_aimless: completed")
-
-        # 10_rfree
-        self._rfree("10_rfree", params, prev_aimless_id="9_aimless")
-        self._log(pipeline_subdir, "RUN", "10_rfree: completed")
-
-        # 11_xtriage
-        self._xtriage("11_xtriage", params, prev_xds_id="7_xds")
-
-        self._log(pipeline_subdir, "DONE",
-                  self._aimless_summary(pipeline_subdir / "9_aimless" / "9_aimless.log"))
-        QRefineWriter(params["process_dir"]).write()

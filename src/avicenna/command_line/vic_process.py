@@ -5,12 +5,10 @@ import re
 import sys
 import argparse
 import pathlib
-import subprocess
 import time
 from importlib.metadata import version, PackageNotFoundError
 sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "src"))
-from avicenna.utils.utils import DataFinder, ParamWriter, Watcher, ProcessingScraper, ProgressBar, log_phil_diff, wait_for_sentinel
-from avicenna.pipelines.legacy.proc_pipeline import RunProcess
+from avicenna.utils.utils import DataFinder, Watcher, ProcessingScraper, ProgressBar, log_phil_diff, wait_for_sentinel
 from avicenna.pipelines.processing import ProcessingOrchestrator
 from avicenna.pipelines.sentinel import ProcessingSentinel
 from avicenna.utils.phil import ProcessingPHIL
@@ -30,10 +28,6 @@ parser.add_argument("--settings", type=pathlib.Path, metavar="FILE",
                     help=f"PHIL settings file (default: auto-load {_DEFAULT_PHIL} if present)")
 parser.add_argument("-d", "--data", type=pathlib.Path, nargs="+", help="Path(s) to data; each should have the format <synchrotron>_<date_YYYYMMDD>_transfer")
 parser.add_argument("-p", "--pinlist", type=str, help="Filename for pin list file, typically pin_list.txt")
-parser.add_argument("-x", "--xdsparams", type=str, help="Filename for XDS param file, usually xds_input_parameters.txt")
-parser.add_argument("--bash", action="store_true", help="Run the bash scripts instead of the Python-based processing pipeline")
-parser.add_argument("--legacy", action="store_true",
-                    help="Use the hard-coded legacy pipeline instead of the PHIL-driven interpreter")
 parser.add_argument("-o", "--output", type=pathlib.Path, default=pathlib.Path(os.curdir), help="Path to output folder (default: current directory)")
 parser.add_argument("--dry_run", action="store_true", help=f"Create pin_list.txt and {_TEMPLATE_PHIL} without submitting jobs")
 parser.add_argument("--silent",    action="store_true", help="Submit jobs without tailing the log")
@@ -86,21 +80,6 @@ class _Tee:
             f.write(data)
     def flush(self):
         self._stream.flush()
-
-
-def _read_xds_params(filepath):
-    """Read XDS params from a params file, falling back to defaults for missing keys."""
-    result = dict(XDS_PARAM_DEFAULTS)
-    with open(filepath) as fh:
-        for line in fh:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            key = key.strip()
-            if key in XDS_PARAM_DEFAULTS:
-                result[key] = value.strip()
-    return result
 
 
 def _params_from_phil(phil):
@@ -244,8 +223,8 @@ def main():
             parser.error("either -d/--data or -p/--pinlist must be provided")
 
         if args.dry_run:
-            if args.pinlist or args.xdsparams:
-                parser.error("--dry_run is incompatible with --pinlist and --xdsparams")
+            if args.pinlist:
+                parser.error("--dry_run is incompatible with --pinlist")
             if not args.data:
                 parser.error("--dry_run requires -d/--data")
             for fname in ("pin_list.txt", _TEMPLATE_PHIL):
@@ -312,75 +291,48 @@ processing {{
             params["pins"] = pin_list
             params["image_dir"] = image_dir
 
-        # Phase 2: Resolve XDS / dataset settings.
-        #  - PHIL path (default): settings come from processing.phil (single source).
-        #  - --legacy / --bash:   settings come from xds_input_parameters.txt.
-        if args.legacy or args.bash:
-            if args.xdsparams and os.path.isfile(args.xdsparams):
-                params.update(_read_xds_params(args.xdsparams))
-            else:
-                if data_path is None:
-                    if not args.data:
-                        sys.exit(
-                            "ERROR: -d/--data is required when using a --pinlist but not using --xdsparams"
-                        )
-                    data_path = DataFinder(paths=args.data).paths[0]
-                args.data = data_path
-                ParamWriter(args=args).build_parameters()
-                params.update(_read_xds_params("xds_input_parameters.txt"))
-        else:
-            params.update(_params_from_phil(phil))
+        # Phase 2: Resolve XDS / dataset settings from processing.phil
+        # (the single source; there is no xds_input_parameters.txt path).
+        params.update(_params_from_phil(phil))
 
         project_dir = os.path.abspath(args.output)
         procpath    = os.path.join(project_dir, "processing")
         omnibus     = os.path.join(project_dir, "processing.log")
         sentinel_submitted = False
 
-        if args.bash:        # run Galen's original bash scripts for XDS processing
-            if (os.path.isfile('./pin_list.txt') and os.path.isfile('./xds_input_parameters.txt')):
-                script_path = os.path.join(os.path.abspath(params["script_dir"]), 'xds_pipeline_prep.sh')
-                subprocess.run(script_path)
-            else:
-                print("ERROR: pin_list.txt and/or xds_input_parameters.txt not found!")
-                exit()
-        else:
-            if args.xds_root:
-                params["xds_root"] = args.xds_root
-            main_job_id = None
-            if not args.legacy:
-                # Snapshot the effective PHIL actually used for this run (after CLI
-                # overrides), with the resolved data/output injected so the file is
-                # self-contained and re-runnable.  Written on every run, even when
-                # identical to the defaults; processing_default.phil (from --dry_run)
-                # remains the pristine template.
-                _snap = ["processing {", "  input {"]
-                if args.data:
-                    _snap.append("    data = " + " ".join(f'"{d}"' for d in args.data))
-                _snap.append(f'    pinlist = "{args.pinlist or "pin_list.txt"}"')
-                _snap += ["  }", "  output {", f'    directory = "{project_dir}"', "  }", "}"]
-                phil.adopt_phil_string("\n".join(_snap) + "\n")
-                # Drop the shipped empty isoform template when a real isoform was
-                # supplied (CLI/file), so the as-run record (and the phil_string
-                # below) is not cluttered with the all-None template.
-                phil.prune_empty_isoforms()
-                with open(_DEFAULT_PHIL, "w") as _f:
-                    _f.write(phil.full_phil_string())
-                print(f"Wrote {_DEFAULT_PHIL} (effective settings for this run)")
-                log_phil_diff(phil, omnibus)
-            with contextlib.redirect_stdout(_Tee(sys.stdout, omnibus)):
-                if args.legacy:
-                    RunProcess(params).run()
-                else:
-                    params["phil_string"] = phil.diff_phil_string()
-                    main_job_id = ProcessingOrchestrator(params).run()
-            # All finalization (filtered qrefine_list.txt + refine.phil) is done by
-            # an SGE completion sentinel held on the main array, so it runs on job
-            # completion in every mode -- interactive, --silent, or after the
-            # submitting shell disconnects.  The sentinel is the sole arbiter of
-            # completion; the foreground watcher below is display-only.
-            if not args.legacy and main_job_id:
-                ProcessingSentinel(project_dir, no_filter=args.no_filter).submit(main_job_id)
-                sentinel_submitted = True
+        if args.xds_root:
+            params["xds_root"] = args.xds_root
+        main_job_id = None
+        # Snapshot the effective PHIL actually used for this run (after CLI
+        # overrides), with the resolved data/output injected so the file is
+        # self-contained and re-runnable.  Written on every run, even when
+        # identical to the defaults; processing_default.phil (from --dry_run)
+        # remains the pristine template.
+        _snap = ["processing {", "  input {"]
+        if args.data:
+            _snap.append("    data = " + " ".join(f'"{d}"' for d in args.data))
+        _snap.append(f'    pinlist = "{args.pinlist or "pin_list.txt"}"')
+        _snap += ["  }", "  output {", f'    directory = "{project_dir}"', "  }", "}"]
+        phil.adopt_phil_string("\n".join(_snap) + "\n")
+        # Drop the shipped empty isoform template when a real isoform was
+        # supplied (CLI/file), so the as-run record (and the phil_string
+        # below) is not cluttered with the all-None template.
+        phil.prune_empty_isoforms()
+        with open(_DEFAULT_PHIL, "w") as _f:
+            _f.write(phil.full_phil_string())
+        print(f"Wrote {_DEFAULT_PHIL} (effective settings for this run)")
+        log_phil_diff(phil, omnibus)
+        with contextlib.redirect_stdout(_Tee(sys.stdout, omnibus)):
+            params["phil_string"] = phil.diff_phil_string()
+            main_job_id = ProcessingOrchestrator(params).run()
+        # All finalization (filtered qrefine_list.txt + refine.phil) is done by
+        # an SGE completion sentinel held on the main array, so it runs on job
+        # completion in every mode -- interactive, --silent, or after the
+        # submitting shell disconnects.  The sentinel is the sole arbiter of
+        # completion; the foreground watcher below is display-only.
+        if main_job_id:
+            ProcessingSentinel(project_dir, no_filter=args.no_filter).submit(main_job_id)
+            sentinel_submitted = True
 
         if args.silent or args.dry_run:
             return

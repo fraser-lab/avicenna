@@ -48,11 +48,6 @@ refine
       .short_caption = Dataset list
       .help = File listing datasets to refine (one per line).
       .expert_level = 0
-    params_file = "qrefine_input_parameters.txt"
-      .type = path
-      .short_caption = MR parameter file (legacy)
-      .help = Legacy-only per-crystal MR parameter file (vic.refine --legacy).  The PHIL pipeline ignores it and reads MR settings from refine.phil instead.
-      .expert_level = 1
     reference_mtz = None
       .type = path
       .short_caption = Reference MTZ

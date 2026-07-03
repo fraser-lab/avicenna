@@ -39,7 +39,7 @@ import pkgutil
 import stat
 from pathlib import Path
 
-from avicenna.pipelines.legacy.proc_pipeline import RunProcess
+from avicenna.pipelines.processing_runner import RunProcess
 from avicenna.pipelines.jobbase import SubPipelineInterpreter
 from avicenna.utils.phil.processing import ProcessingPHIL
 from avicenna.utils.software import suite_setup_sources
