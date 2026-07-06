@@ -1,6 +1,8 @@
 [console_scripts]
-vic.pandda = avicenna.command_line.vic_pandda:main
+vic.analysis = avicenna.command_line.vic_analysis:main
+vic.check_programs = avicenna.command_line.vic_check_programs:main
 vic.process = avicenna.command_line.vic_process:main
 vic.refine = avicenna.command_line.vic_refine:main
-vic.scrape = avicenna.command_line.vic_scrape_logs:main
+vic.settings = avicenna.command_line.vic_settings:main
+vic.summary = avicenna.command_line.vic_summary:main
 vic.watch = avicenna.command_line.vic_watch:main

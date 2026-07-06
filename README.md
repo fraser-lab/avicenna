@@ -1,8 +1,8 @@
-# AVICENNA - the (somewhat) automated data-to-structure pipeline
+# AVICENNA - the semi-automated data-to-structure pipeline
 
 ## Introduction
 
-AVICENNA is intended to someday become a fully automated data-to-structure pipeline optimized for fragment screening. It will process a large number of datasets, run difference Fourier and/or molecular replacement to "solve" each structure, then run fragment screening software such as qFit and panDDA. AVICENNA is a set of Python modules, with the separate function (processing, structure solution, etc.) invoked individually, with further plans to connect them all into a contiguous pipeline.
+AVICENNA is intended to someday become a fully automated data-to-structure pipeline optimized for fragment screening. AVICENNA uses PHIL (Python Hierarchical Input Language) to create modular, multi-step sub-pipelines which can be relatively easily customized, not only by changing individual parameters but by adding, deleting, or moving entire steps. 3 Currently, it processes multiple complete datasets (XDS, Pointless, Aimless), solves and refines each structure (Phaser, Refmac5), then runs electron density analysis software (panDDA). AVICENNA is a set of Python modules, with the separate function (processing, structure solution, analysis) invoked individually, with further plans to connect them all into a contiguous pipeline. Additional plans include expanding the options for backends, such as DIALS, phenix.refine, and panDDA2 (and others) as desired. 
 
 ## Installation
 
@@ -19,13 +19,13 @@ At the end of the installation, the install script will print out a line to add 
 ### Updating
 
 Since Avicenna is in constant development at the moment, it's likely that a new feature (or five) has been added every day and your cloned repository needs to be updated. To update, do this:
+
 	cd $AVICENNA_INSTALL_FOLDER
 	git pull --rebase
 
 ### Running on Wynton
 
 AVICENNA is currently configured only to run on the Wynton computing cluster at UCSF. Because of that, it doesn't need to be launched with a `qsub` command: it issues that command automatically. Future work is intended to make AVICENNA runnable without an available compute cluster, as well.
-
 
 
 ## Preparing the data for the pipeline
@@ -45,158 +45,53 @@ The following scheme is strongly suggested:
 **NOTE**: If you are putting together datasets collected on several days and even at different facilities, you can create a folder named after your project (e.g. `huwe1`) and create multiple transfer folders inside of it. Then give the project folder name to AVICENNA as input (see below) and it will resolve all the subfolders automatically.
 
 
-## Processing X-ray diffraction data
+## Running AVICENNA sub-pipelines
 
-To run AVICENNA's X-ray diffraction data processing pipeline, use the command
+All AVICENNA sub-pipelines (processing, refinement, and density analysis) run using the same general principle:
 
-	vic.process [OPTIONS]
+	vic.<sub-pipeline> [OPTIONS]
 
-The basic options include:
+For example:
 
-  `-d </path/to/image/files>` - specify path(s) to data files (could be multiple paths)
-  
-  `-d <file_with_list_of_paths.txt>` - a text file with a list of paths to image folder can also be submitted. **NOTE**: For best results, it's recommended to use absolute paths (e.g. `/path/to/images`) to avoid "file not found" errors.
-  
-  `-p pin_list.txt` - a text file with a list of pin codes and their corresponding data (see the example below); can be provided instead of the path to image files
-  
-  `-o </path/to/output/folder>` - use to specify a different output folder than the one from which AVICENNA is run
-  
-  `-x xds_input_parameters.txt` - a text file with a selection of input parameters for XDS (see example below); not required for basic default scenario (see below), but required if crystal information (space group, unit cell) is to be passed on to XDS, or if some parameters need to be tweaked
-  
-  `-l` - toggle display of the run log (will eventually be the default)
-  
-  `--dry_run` - generate `pin_list.txt` and `xds_input_parameters.txt` but do not actually run processing
+	vic.process -d /path/to/data/folders
+	vic.refine --settings refine.phil space_group=P212121
+	vic.analysis --settings analysis.phil
 
-Whenever `vic_process.py` runs, it outputs its own `pin_list.txt` and `xds_input_parameters.txt`, so if you simply wish to generate those files and then edit them later, use the `--dry_run` option.
+To see the list of options for any given sub-pipeline, issue this command:
+	vic.<sub-pipeline> -h
 
-### Examples
+To see the list of default settings (in PHIL format), use the dry-run option, e.g.:
+	vic.refine --dry_run
 
-Basic run with defaults and no prior crystal information:
-  
-  `vic_process.py -d /path/to/image/files/first_sweep/ /path/to/image/files/second_sweep`
+To see the list of default settings (in PHIL format), use the dry-run option, e.g.:
+	vic.refine --dry_run
 
-Run with pre-written `pin_list.txt` and `xds_input_parameters.txt` files (see below for examples)
+Additional parameters can be added directly via command line, without modifying the PHIL-formatted settings file, e.g.:
 
-  `vic_process.py -p pin_list.txt -x xds_input_parameters.txt`
+	vic.refine --settings refine.phil space_group=P43212 unit_cell=38,38,79,90,90,90
 
+**NOTE**: at this time, refinement and analysis sub-pipelines require additional parameters to be supplied by the user prior to running. These are:
 
-### Sample pin_list.txt
+refinement: 
+- in `refine.input.reference_pdb`, the path to the reference structure (which will be used to solve and refine each ligand-bound structure)
 
-**NOTE**: the file *must* be called `pin_list.txt` at this time.
-
-**NOTE**: the paths in the first column *must* be absolute paths at this time.
-
-	/wynton/group/fraser/als_20251107_transfer,FRS-049_03
-	/wynton/group/fraser/als_20251107_transfer,FRS-049_04
-	/wynton/group/fraser/als_20251107_transfer,FRS-049_05
-	/wynton/group/fraser/als_20251107_transfer,FRS-049_06
-	/wynton/group/fraser/als_20251121_transfer,QCR005_01
-
-### Sample xds_input_parameters.txt
-
-**NOTE**: the file *must* be called `xds_input_parameters.txt` at this time
-
-**NOTE**: to process without prior crystal information, remove everything from (and including) `## crystal ##` down.
-
-	script_dir=/wynton/group/fraser/alyubimov/processing_pipeline/scripts
-	image_dir=/wynton/group/fraser
-	detector_edge=0.8
-	indexing_images=first_half
-	try_alt_sym=false
-	ncpu=8
-	no_symmetry=false
-	scaling=correct
-	recycle_xds=false
-	refine_cell_integrate=both
-	res_limit=cc12
-	cleanup=partial
-	## crystal ##
-	first_pass=P43212
-	sg=P43212
-	number=96
-	cell=62.97 62.97 231.24 90.00 90.00 90.00
-	ref_hkl=none
-	ref_mtz=none
-
-### Accessing output
-AVICENNA will create a `processing` folder, in which it will store the processing software (`XDS`) output and the queue logs. Two programs can give some information about the results of the processing pipeline's work.
-
-- `vic.watch . -m`  -- issued from the root folder for this AVICENNA run, `vic.watch` will track progress in real time. **NOTE**: to run this (optional) program, open a new terminal and log in through there.
-- `vic.scrape .` -- issued from the root folder _after_ the run concludes, `vic.scrape` will scrape the logfiles and show a summary of the results.
+analysis: 
+- the path to the reference structure (PDB) - typically an apo structure obtained from the Protein Data Bank or solved beforehand
+- the path to the reference dataset (MTZ) - structure factors and phases for the apo structure
+- (optional) the path to the "ground state" datasets, i.e. a set of minimum 30 apo structures and maps, preferably obtained in a separate AVICENNA processing/refinement run and kept in a separate folder
 
 
-## Running the structure solution / refinement pipeline
-After the XDS pipeline run concludes, AVICENNA will create two files in the output folder (see samples below):
-	qrefine_list.txt
-	qrefine_input_parameters.txt
+## Viewing the output
 
-These can be direclty input into the next pipeline. However, `qrefine_input_parameters.txt` contains two placeholder items that have to be filled in manually:
+To view a short summary of the sub-pipeline output, use the `vic.summary` command with the `--pipeline` option to specify which sub-pipeline's results you wish to view, e.g.:
 
-- the path to the reference PDB file - this is the PDB file of the molecule of interest to be used as a starting model for the molecular replacement and/or refinement jobs.
-- the molecular weight of the protein (in Daltons) - this has a _huge_ effect on structure solution and refinement algorithms.
+	vic.summary ./ --p processing 
 
-After modifying the `qrefine_list.txt` and `qrefine_input_parameters.txt`, run the `vic.refine` program:
+For a more extensive summary, in the form of a list of per-dataset statistics, add the `--verbose` option.
 
-	vic.refine -l qrefine_list.txt -p qrefine_input_parameters.txt
+Each sub-pipeline's output is stored in the current folder by default, under a hard-coded name:
+- `processing` 	- processing results (`processing_logs` for the logs)
+- `qrefine`		- refinement results (`qrefine_logs` for the logs) 
+- `pandda`		- for panDDA results (`pandda_logs` for the logs) 
 
-You can monitor the in-progress run by opening a new terminal window, logging in, going to the AVICENNA root folder and issuing:
-
-	vic.watch . -m --pipeline qrefine
-
-### Sample `qrefine_list.txt` file
-
-**NOTE**: The file _must_ be called `qrefine_list.txt` at this time.
-
-	als_20251121_QCR005_02_1,1_P43212,,1 900,integration not forced
-	als_20251121_QCR005_02_1,1_P43212,refined,1 900,integration not forced
-	als_20251121_QCR005_03_1,1_P43212,,1 900,integration not forced
-	als_20251121_QCR005_03_1,1_P43212,refined,1 900,integration not forced
-	als_20251121_QCR005_04_1,1_P43212,,1 900,integration not forced
-	als_20251121_QCR005_04_1,1_P43212,refined,1 900,integration not forced
-	als_20251121_QCR005_05_1,1_P43212,,1 900,integration not forced
-	als_20251121_QCR005_05_1,1_P43212,refined,1 900,integration not forced
-	als_20251121_QCR005_06_1,1_P43212,,1 900,integration not forced
-	als_20251121_QCR005_06_1,1_P43212,refined,1 900,integration not forced
-	als_20251121_QCR005_07_1,1_P43212,,1 900,integration not forced
-	als_20251121_QCR005_07_1,1_P43212,refined,1 900,integration not forced
-	als_20251121_QCR005_08_1,1_P43212,,1 900,integration not forced
-	als_20251121_QCR005_08_1,1_P43212,refined,1 900,integration not forced
-	als_20251121_QCR005_10_1,1_P43212,,1 900,integration not forced
-	als_20251121_QCR005_10_1,1_P43212,refined,1 900,integration not forced
-	als_20251121_QCR005_11_1,1_P43212,,1 900,integration forced in P43212 1
-	als_20251121_QCR005_12_1,1_P43212,,1 900,integration not forced
-	als_20251121_QCR005_12_1,1_P43212,refined,1 900,integration not forced
-	als_20251121_QCR005_13_1,1_P43212,,1 900,integration not forced
-	als_20251121_QCR005_13_1,1_P43212,refined,1 900,integration not forced
-	als_20251121_QCR005_14_1,1_P43212,,1 900,integration not forced
-	als_20251121_QCR005_14_1,1_P43212,refined,1 900,integration not forced
-	als_20251121_QCR005_15_1,1_P43212,,1 900,integration not forced
-	als_20251121_QCR005_15_1,1_P43212,refined,1 900,integration not forced
-	als_20251121_QCR005_16_1,1_P43212,,1 900,integration forced in P43212 1
-	als_20251121_QCR006_01_1,1_P43212,,1 900,integration not forced
-	als_20251121_QCR006_01_1,1_P43212,refined,1 900,integration not forced
-	als_20251121_QCR006_02_1,1_P43212,,1 900,integration not forced
-	als_20251121_QCR006_02_1,1_P43212,refined,1 900,integration not forced
-	als_20251121_QCR006_16_1,1_P43212,,1 900,integration not forced
-	als_20251121_QCR006_16_1,1_P43212,refined,1 900,integration not forced
-
-## Sample `qrefine_input_parameters.txt` file
-
-**NOTE**: the file _must_ be called `qrefine_input_parameters.txt` at this time.
-
-	## crystal ##
-	crystal_name=1_P43212
-	mr_pdb=/path/to/reference.pdb
-	mr_cutoff=0.45
-	mr_water=both
-	mr_tncs=false
-	mr_copies=1
-	mr_mw=100000
-	mr_seq_id=1.0
-	mr_try_monomer=false
-
-## Accessing output
-AVICENNA creates a folder called `qrefine` under the root folder. It will have solved / refined structures that can serve as input into panDDA suite. As above, you can use two programs to monitor / analyze the output:
-
-- `vic.watch . -m --pipeline qrefine` - in a separate terminal window, can be used to monitor the run in progress
-- `vic.scrape . --pipeline qrefine` - after the run concludes, can be used to see the table of results
+The `pandda` folder is the one from which `pandda.inspect` should be run from. This folder can be safely copied or moved to a different location, or downloaded to a personal laptop for further analysis.

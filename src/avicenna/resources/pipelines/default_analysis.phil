@@ -1,0 +1,48 @@
+analysis {
+  input {
+    input_datasets = None
+    ground_state_datasets = None
+    reference_pdb = None
+    reference_mtz = None
+    ligands = None
+    ligand_library = DSI_1 DSI_2 DSI_3 *EE UCSF91_1 all
+  }
+  output {
+    directory = "."
+    log_folder = None
+  }
+  programs {
+    pandda {
+      root = None
+    }
+    pandda2 {
+      root = None
+    }
+  }
+  steps {
+    step {
+      id = 1_pandda
+      program = pandda
+      pandda {
+        prefix = VIC
+        copy_input = True
+        remove_waters = False
+        dataset {
+          offset = auto
+          ground_state_range = auto
+        }
+        analyse {
+          cpus = auto
+          min_build_datasets = 30
+          max_build_datasets = 50
+          max_new_datasets = 1500
+          no_lr_comp_check = False
+        }
+        run {
+          log_time_out = 0
+          dry_run = False
+        }
+      }
+    }
+  }
+}

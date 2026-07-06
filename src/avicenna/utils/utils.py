@@ -1,11 +1,13 @@
 import math
 import os
 import pathlib
+import re
+import statistics
 import sys
 import threading
 import time
 from datetime import datetime
-# import matplotlib.pyplot as plt
+from html import unescape as html_unescape
 
 # Suffixes appended to crystal directory names to indicate cell-refinement mode.
 # New data uses '_refined'; older data on disk may carry '_true', '_false', or '_both'.
@@ -19,7 +21,7 @@ _LOG_DECORATIONS = {
 _TAG_WIDTH = 12
 
 
-def format_log_line(tag, message, context=None, context_width=None):
+def format_log_line(tag, message, context=None, context_width=None, forced_dir=None):
     """Return a formatted pipeline log line.
 
     The tag field is fixed-width (_TAG_WIDTH). Tags in _LOG_DECORATIONS get
@@ -27,6 +29,8 @@ def format_log_line(tag, message, context=None, context_width=None):
     (e.g. a job_id) is inserted in brackets between the tag field and the
     message. If context_width is given, the context is left-padded to that
     width so the message column stays aligned across all log lines.
+    forced_dir, when present, is inserted in brackets immediately before the
+    message to identify forced-integration retry jobs.
     """
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     decoration = _LOG_DECORATIONS.get(tag, "")
@@ -36,7 +40,72 @@ def format_log_line(tag, message, context=None, context_width=None):
         ctx = f"[ {ctx_str} ]  "
     else:
         ctx = ""
-    return f"[{ts}] {tag_field}  {ctx}{message}\n"
+    prefix = f"[{forced_dir}]  " if forced_dir else ""
+    return f"[{ts}] {tag_field}  {ctx}{prefix}{message}\n"
+
+
+def log_phil_diff(phil, omnibus_path):
+    """Emit the run's non-default PHIL settings to the console and omnibus log.
+
+    Diffs the effective PHIL against the shipped pipeline defaults
+    (``default_<name>.phil``) via ``phil.default_diff_phil_string()``.  When the
+    run uses only defaults the diff is empty and nothing is emitted.  Otherwise
+    a header block is appended to the omnibus log (so it appears at the top of
+    this run's log) and echoed to the terminal.  Best-effort: any failure to
+    compute or write the diff is swallowed so it can never abort a run.
+    """
+    try:
+        diff = phil.default_diff_phil_string().strip()
+    except Exception:
+        return
+    if not diff:
+        return
+    block = (
+        "=" * 60 + "\n"
+        "Run settings differing from pipeline defaults:\n"
+        + "-" * 60 + "\n"
+        + diff + "\n"
+        + "=" * 60 + "\n\n"
+    )
+    sys.stdout.write(block)
+    sys.stdout.flush()
+    try:
+        with open(omnibus_path, "a") as fh:
+            fh.write(block)
+    except OSError:
+        pass
+
+
+def wait_for_sentinel(omnibus_path, marker="[ sentinel ]", poll=3.0, timeout=3600):
+    """Block until the completion sentinel records its marker in *omnibus_path*.
+
+    The foreground watcher's done-detection is a file-structure sweep, but the
+    authoritative arbiter of completion is the SGE-held sentinel (which also
+    writes the next-stage .phil and the filtered result list).  After the sweep
+    goes idle the foreground waits here for the sentinel's marker so a run is not
+    declared "done" before finalization has actually happened.
+
+    Interruptible with Ctrl-C -- the sentinel runs independently on the cluster,
+    so interrupting the wait does not affect finalization.  Returns True if the
+    marker appeared, False on timeout.
+    """
+    def _seen():
+        try:
+            with open(omnibus_path) as fh:
+                return any(marker in line for line in fh)
+        except OSError:
+            return False
+
+    if _seen():
+        return True
+    deadline = time.time() + timeout if timeout else None
+    with Spinner(height=1, message="Waiting for completion sentinel to finalize..."):
+        while not _seen():
+            if deadline and time.time() > deadline:
+                return False
+            time.sleep(poll)
+    return True
+
 
 # Bravais lattice → list of (sg_number, sg_name) tuples.
 # Derived from xds_lattices.txt in the processing pipeline scripts directory.
@@ -65,6 +134,102 @@ BRAVAIS_LATTICES = {
     "cF": [(196, "F23"),    (209, "F432"),   (210, "F4132")],
     "cI": [(197, "I23"),    (199, "I213"),   (211, "I432"),   (214, "I4132")],
 }
+
+_SG_BY_NAME:   dict = {}
+_SG_BY_NUMBER: dict = {}
+for _lat_sgs in BRAVAIS_LATTICES.values():
+    for _num, _name in _lat_sgs:
+        _SG_BY_NAME[_name.upper()] = (_num, _name)
+        _SG_BY_NUMBER[_num]        = (_num, _name)
+
+# Short / alternative symbols that differ from the canonical XDS name.
+# Monoclinic: IUCr short symbol omits the identity axis positions.
+# Rhombohedral: H-prefix names denote the hexagonal setting used by CCP4/Pointless.
+_SG_ALIASES = {
+    "P2":  "P121",   # SG 3
+    "P21": "P1211",  # SG 4
+    "H3":  "R3",     # SG 146, hexagonal setting
+    "H32": "R32",    # SG 155, hexagonal setting
+}
+for _alias, _canonical in _SG_ALIASES.items():
+    _SG_BY_NAME[_alias] = _SG_BY_NAME[_canonical]
+
+
+def qsub_terse(args):
+    """Submit via ``qsub -terse`` and return the numeric job id (str) or None.
+
+    ``-terse`` prints just the job id; for array jobs it is
+    ``jobid.start-end:step``, so the id usable with ``-hold_jid`` is the leading
+    integer.  This isolates the only scheduler-specific call, so completion
+    detection elsewhere can stay scheduler-agnostic (file-structure sweep)."""
+    import subprocess
+    result = subprocess.run(["qsub", "-terse", *map(str, args)],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    out = (result.stdout or "").strip()
+    if result.returncode != 0 or not out:
+        if out:
+            print(out)
+        return None
+    return out.splitlines()[0].split(".")[0].strip()
+
+
+def sg_lookup(space_group=None, space_group_number=None):
+    """Return (number, canonical_name) for a space group specification.
+
+    Pass exactly one argument; raises ValueError if the lookup fails.
+    Names are matched case-insensitively with spaces stripped
+    (e.g. 'P43212', 'p 43 2 12', 'P 43 21 2' all resolve to SG 96).
+    """
+    if space_group is not None:
+        key = space_group.strip().upper().replace(" ", "")
+        if key not in _SG_BY_NAME:
+            raise ValueError(
+                f"Unknown space group name {space_group!r}. "
+                "Use XDS-style names (e.g. 'P43212', 'C2', 'I222')."
+            )
+        return _SG_BY_NAME[key]
+    if space_group_number is not None:
+        if space_group_number not in _SG_BY_NUMBER:
+            raise ValueError(f"Unknown space group number {space_group_number}.")
+        return _SG_BY_NUMBER[space_group_number]
+    raise ValueError("Provide space_group or space_group_number.")
+
+
+def count_hdf5_images(master_path):
+    """Return the number of diffraction images in a Dectris Eiger HDF5 master file.
+
+    Tries the omega axis (one entry per image) first, since it is the most
+    direct count. Falls back to nimages*ntrigger from detectorSpecific.
+    Raises ValueError if neither path is present.
+    """
+    import h5py
+    with h5py.File(str(master_path), "r") as f:
+        omega = f.get("/entry/sample/goniometer/omega")
+        if omega is not None and omega.shape:
+            return int(omega.shape[0])
+        ds = f.get("/entry/instrument/detector/detectorSpecific")
+        if ds is not None and "nimages" in ds and "ntrigger" in ds:
+            return int(ds["nimages"][()]) * int(ds["ntrigger"][()])
+    raise ValueError(f"Could not determine image count from {master_path}")
+
+
+def has_image_data(path, max_depth=4):
+    """Return True if *path* contains any *_master.h5 or *.cbf file within
+    *max_depth* subdirectory levels (inclusive).
+
+    Used by DataFinder to skip non-dataset sibling folders (e.g. autoProc_dir,
+    jpegs) so they don't inflate the pin list.  Folders with only raster
+    pre-scans still pass — they're filtered downstream with a specific reason.
+    """
+    base = os.path.normpath(str(path))
+    base_sep = base.count(os.sep)
+    for root, dirs, files in os.walk(base):
+        if root.count(os.sep) - base_sep >= max_depth:
+            dirs[:] = []
+        for fname in files:
+            if fname.endswith('_master.h5') or fname.endswith('.cbf'):
+                return True
+    return False
 
 
 class DataFinder(object):
@@ -101,7 +266,11 @@ class DataFinder(object):
         self.image_dir = parents.pop()
         for path in self.paths:
             for sf in sorted(os.listdir(path)):
-                if not os.path.isdir(os.path.join(path, sf)):
+                sub = os.path.join(path, sf)
+                if not os.path.isdir(sub):
+                    continue
+                if not has_image_data(sub):
+                    print(f"Skipping {sf} — no image data")
                     continue
                 pin_line = f"{path},{sf}"
                 print(pin_line)
@@ -112,34 +281,6 @@ class DataFinder(object):
                 fh.write(f"{pin}\n")
         print(filepath)
         return self.pin_list, self.image_dir, self.paths[0]
-
-
-class ParamWriter(object):
-    def __init__(self, args):
-        dst = str(args.data)[:-1] if str(args.data).endswith('/') else str(args.data)
-        self.main_path = os.path.abspath(dst)
-
-    def build_parameters(self):
-        image_dir = os.path.dirname(self.main_path)
-        xds_params = {
-            'script_dir':            '../scripts',
-            'image_dir':             image_dir,
-            'detector_edge':         '0.8',
-            'indexing_images':       'first_half',
-            'try_alt_sym':           'all',
-            'ncpu':                  '8',
-            'no_symmetry':           'false',
-            'scaling':               'correct',
-            'recycle_xds':           'false',
-            'refine_cell_integrate': 'both',
-            'res_limit':             'cc12',
-            'cleanup':               'partial',
-        }
-        xds_param_filepath = f"{os.path.abspath(os.curdir)}/xds_input_parameters.txt"
-        print(xds_param_filepath)
-        with open(xds_param_filepath, 'w') as xpf:
-            for key, value in xds_params.items():
-                xpf.write(f"{key}={value}\n")
 
 
 class ScraperBase(object):
@@ -156,6 +297,8 @@ class ScraperBase(object):
     def scrape_all(self):
         results = self.find_results()
         for result in results:
+            if result.get('outcome') == 'rejected':
+                continue
             updated_result = self.scrape_one_log(info_dict=result)
             if updated_result is None:
                 result['outcome'] = 'failed'
@@ -164,27 +307,147 @@ class ScraperBase(object):
                 result['outcome'] = 'completed'
         self.results = results
 
+    # ------------------------------------------------------------------ #
+    # Standardized summary interface (shared by every sub-pipeline)       #
+    # ------------------------------------------------------------------ #
+    # Subclasses declare KEY_STATS as an ordered list of (label, fmt)
+    # tuples, where fmt is a printf-style format for both the median and
+    # its standard deviation (e.g. "%.3f").  _stat_values(result) returns
+    # {label: float} for one completed result (missing/unparseable stats
+    # are simply omitted).  The base class turns these into counts +
+    # median(stdev) for the short-form summary and works for ANY scraper.
+    KEY_STATS = []
+
+    # Headline label for the total-count line; overridable per pipeline.
+    TOTAL_LABEL = "Total datasets"
+
+    def _stat_values(self, result):
+        """Return {label: float} of numeric key stats for one completed result."""
+        return {}
+
+    def _summary_counts(self):
+        """Hook: pipeline-specific (label, value) count pairs shown after the
+        base counts and before the median block in print_summary().  Values are
+        runtime (computed while scraping), so this is a method rather than a
+        static attribute like KEY_STATS.  The base aligns them.  Default: none."""
+        return []
+
+    def get_counts(self):
+        """Return (total, successes, failed, rejected, unprocessed)."""
+        outcomes = [r.get('outcome') for r in self.results]
+        successes   = outcomes.count('completed')
+        failed      = outcomes.count('failed')
+        rejected    = outcomes.count('rejected')
+        unprocessed = outcomes.count('unprocessed')
+        return len(outcomes), successes, failed, rejected, unprocessed
+
+    def get_stat_summary(self):
+        """Return {label: (n, median, stdev)} over completed results.
+
+        stdev is the sample standard deviation, or None when fewer than two
+        values are available for that stat.
+        """
+        collected = {label: [] for label, _ in self.KEY_STATS}
+        for result in self.results:
+            if result.get('outcome') != 'completed':
+                continue
+            for label, value in self._stat_values(result).items():
+                if value is not None and label in collected:
+                    collected[label].append(value)
+        summary = {}
+        for label, _ in self.KEY_STATS:
+            vals = collected[label]
+            if not vals:
+                summary[label] = (0, None, None)
+            elif len(vals) == 1:
+                summary[label] = (1, vals[0], None)
+            else:
+                summary[label] = (len(vals), statistics.median(vals),
+                                  statistics.stdev(vals))
+        return summary
+
+    def print_summary(self, omnibus=None):
+        """Short-form summary: one item per line (slim for narrow terminals).
+
+        Wrapped in separators above and below.  When omnibus is given, the same
+        block is appended to that log file (so it lands in the main run log).
+        """
+        total, successes, failed, rejected, unprocessed = self.get_counts()
+        failures = failed + rejected
+        lines = [
+            f"Looking in {os.path.abspath(self.result_path)}",
+            f"{self.TOTAL_LABEL}: {total}",
+            f"Successes:      {successes}",
+            f"Failures:       {failures}  (failed {failed}, rejected {rejected})",
+        ]
+        if unprocessed:
+            lines.append(f"Unprocessed:    {unprocessed}")
+        extra = self._summary_counts()
+        if extra:
+            lines.append("")
+            width = max(len(label) for label, _ in extra) + 1
+            for label, value in extra:
+                lines.append(f"{(label + ':').ljust(width)} {value}")
+        if self.KEY_STATS:
+            lines.append("")
+            lines.append(f"Median (stdev) over {successes} successes:")
+            summary = self.get_stat_summary()
+            width = max(len(label) for label, _ in self.KEY_STATS) + 1
+            for label, fmt in self.KEY_STATS:
+                _, median, stdev = summary[label]
+                if median is None:
+                    value = "n/a"
+                elif stdev is None:
+                    value = f"{fmt % median} (n/a)"
+                else:
+                    value = f"{fmt % median} ({fmt % stdev})"
+                lines.append(f"{(label + ':').ljust(width)} {value}")
+        sep = "=" * max(len(line) for line in lines)
+        block = [sep] + lines + [sep]
+        for line in block:
+            print(line)
+        if omnibus:
+            with open(omnibus, "a") as fh:
+                fh.write("\n".join(block) + "\n")
+
     def print_info(self):
+        """Long-form per-dataset table, wrapped in separators with a path header."""
+        header = f"Looking in {os.path.abspath(self.result_path)}"
+        print("=" * len(header))
+        print(header)
+        self._print_table()
+        print("=" * len(header))
+
+    def _print_table(self):
         raise NotImplementedError
 
     @staticmethod
     def _print_table_mixed(tagged_rows, headers):
         """Print rows as an aligned fixed-width table with two row formats.
 
-        tagged_rows is a list of (is_error, row) pairs:
-          - ok rows (is_error=False): full n-tuple matching headers
-          - error rows (is_error=True): (*id_cols, msg) where id_cols are the
-            leading columns to pad and msg is the error string (may be empty)
+        tagged_rows is a list of (status, row) pairs:
+          - ok rows (status=None): full n-tuple matching headers
+          - error rows (status=str, e.g. 'FAILED', 'REJECTED'): (*id_cols, msg)
+            where id_cols are the leading columns to pad and msg is the reason
+            string (may be empty). The status label appears in place of the
+            middle columns.
+
+        For backwards compatibility a bool status is treated as None/'FAILED'.
 
         Column widths are computed from headers and ok rows only, so error rows
-        do not inflate the column widths. Error rows print their id columns
-        padded to the same widths as ok rows, then 'FAILED' and the message
-        directly — skipping the empty middle columns entirely.
+        do not inflate the column widths.
         """
         if not tagged_rows:
             return
+        def _norm(status):
+            if status is False or status is None:
+                return None
+            if status is True:
+                return 'FAILED'
+            return str(status)
+        normalized = [(_norm(s), row) for s, row in tagged_rows]
         n = len(headers)
-        ok_rows = [row for is_err, row in tagged_rows if not is_err]
+        ok_rows = [row for status, row in normalized if status is None]
         widths = [
             max(len(str(headers[i])), max((len(str(r[i])) for r in ok_rows), default=0))
             for i in range(n - 1)
@@ -193,23 +456,58 @@ class ScraperBase(object):
             parts = [f'{str(row[i]):<{widths[i]}}' for i in range(n - 1)]
             parts.append(str(row[n - 1]))
             return '  '.join(parts).rstrip()
-        def fmt_err(row):
+        def fmt_err(label, row):
             n_ids = len(row) - 1
             parts = [f'{str(row[i]):<{widths[i]}}' for i in range(n_ids)]
-            parts.append('FAILED')
+            parts.append(label)
             if row[-1]:
                 parts.append(str(row[-1]))
             return '  '.join(parts).rstrip()
         header = fmt_ok(headers)
         print(header)
         print('-' * len(header))
-        for is_err, row in tagged_rows:
-            print(fmt_err(row) if is_err else fmt_ok(row))
+        for status, row in normalized:
+            print(fmt_err(status, row) if status else fmt_ok(row))
 
 
 class ProcessingScraper(ScraperBase):
 
     _ERROR_PATTERNS = ('!!! ERROR', 'Error:', 'FATAL ERROR', 'Sorry:')
+
+    KEY_STATS = [
+        ('Resolution (Å)', '%.2f'),
+        ('Completeness',   '%.1f'),
+        ('Multiplicity',   '%.1f'),
+        ('CC1/2',          '%.3f'),
+        ('Rpim',           '%.3f'),
+        ('Mosaicity',      '%.2f'),
+    ]
+
+    @staticmethod
+    def _overall(value):
+        """First (overall) element of a scraped list-valued stat, as float."""
+        try:
+            return float(value[0])
+        except (TypeError, ValueError, IndexError):
+            return None
+
+    @staticmethod
+    def _scalar(value):
+        """Scraped single-valued stat as float, or None."""
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _stat_values(self, result):
+        return {
+            'Resolution (Å)': self._overall(result.get('High resolution limit')),
+            'Completeness':   self._overall(result.get('Completeness')),
+            'Multiplicity':   self._overall(result.get('Multiplicity')),
+            'CC1/2':          self._overall(result.get('Mn(I) half-set correlation CC(1/2)')),
+            'Rpim':           self._overall(result.get('Rpim (within I+/I-)')),
+            'Mosaicity':      self._scalar(result.get('Average mosaicity')),
+        }
 
     @staticmethod
     def _tail(path, n=50):
@@ -240,16 +538,19 @@ class ProcessingScraper(ScraperBase):
         """
         p = pathlib.Path(pipeline_subdir)
 
-        # Condition 1: XDS produced XDS_ASCII.HKL (8_xds for forced path, 5_xds for normal)
-        hkl_ok = any((p / d / 'XDS_ASCII.HKL').is_file() for d in ('8_xds', '5_xds'))
+        # Condition 1: XDS produced XDS_ASCII.HKL in any *_xds step directory
+        hkl_ok = any(
+            (d / 'XDS_ASCII.HKL').is_file()
+            for d in p.iterdir()
+            if d.is_dir() and d.name.endswith('_xds')
+        )
         if not hkl_ok:
             xds_dirs = sorted(
                 (d for d in p.iterdir() if d.is_dir() and d.name.endswith('_xds')),
                 key=lambda d: int(d.name.split('_')[0]), reverse=True,
             )
             if xds_dirs:
-                job_num = xds_dirs[0].name.split('_')[0]
-                log = xds_dirs[0] / f'{job_num}_xds.log'
+                log = xds_dirs[0] / f'{xds_dirs[0].name}.log'
             else:
                 log = None
             excerpt = self._find_error(self._tail(log)) if log and log.is_file() else None
@@ -257,14 +558,20 @@ class ProcessingScraper(ScraperBase):
             return False, f"{label}: {excerpt or '(no error found in log)'}"
 
         # Condition 2: rfree chain produced XDS_ASCII_ctruncate.mtz
-        if not (p / '11_rfree' / 'XDS_ASCII_ctruncate.mtz').is_file():
-            rfree_dir = p / '11_rfree'
-            logs = sorted(rfree_dir.glob('*_rfree.log')) if rfree_dir.is_dir() else []
+        rfree_dirs = [d for d in p.iterdir() if d.is_dir() and d.name.endswith('_rfree')]
+        rfree_ok = any((d / 'XDS_ASCII_ctruncate.mtz').is_file() for d in rfree_dirs)
+        if not rfree_ok:
+            rfree_dir = rfree_dirs[0] if rfree_dirs else None
+            logs = sorted(rfree_dir.glob('*_rfree.log')) if rfree_dir else []
             excerpt = self._find_error(self._tail(logs[0])) if logs else None
-            return False, f"11_rfree: {excerpt or '(no error found in log)'}"
+            label = rfree_dir.name if rfree_dir else 'rfree'
+            return False, f"{label}: {excerpt or '(no error found in log)'}"
 
         # Condition 3: xtriage directory was created
-        if not (p / '13_xtriage').is_dir():
+        xtriage_exists = any(
+            d.is_dir() and d.name.endswith('_xtriage') for d in p.iterdir()
+        )
+        if not xtriage_exists:
             step_dirs = sorted(
                 (d for d in p.iterdir() if d.is_dir() and d.name[0].isdigit()),
                 key=lambda d: int(d.name.split('_')[0]), reverse=True,
@@ -285,7 +592,10 @@ class ProcessingScraper(ScraperBase):
         no subdir succeeded and there is no single candidate to diagnose.
         """
         # Flat case: job completed directly under index_path
-        if os.path.isdir(os.path.join(index_path, '13_xtriage')):
+        if any(
+            d.endswith('_xtriage') and os.path.isdir(os.path.join(index_path, d))
+            for d in os.listdir(index_path)
+        ):
             logs = []
             for d in os.listdir(index_path):
                 if d.endswith('_aimless') and os.path.isdir(os.path.join(index_path, d)):
@@ -307,15 +617,24 @@ class ProcessingScraper(ScraperBase):
         )
         for force_dir in force_dirs:
             force_path = os.path.join(index_path, force_dir)
-            if os.path.isdir(os.path.join(force_path, '13_xtriage')):
-                log = os.path.join(force_path, '10_aimless', '10_aimless.log')
-                return (log if os.path.isfile(log) else None), force_path
+            if any(
+                d.endswith('_xtriage') and os.path.isdir(os.path.join(force_path, d))
+                for d in os.listdir(force_path)
+            ):
+                # Find the highest-numbered aimless log in this force dir
+                aimless_logs = sorted(
+                    [(int(d.split('_')[0]), os.path.join(force_path, d, f'{d}.log'))
+                     for d in os.listdir(force_path)
+                     if d.endswith('_aimless') and os.path.isdir(os.path.join(force_path, d))],
+                    key=lambda x: x[0],
+                )
+                log = aimless_logs[-1][1] if aimless_logs else None
+                return (log if log and os.path.isfile(log) else None), force_path
 
         # No completed job found; flat case can still be diagnosed, force case cannot
         return None, (None if force_dirs else index_path)
 
     def find_results(self):
-        print(f"Looking in {self.result_path}...")
         results = []
         for dataset_name in sorted(os.listdir(self.result_path)):
             dataset_path = os.path.join(self.result_path, dataset_name)
@@ -344,7 +663,30 @@ class ProcessingScraper(ScraperBase):
                         'pipeline_subdir' : pipeline_subdir,
                         'outcome'         : 'unprocessed',
                     })
+        results.extend(self._find_rejections())
         return results
+
+    def _find_rejections(self):
+        """Read .rejected/*.txt markers written by RunProcess and return one
+        result dict per rejected pin so they surface in print_info().
+        """
+        rejected_dir = pathlib.Path(self.result_path) / ".rejected"
+        if not rejected_dir.is_dir():
+            return []
+        out = []
+        for marker in sorted(rejected_dir.glob("*.txt")):
+            try:
+                reason = marker.read_text().strip()
+            except OSError:
+                reason = "(could not read rejection marker)"
+            out.append({
+                'pin_code'    : marker.stem,
+                'dataset_code': marker.stem,
+                'result_path' : '',  # no result subdir for rejected pins
+                'error'       : reason,
+                'outcome'     : 'rejected',
+            })
+        return out
 
     def scrape_one_log(self, info_dict):
         logfile          = info_dict.get('aimless_log')
@@ -392,7 +734,7 @@ class ProcessingScraper(ScraperBase):
 
         return info_dict
 
-    def print_info(self):
+    def _print_table(self):
         HEADERS = ('Dataset', 'Type', 'SG', 'Cell', 'Res', 'Comp', 'Mult', 'CC1/2', 'Rpim', 'Note')
         tagged_rows = []
         for result in self.results:
@@ -407,12 +749,13 @@ class ProcessingScraper(ScraperBase):
                     cell  = ' '.join(result['Average unit cell'])
                     res   = result['High resolution limit'][-1]
                     sg    = result['Space group']
-                    tagged_rows.append((False, (code, rtype, sg, cell, res, comp, mult, cc12, rpim, '')))
+                    tagged_rows.append((None, (code, rtype, sg, cell, res, comp, mult, cc12, rpim, '')))
                 except (KeyError, TypeError):
-                    tagged_rows.append((False, (code, rtype, '?', '?', '?', '?', '?', '?', '?', 'missing stats')))
+                    tagged_rows.append((None, (code, rtype, '?', '?', '?', '?', '?', '?', '?', 'missing stats')))
+            elif result['outcome'] == 'rejected':
+                tagged_rows.append(('REJECTED', (code, rtype, result.get('error', ''))))
             else:
-                error = result.get('error', '')
-                tagged_rows.append((True, (code, rtype, error)))
+                tagged_rows.append(('FAILED', (code, rtype, result.get('error', ''))))
         self._print_table_mixed(tagged_rows, HEADERS)
 
     def write_qrefine_list(self, path=None):
@@ -461,6 +804,20 @@ class ProcessingScraper(ScraperBase):
 
 
 class QRefineScraper(ScraperBase):
+
+    KEY_STATS = [
+        ('Resolution (Å)', '%.2f'),
+        ('Rwork',          '%.4f'),
+        ('Rfree',          '%.4f'),
+    ]
+
+    def _stat_values(self, result):
+        return {
+            'Resolution (Å)': result.get('resolution'),
+            'Rwork':          result.get('rwork'),
+            'Rfree':          result.get('rfree'),
+        }
+
     def _parse_pdb_stats(self, pdb_path):
         """Extract Rwork, Rfree, and resolution from REMARK 3 in a PDB file."""
         rwork = rfree = res = None
@@ -486,7 +843,6 @@ class QRefineScraper(ScraperBase):
         return rwork, rfree, res
 
     def find_results(self):
-        print(f"Looking in {self.result_path}...")
         qrefine_dir = os.path.join(self.result_path, 'qrefine')
         results = []
         if not os.path.isdir(qrefine_dir):
@@ -531,7 +887,7 @@ class QRefineScraper(ScraperBase):
         info_dict['phaser']     = os.path.isfile(os.path.join(job_dir, f'02-phaser_{s}.1.pdb'))
         return info_dict
 
-    def print_info(self):
+    def _print_table(self):
         HEADERS = ('Job', 'Rwork', 'Rfree', 'Res', 'Phaser', 'Model', 'Note')
         tagged_rows = []
         for result in self.results:
@@ -637,6 +993,274 @@ class RefinementFilter(FilterBase):
         raise NotImplementedError
 
 
+class _PanddaAnalysisBackend:
+    """PanDDA (pandda.analyse) backend for AnalysisScraper.
+
+    Layer 2 of the analysis scraper: knows the on-disk output layout of one
+    analysis program.  All per-dataset and project-level stats come from the
+    single formatted HTML summary that pandda.analyse writes at
+    ``pandda/analyses/html_summaries/pandda_analyse.html`` (the ``analyses``
+    component is a dated symlink, so this path resolves through it).  The
+    ``pandda/pandda.done`` marker is the completion gate.
+
+    parse() returns ``(datasets, summary)`` in the shape AnalysisScraper
+    expects: ``datasets`` is a list of per-dataset result dicts (each with an
+    ``outcome`` already set), and ``summary`` is a dict of project-level counts.
+
+    Adding another backend (e.g. pandda2) = write a sibling class with the same
+    ``name`` / ``detect`` / ``is_complete`` / ``parse`` interface and register
+    it in ``AnalysisScraper._BACKENDS``; AnalysisScraper itself is untouched.
+    """
+
+    name = "pandda"
+    HTML_RELPATH = ("pandda", "analyses", "html_summaries", "pandda_analyse.html")
+    DONE_RELPATH = ("pandda", "pandda.done")
+
+    # PanDDA "Overall" column value -> ScraperBase outcome.
+    _OUTCOME = {
+        "analysed":     "completed",
+        "not analysed": "failed",
+        "rejected":     "rejected",
+    }
+
+    def __init__(self, result_path):
+        self.result_path = str(result_path)
+        self.html_path = os.path.join(self.result_path, *self.HTML_RELPATH)
+        self.done_path = os.path.join(self.result_path, *self.DONE_RELPATH)
+
+    def detect(self):
+        """True when this backend's HTML summary exists under result_path."""
+        return os.path.isfile(self.html_path)
+
+    def is_complete(self):
+        """True when the pandda.done completion marker is present."""
+        return os.path.isfile(self.done_path)
+
+    # ---------------------------------------------------------------- #
+    # HTML parsing helpers                                             #
+    # ---------------------------------------------------------------- #
+    @staticmethod
+    def _cell_text(cell_html):
+        """Collapse one <td>/<th> inner-HTML to clean text."""
+        text = re.sub(r"<[^>]+>", " ", cell_html)
+        return re.sub(r"\s+", " ", html_unescape(text)).strip()
+
+    @classmethod
+    def _row_cells(cls, row_html):
+        return [cls._cell_text(c)
+                for c in re.findall(r"<t[hd][^>]*>(.*?)</t[hd]>", row_html,
+                                    re.S | re.I)]
+
+    @staticmethod
+    def _to_float(text):
+        try:
+            return float(text)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _cluster_count(text):
+        """'1 Clusters' -> 1, '' -> 0."""
+        m = re.match(r"\s*(\d+)", text or "")
+        return int(m.group(1)) if m else 0
+
+    def parse(self):
+        with open(self.html_path) as fh:
+            html = fh.read()
+        datasets = self._parse_datasets(html)
+        summary = self._parse_summary(html, datasets)
+        return datasets, summary
+
+    def _parse_datasets(self, html):
+        """Parse the per-dataset summary table into result dicts.
+
+        Columns are located by header name (not fixed position) so a future
+        pandda column reorder does not silently misread the table.
+        """
+        table = re.search(r"<table.*?</table>", html, re.S | re.I)
+        if not table:
+            return []
+        rows = re.findall(r"<tr.*?</tr>", table.group(0), re.S | re.I)
+        if not rows:
+            return []
+        header = [h.lower() for h in self._row_cells(rows[0])]
+        idx = {name: i for i, name in enumerate(header)}
+
+        def col(cells, name):
+            i = idx.get(name)
+            return cells[i] if i is not None and i < len(cells) else ""
+
+        results = []
+        for row in rows[1:]:
+            cells = self._row_cells(row)
+            if not cells:
+                continue
+            rfree = rwork = None
+            rr = col(cells, "rfree/rwork")
+            if "/" in rr:
+                a, b = rr.split("/", 1)
+                rfree, rwork = self._to_float(a), self._to_float(b)
+            overall = col(cells, "overall")
+            checks = col(cells, "dataset checks")
+            result_text = col(cells, "result")
+            results.append({
+                "dtag":            col(cells, "dataset"),
+                "checks":          checks,
+                "rfree":           rfree,
+                "rwork":           rwork,
+                "resolution":      self._to_float(col(cells, "resolution")),
+                "reference_rmsd":  self._to_float(col(cells, "reference rmsd")),
+                "map_uncertainty": self._to_float(col(cells, "map uncertainty")),
+                "clusters":        self._cluster_count(col(cells, "interesting areas")),
+                "result":          result_text,
+                "interesting":     result_text.lower() == "z-blobs found",
+                "outcome":         self._OUTCOME.get(overall.lower(), "failed"),
+            })
+        return results
+
+    def _parse_summary(self, html, datasets):
+        """Project-level counts, derived from the parsed rows plus the number
+        of 'Identified Site Summary (N)' sections (sites are not in the table).
+        """
+        site_nums = [int(n) for n in
+                     re.findall(r"Identified Site Summary \((\d+)\)", html)]
+        analysed = [d for d in datasets if d["outcome"] == "completed"]
+        return {
+            "total":          len(datasets),
+            "analysed":       len(analysed),
+            "not_analysed":   sum(1 for d in datasets if d["outcome"] == "failed"),
+            "rejected":       sum(1 for d in datasets if d["outcome"] == "rejected"),
+            "interesting":    sum(1 for d in datasets if d["interesting"]),
+            "clusters":       sum(d["clusters"] for d in datasets),
+            "sites":          max(site_nums) if site_nums else 0,
+            "failing_checks": sum(1 for d in datasets
+                                  if d["checks"] and d["checks"].lower() != "ok"),
+        }
+
+
+class AnalysisScraper(ScraperBase):
+    """Scrape analysis-pipeline results into the standardized summary interface.
+
+    Layer 1 (backend-agnostic): implements the ScraperBase contract
+    (find_results / scrape_all / _stat_values / _print_table) and a
+    project-level summary overlay via _summary_counts().  The actual
+    output discovery and parsing is delegated to a backend parser (Layer 2,
+    see _PanddaAnalysisBackend) selected by _select_backend(): an explicit
+    ``backend=`` wins, otherwise the first registered backend whose output is
+    present on disk, otherwise DEFAULT_BACKEND.  New analysis programs plug in
+    by registering a backend in _BACKENDS; this class does not change.
+    """
+
+    # backend name -> parser class (populated below, after the class body)
+    _BACKENDS = {}
+    DEFAULT_BACKEND = "pandda"
+
+    TOTAL_LABEL = "Total datasets"
+
+    KEY_STATS = [
+        ('Resolution (Å)',   '%.2f'),
+        ('RFree',            '%.3f'),
+        ('RWork',            '%.3f'),
+        ('Map Uncertainty',  '%.3f'),
+        ('Interesting areas', '%.1f'),
+    ]
+
+    def __init__(self, result_path, backend=None):
+        super().__init__(result_path)
+        self.backend_name = backend
+        self.backend = None
+        self.summary = {}
+
+    def _select_backend(self):
+        name = self.backend_name
+        if name is None:
+            for cand, cls in self._BACKENDS.items():
+                if cls(self.result_path).detect():
+                    name = cand
+                    break
+            else:
+                name = self.DEFAULT_BACKEND
+        cls = self._BACKENDS.get(name)
+        if cls is None:
+            raise ValueError(f"Unknown analysis backend {name!r} "
+                             f"(known: {', '.join(self._BACKENDS) or 'none'})")
+        return cls(self.result_path)
+
+    def find_results(self):
+        self.backend = self._select_backend()
+        if not self.backend.detect():
+            print(f"vic.summary: no {self.backend.name} analysis output found "
+                  f"under {os.path.abspath(str(self.result_path))}.")
+            return []
+        if not self.backend.is_complete():
+            print(f"vic.summary: {self.backend.name} run not finished "
+                  f"(no completion marker); reporting partial results.")
+        datasets, summary = self.backend.parse()
+        self.summary = summary
+        return datasets
+
+    def scrape_all(self):
+        # The backend parses every dataset from the single HTML summary in one
+        # pass and sets each outcome, so there is no per-log scrape step.
+        self.results = self.find_results()
+
+    def _stat_values(self, result):
+        clusters = result.get('clusters')
+        return {
+            'Resolution (Å)':   result.get('resolution'),
+            'RFree':            result.get('rfree'),
+            'RWork':            result.get('rwork'),
+            'Map Uncertainty':  result.get('map_uncertainty'),
+            # median over interesting datasets only: 0-cluster datasets return
+            # None here so they drop out of the median (an all-datasets median
+            # would just be 0 and carry no information).
+            'Interesting areas': clusters if clusters else None,
+        }
+
+    def _summary_counts(self):
+        s = self.summary
+        if not s:
+            return []
+        return [
+            ("Interesting (hits)", s.get('interesting', 0)),
+            ("Identified sites",   s.get('sites', 0)),
+            ("Total clusters",     s.get('clusters', 0)),
+            ("Failed checks",      s.get('failing_checks', 0)),
+        ]
+
+    def _print_table(self):
+        HEADERS = ('Dataset', 'Res', 'RFree', 'RWork', 'Clusters', 'Result')
+        tagged_rows = []
+        for r in self.results:
+            name = r.get('dtag') or '?'
+            if r['outcome'] == 'completed':
+                res    = f"{r['resolution']:.2f}A" if r.get('resolution') is not None else 'n/a'
+                rfree  = f"{r['rfree']:.3f}"        if r.get('rfree')      is not None else 'n/a'
+                rwork  = f"{r['rwork']:.3f}"        if r.get('rwork')      is not None else 'n/a'
+                clus   = str(r.get('clusters', 0))
+                result = r.get('result') or '-'
+                tagged_rows.append((False, (name, res, rfree, rwork, clus, result)))
+            else:
+                status = 'REJECTED' if r['outcome'] == 'rejected' else 'NOT ANALYSED'
+                tagged_rows.append((status, (name, r.get('checks', ''))))
+        self._print_table_mixed(tagged_rows, HEADERS)
+
+
+AnalysisScraper._BACKENDS = {
+    _PanddaAnalysisBackend.name: _PanddaAnalysisBackend,
+}
+
+
+class AnalysisFilter(FilterBase):
+    """Filter and deduplicate analysis results. (Not yet implemented.)"""
+
+    def filter_quality(self, results):
+        raise NotImplementedError
+
+    def select_best(self, group):
+        raise NotImplementedError
+
+
 class WatcherBase(object):
 
     _OMNIBUS_LOG = "processing.log"
@@ -646,6 +1270,15 @@ class WatcherBase(object):
         "PREP"   : "PREPARING",
         "RUN"    : "RUNNING",
         "FORCE"  : "RUNNING_FORCE",
+        # BYPASS/SKIP are NON-terminal: a step logging them is recovering or
+        # continuing, not finished.  They must be recognized here, otherwise the
+        # bottom-up scan in _read_pipeline_log skips the unknown tag and falls
+        # back to a preceding ERROR -- making a job that is actively re-running
+        # in place (e.g. the <50%-indexed BYPASS path) look terminally FAILED.
+        # Only FINISHED/FAILED are treated as terminal downstream, so any other
+        # value here counts as in-progress.
+        "BYPASS" : "BYPASSING",
+        "SKIP"   : "SKIPPED",
         "DONE"   : "FINISHED",
         "ERROR"  : "FAILED",
     }
@@ -837,6 +1470,55 @@ class ProcessingWatcher(WatcherBase):
                     logs.append(flat_log)
         return logs
 
+    def _psf_status(self, psf_path):
+        """Aggregate one crystal subfolder's status across its ``index_*/``
+        attempts, treating forced-lattice (``*_force/``) re-runs correctly.
+
+        A forced attempt counts as still-running while its ``*_force/`` directory
+        exists (it is created *before* the SGE job is submitted) but its
+        ``pipeline.log`` is missing or non-terminal -- so the run is never
+        declared done while forced re-runs are queued or in flight.  The dataset
+        is non-terminal if ANY attempt is non-terminal; otherwise FINISHED if ANY
+        attempt finished (forced integration deliberately tries several lattices,
+        most of which fail); otherwise FAILED.  Returns ``(None, None)`` when
+        there is no information yet (treated as in-progress by get_counts)."""
+        states = []        # terminal (status, msg) from attempts that have a log
+        running = None     # a representative non-terminal (status, msg), if any
+        pending = False    # a *_force/ (or index_) dir exists with no terminal log yet
+        try:
+            entries = sorted(os.listdir(psf_path))
+        except OSError:
+            return (None, None)
+        for entry in entries:
+            index_path = os.path.join(psf_path, entry)
+            if not (entry.startswith('index_') and os.path.isdir(index_path)):
+                continue
+            force_dirs = [s for s in os.listdir(index_path)
+                          if s.endswith('_force')
+                          and os.path.isdir(os.path.join(index_path, s))]
+            if force_dirs:
+                log_paths = [os.path.join(index_path, fd, 'pipeline.log') for fd in force_dirs]
+            else:
+                log_paths = [os.path.join(index_path, 'pipeline.log')]
+            for lp in log_paths:
+                if not os.path.isfile(lp):
+                    pending = True          # job submitted, not yet logging
+                    continue
+                st, msg = self._read_pipeline_log(lp)
+                if st is None:
+                    continue
+                if st in ("FINISHED", "FAILED"):
+                    states.append((st, msg))
+                else:
+                    running = running or (st, msg)
+        if pending or running:
+            return running or ("RUNNING_FORCE", None)
+        if not states:
+            return (None, None)
+        if any(s == "FINISHED" for s, _ in states):
+            return ("FINISHED", None)
+        return ("FAILED", next((m for s, m in states if s == "FAILED"), None))
+
     def watch(self):
         folders = [name for name in os.listdir(self.procpath)
                    if os.path.isdir(os.path.join(self.procpath, name))]
@@ -848,22 +1530,9 @@ class ProcessingWatcher(WatcherBase):
             for psf_name in self.datasets[pin]:
                 if "REJECTED" in self.datasets[pin][psf_name]:
                     continue
-                psf = os.path.join(pin_folder_path, psf_name)
-                logs = self._pipeline_logs(psf)
-                if not logs:
-                    continue
-                statuses = [self._read_pipeline_log(l) for l in logs]
-                statuses = [(s, m) for s, m in statuses if s is not None]
-                if not statuses:
-                    continue
-                if any(s == "FAILED" for s, _ in statuses):
-                    failed_msg = next(m for s, m in statuses if s == "FAILED")
-                    self.datasets[pin][psf_name] = ("FAILED", failed_msg)
-                elif all(s == "FINISHED" for s, _ in statuses):
-                    self.datasets[pin][psf_name] = ("FINISHED", None)
-                else:
-                    last_s, last_m = statuses[-1]
-                    self.datasets[pin][psf_name] = (last_s, last_m)
+                status = self._psf_status(os.path.join(pin_folder_path, psf_name))
+                if status != (None, None):
+                    self.datasets[pin][psf_name] = status
 
     def tail_logs(self, log_file=None):
         """Print any new lines added to pipeline.log files since last call."""
@@ -1094,11 +1763,13 @@ class ProgressBar:
         "PanDDAWatcher"     : lambda path: "Running panDDA",
     }
 
-    def __init__(self, watcher, multiline=False, title=None):
+    def __init__(self, watcher, multiline=False, title=None, separator=False):
         self.watcher = watcher
         self.multiline = multiline
+        self.separator = separator
         self._drawn = False
         self._prev_lines = 0  # lines printed on last draw (multiline mode)
+        self._last_state = None  # cached count signature for spinner-only updates
         if title is not None:
             self._title = title
         else:
@@ -1110,6 +1781,22 @@ class ProgressBar:
         n   = len(self._SPINNER_CHARS)
         idx = int((time.time() % self._SPINNER_PERIOD) / self._SPINNER_PERIOD * n)
         return self._SPINNER_CHARS[idx % n]
+
+    def erase(self):
+        """Clear the bar area so new content can be printed above it.
+
+        Moves the cursor to the top-left of the bar block, clears to end of
+        screen, and resets draw state so the next draw() call prints fresh.
+        """
+        if not self._drawn:
+            return
+        n_up = (self._prev_lines - 1) if self.multiline else 1
+        if n_up > 0:
+            print(f"\033[{n_up}A", end="")
+        print("\r\033[J", end="", flush=True)
+        self._drawn = False
+        self._prev_lines = 0
+        self._last_state = None
 
     def draw(self):
         """Redraw progress in place. Returns True if any jobs still running."""
@@ -1139,7 +1826,7 @@ class ProgressBar:
         if self._drawn:
             print("\033[1A\r", end="")   # up 1 line, back to column 0
 
-        print(f"\033[2K{self._SIMPLE_LEGEND}")
+        print(f"\033[2K {self._spinner_char()}  {self._SIMPLE_LEGEND}")
         print(f"\033[2K({finished + failed + rejected}/{total}) [{bar}]",
               end="", flush=True)
         self._drawn = True
@@ -1159,22 +1846,34 @@ class ProgressBar:
             "no_longer_running":    finished + failed + rejected,
         }
         active = [(label, counts[key]) for label, key, _sym in self._MULTILINE_CATEGORIES]
+        state = (total, tuple(c for _, c in active), self.separator)
 
-        bar_width = 40
+        # If counts are unchanged since last full draw, update only the spinner
+        # char on the title line in place — leaves the rest of the bar untouched
+        # so it doesn't blink.  Cursor saved/restored via DEC SC/RC.
+        if self._drawn and self._last_state == state:
+            n_up = len(active)
+            sys.stdout.write(
+                f"\033[s\033[{n_up}A\r\033[2K {self._spinner_char()}  {self._title}\033[u"
+            )
+            sys.stdout.flush()
+            return in_progress > 0
+
+        bar_width = min(total, 50) if total > 0 else 50
         denom = total or 1
         new_lines = len(active) + 1  # +1 for title line
+        if self.separator:
+            new_lines += 1
 
-        # Reposition cursor to start of our block.
-        # Cursor sits at end of last printed line (no trailing \n).
+        # Build the full bar block as a single write so the redraw is visually atomic.
+        parts = []
         if self._drawn and self._prev_lines > 0:
             if self._prev_lines > 1:
-                print(f"\033[{self._prev_lines - 1}A", end="")
-            print("\r", end="")
-
-        # Title line with spinner
-        print(f"\033[2K {self._spinner_char()}  {self._title}")
-
-        # Draw per-category lines
+                parts.append(f"\033[{self._prev_lines - 1}A")
+            parts.append("\r")
+        if self.separator:
+            parts.append(f"\033[2K{'─' * 72}\n")
+        parts.append(f"\033[2K {self._spinner_char()}  {self._title}\n")
         for i, (label, count) in enumerate(active):
             n = round(count / denom * bar_width)
             if count > 0 and n == 0:
@@ -1182,22 +1881,20 @@ class ProgressBar:
             else:
                 bar = "█" * n
             line = f"\033[2K{label:>10}: {count:>4}/{total:<4} │{bar:<{bar_width}}"
-            if i < len(active) - 1:
-                print(line)
-            else:
-                print(line, end="", flush=True)
-
-        # Blank out any extra lines from the previous (longer) draw, then
+            parts.append(line + ("\n" if i < len(active) - 1 else ""))
+        # Blank out extra lines left over from a previous longer draw, then
         # move cursor back up so it sits at the end of the last real line.
         extra = self._prev_lines - new_lines
         if extra > 0:
             for _ in range(extra):
-                print()
-                print("\033[2K", end="")
-            print(f"\033[{extra}A", end="", flush=True)
+                parts.append("\n\033[2K")
+            parts.append(f"\033[{extra}A")
+        sys.stdout.write("".join(parts))
+        sys.stdout.flush()
 
         self._drawn = True
         self._prev_lines = new_lines
+        self._last_state = state
         return in_progress > 0
 
 
@@ -1270,7 +1967,17 @@ class Spinner:
             j = i % n
             sys.stdout.write(f"\033[{self.height}A" + self._draw(self._rows[j], self._chars[j]))
             sys.stdout.flush()
-        sys.stdout.write(f"\033[{self.height}A" + "   \n" * self.height)
+        # Clear the spinner area and park the cursor at the start of its first
+        # row WITHOUT a trailing newline, so the caller's next print() overwrites
+        # the spinner line in place instead of leaving a dead line behind it.
+        sys.stdout.write(f"\033[{self.height}A\r")
+        for r in range(self.height):
+            sys.stdout.write("\033[2K")
+            if r < self.height - 1:
+                sys.stdout.write("\033[1B")
+        if self.height > 1:
+            sys.stdout.write(f"\033[{self.height - 1}A")
+        sys.stdout.write("\r")
         sys.stdout.flush()
 
     def start(self):
@@ -1294,23 +2001,8 @@ class Spinner:
 class QRefineWriter:
     """
     Scans a completed XDS pipeline output directory, then writes
-    qrefine_list.txt and qrefine_input_parameters.txt.
-
-    qrefine_list.txt             — one row per completed job (MTZ file found)
-    qrefine_input_parameters.txt — one ## crystal ## block per unique
-                                   crystal_name; mr_pdb is a placeholder.
+    qrefine_list.txt (one row per completed job -- MTZ file found).
     """
-
-    _DEFAULT_PARAMS = [
-        ('mr_pdb',          '/path/to/reference.pdb'),
-        ('mr_cutoff',       '0.45'),
-        ('mr_water',        'both'),
-        ('mr_tncs',         'false'),
-        ('mr_copies',       '1'),
-        ('mr_mw',           '100000'),
-        ('mr_seq_id',       '1.0'),
-        ('mr_try_monomer',  'false'),
-    ]
 
     def __init__(self, process_dir):
         self.process_dir = pathlib.Path(process_dir).resolve()
@@ -1321,10 +2013,10 @@ class QRefineWriter:
 
         for mtz in sorted(self.process_dir.rglob('XDS_ASCII_ctruncate.mtz')):
             rel = mtz.relative_to(self.process_dir).parts
-            if len(rel) == 6 and rel[0] == 'processing' and rel[4] == '11_rfree':
+            if len(rel) == 6 and rel[0] == 'processing' and rel[4].endswith('_rfree'):
                 pin, crystal_dir, index_dir = rel[1], rel[2], rel[3]
                 integration = 'integration not forced'
-            elif len(rel) == 7 and rel[0] == 'processing' and rel[4].endswith('_force') and rel[5] == '11_rfree':
+            elif len(rel) == 7 and rel[0] == 'processing' and rel[4].endswith('_force') and rel[5].endswith('_rfree'):
                 pin, crystal_dir, index_dir = rel[1], rel[2], rel[3]
                 force_base = rel[4][:-len('_force')]          # e.g. '1_P43212'
                 prefix, sg = force_base.split('_', 1)
@@ -1361,18 +2053,5 @@ class QRefineWriter:
                 fh.write(f"{pin},{crystal_name},{cell_refined},{index},{integration}\n")
         print(str(out))
 
-    def write_qrefine_input_parameters(self, path=None):
-        entries = self._find_completed()
-        seen = dict.fromkeys(e[1] for e in entries)   # unique crystal_names, insertion order
-        out = pathlib.Path(path) if path else self.process_dir / 'qrefine_input_parameters.txt'
-        with open(out, 'w') as fh:
-            for crystal_name in seen:
-                fh.write('## crystal ##\n')
-                fh.write(f'crystal_name={crystal_name}\n')
-                for key, val in self._DEFAULT_PARAMS:
-                    fh.write(f'{key}={val}\n')
-        print(str(out))
-
     def write(self):
         self.write_qrefine_list()
-        self.write_qrefine_input_parameters()

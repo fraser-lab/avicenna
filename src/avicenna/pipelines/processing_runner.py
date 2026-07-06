@@ -27,167 +27,11 @@ import time
 from datetime import datetime
 from pathlib import Path
 sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "src"))
-from avicenna.utils.utils import BRAVAIS_LATTICES, QRefineWriter, format_log_line, ProcessingWatcher
+from avicenna.utils.utils import BRAVAIS_LATTICES, QRefineWriter, format_log_line, ProcessingWatcher, sg_lookup, count_hdf5_images, qsub_terse
+from avicenna.utils.software import find_xds, find_ccp4, find_phenix, suite_setup_sources
+from avicenna.utils import resources
 
 
-def _find_latest_xds_dir(explicit_root=None):
-    """Return the Path to the XDS installation root containing bin/ and lib/.
-
-    If explicit_root is provided it takes precedence over all auto-detection.
-    Otherwise tries in order:
-    1. SBGrid with $SBG_PROGRAMS set: construct path from env var + platform.
-    2. Standard SBGrid filesystem path under /programs (works without sourcing).
-    3. Non-SBGrid bare install: xds_par is the actual binary; go two levels up.
-    """
-    if explicit_root:
-        explicit_root = Path(explicit_root)
-        if (explicit_root / "bin" / "xds_par").is_file():
-            return explicit_root
-        raise FileNotFoundError(f"No valid XDS installation found at {explicit_root}")
-
-    arch = f"{platform.machine()}-{'darwin' if sys.platform == 'darwin' else 'linux'}"
-
-    for xds_root in (
-        Path(os.environ["SBG_PROGRAMS"]) / arch / "xds" if os.environ.get("SBG_PROGRAMS") else None,
-        Path("/programs") / arch / "xds",
-    ):
-        if xds_root and xds_root.is_dir():
-            candidates = [
-                d for d in xds_root.iterdir()
-                if d.is_dir() and d.name.isdigit() and len(d.name) == 8
-            ]
-            if candidates:
-                return max(candidates, key=lambda d: d.name)
-
-    xds_par = shutil.which("xds_par")
-    if xds_par:
-        candidate = Path(xds_par).resolve().parents[1]
-        if (candidate / "bin" / "xds_par").is_file():
-            return candidate
-
-    raise FileNotFoundError(
-        "XDS installation not found. "
-        "Source SBGrid, ensure xds_par is on PATH, or pass --xds_root."
-    )
-
-
-def _find_xdsstat():
-    """Return Path to the xdsstat binary.
-
-    Tries in order:
-    1. SBGrid with $SBG_PROGRAMS set.
-    2. Standard SBGrid filesystem path under /programs.
-    3. xdsstat on PATH.
-    """
-    arch = f"{platform.machine()}-{'darwin' if sys.platform == 'darwin' else 'linux'}"
-
-    for xdsstat_root in (
-        Path(os.environ["SBG_PROGRAMS"]) / arch / "xdsstat" if os.environ.get("SBG_PROGRAMS") else None,
-        Path("/programs") / arch / "xdsstat",
-    ):
-        if xdsstat_root and xdsstat_root.is_dir():
-            candidates = [d for d in xdsstat_root.iterdir()
-                          if d.is_dir() and (d / "xdsstat").is_file()]
-            if candidates:
-                return max(candidates, key=lambda d: d.stat().st_mtime) / "xdsstat"
-
-    xdsstat = shutil.which("xdsstat")
-    if xdsstat:
-        return Path(xdsstat)
-
-    raise FileNotFoundError(
-        "xdsstat not found. Source SBGrid or ensure xdsstat is on PATH."
-    )
-
-
-def _find_ccp4_bin():
-    """Return Path to the CCP4 bin/ directory.
-
-    Tries in order:
-    1. SBGrid with $SBG_PROGRAMS set.
-    2. Standard SBGrid filesystem path under /programs.
-    3. pointless on PATH; use its parent directory.
-
-    Within the CCP4 installation root, versions are sorted by parsed version
-    tuple so that 9.0.014 > 9.0.008 > 8.0, etc.  The actual bin/ lives one
-    level deeper inside a directory named ccp4-<variant>.
-    """
-    arch = f"{platform.machine()}-{'darwin' if sys.platform == 'darwin' else 'linux'}"
-
-    for ccp4_root in (
-        Path(os.environ["SBG_PROGRAMS"]) / arch / "ccp4" if os.environ.get("SBG_PROGRAMS") else None,
-        Path("/programs") / arch / "ccp4",
-    ):
-        if not (ccp4_root and ccp4_root.is_dir()):
-            continue
-        candidates = []
-        for d in ccp4_root.iterdir():
-            if not d.is_dir():
-                continue
-            parts = re.findall(r"\d+", d.name)
-            if parts:
-                candidates.append((tuple(int(x) for x in parts), d))
-        for _, version_dir in sorted(candidates, key=lambda x: x[0], reverse=True):
-            for subdir in version_dir.iterdir():
-                if subdir.name.startswith("ccp4-") and (subdir / "bin" / "pointless").is_file():
-                    return subdir / "bin"
-
-    pointless = shutil.which("pointless")
-    if pointless:
-        return Path(pointless).parent
-
-    raise FileNotFoundError(
-        "CCP4 installation not found. "
-        "Source SBGrid or ensure pointless is on PATH."
-    )
-
-
-def _find_phenix_bin():
-    """Return Path to the Phenix bin directory (phenix_bin/ or build/bin/).
-
-    Tries in order:
-    1. SBGrid with $SBG_PROGRAMS set.
-    2. Standard SBGrid filesystem path under /programs.
-    3. phenix.xtriage on PATH; use its parent directory.
-    """
-    arch = f"{platform.machine()}-{'darwin' if sys.platform == 'darwin' else 'linux'}"
-
-    for phenix_root in (
-        Path(os.environ["SBG_PROGRAMS"]) / arch / "phenix" if os.environ.get("SBG_PROGRAMS") else None,
-        Path("/programs") / arch / "phenix",
-    ):
-        if not (phenix_root and phenix_root.is_dir()):
-            continue
-        candidates = []
-        for d in phenix_root.iterdir():
-            if not d.is_dir():
-                continue
-            parts = re.findall(r"\d+", d.name)
-            if not parts:
-                continue
-            for bin_subdir in ("phenix_bin", "build/bin"):
-                bin_dir = d / bin_subdir
-                if bin_dir.is_dir() and (bin_dir / "phenix.xtriage").is_file():
-                    candidates.append((tuple(int(x) for x in parts), bin_dir))
-                    break
-        if candidates:
-            return max(candidates, key=lambda x: x[0])[1]
-
-    xtriage = shutil.which("phenix.xtriage")
-    if xtriage:
-        return Path(xtriage).parent
-
-    raise FileNotFoundError(
-        "Phenix installation not found. "
-        "Source SBGrid or ensure phenix.xtriage is on PATH."
-    )
-
-
-# TODO: HDF5 image counting is not yet implemented.
-# Eiger master files vary significantly in internal structure across firmware
-# versions and beamlines, and some future formats do not yet exist.  Until a
-# robust multi-format reader is available, the MIN_IMAGES check is skipped for
-# HDF5 datasets.  See RunProcess.run() for the skip logic.
 
 
 class RunBase:
@@ -211,30 +55,39 @@ class RunXDS(RunBase):
     parameters, refined symmetry/resolution) as well as reference datasets
     for known-symmetry constraints.
 
-    The four processing scenarios, each implemented as a method, mirror the
-    branching logic in run_xds.sh:
+    The three processing scenarios, each implemented as a method:
 
-        xds_initial_indexing   -- job 1, force_integration=False (default)
-        xds_forced_integration -- job 1, force_integration=True
-        xds_recycle_detector   -- job 2
-        xds_refine_symmetry    -- jobs 5 / 8
+        xds_initial_indexing   -- step 1_xds, generate_inp=True
+        xds_forced_integration -- step 1_xds, force_integration=True
+        xds_recycle_detector   -- step 4_xds, generate_inp=False, recycle_geometry=True
+        xds_refine_symmetry    -- step 7_xds, generate_inp=False, update_symmetry=True
     """
 
-    def __init__(self, params, job, xds_executable, xdsstat_executable):
+    def __init__(self, params, step_id, xds_executable, xdsstat_executable,
+                 prev_xds_id=None, prev_aimless_id=None, prev_pointless_id=None):
         """
         Parameters
         ----------
         params : dict
             Pipeline parameters from vic_process.py / RunProcess.
-        job : int
-            Sequential job number within the pipeline (1, 2, 5, or 8).
+        step_id : str
+            Step identifier and output directory name (e.g. "1_xds", "4_xds").
         xds_executable : str or Path
             Full path to the xds_par binary.
         xdsstat_executable : str or Path
             Full path to the xdsstat binary.
+        prev_xds_id : str or None
+            step_id of the preceding XDS step to copy geometry from.
+        prev_aimless_id : str or None
+            step_id of the preceding Aimless step to read symmetry/resolution from.
+        prev_pointless_id : str or None
+            step_id of the preceding Pointless step to read space group from.
         """
         self.params = params
-        self.job = job
+        self.step_id = step_id
+        self.prev_xds_id       = prev_xds_id
+        self.prev_aimless_id   = prev_aimless_id
+        self.prev_pointless_id = prev_pointless_id
         self.xds_executable    = Path(xds_executable)
         self.xdsstat_executable = Path(xdsstat_executable)
 
@@ -244,7 +97,11 @@ class RunXDS(RunBase):
         self.image_dir         = Path(params.get("image_dir"))
         self.pipeline_subdir   = Path(params.get("pipeline_subdir"))
         self.image_range       = params.get("image_range", "").replace("-", " ")
+        # ncpu / xds_jobs are resolved to concrete ints at submit time (see
+        # RunProcess.run); kept raw here so a stray "auto" can still be resolved
+        # from the frame count in _set_xds_processors rather than crashing.
         self.ncpu              = params.get("ncpu", 8)
+        self.njobs             = params.get("xds_jobs", 1)
         self.force_integration = params.get("force_integration", "false")
         self.known_first_pass  = params.get("known_first_pass", "none")
         self.known_sg          = params.get("known_sg", "none")
@@ -255,7 +112,6 @@ class RunXDS(RunBase):
         self.sg                = params.get("sg", "none")
         self.sg_number         = params.get("sg_number", "none")
         self.cell              = params.get("cell", "none").replace("-", " ")
-        self.recycle_xds       = params.get("recycle_xds", "false")
         self.refine_cell_integrate = params.get("refine_cell_integrate", "true")
         self.detector_edge     = float(params.get("detector_edge", 0.8))
         self.res_limit         = params.get("res_limit", "cc12")
@@ -268,16 +124,16 @@ class RunXDS(RunBase):
     # ------------------------------------------------------------------
 
     def _run_xds(self):
-        """Execute xds_par in the current directory, writing log to <job>_xds.log."""
-        log = Path(f"{self.job}_xds.log")
+        """Execute xds_par in the current directory, writing log to <step_id>.log."""
+        log = Path(f"{self.step_id}.log")
         with open(log, "w") as fh:
             subprocess.run([str(self.xds_executable)], stdout=fh, stderr=fh)
 
     def _run_xdsstat(self):
-        """Run xdsstat on XDS_ASCII.HKL if it was produced, writing <job>_xdsstat.log."""
+        """Run xdsstat on XDS_ASCII.HKL if it was produced."""
         if Path("XDS_ASCII.HKL").is_file():
-            log = Path(f"{self.job}_xdsstat.log")
-            with open(log, "w") as fh:
+            xdsstat_log = self.step_id.replace("_xds", "_xdsstat") + ".log"
+            with open(Path(xdsstat_log), "w") as fh:
                 subprocess.run([str(self.xdsstat_executable)],
                                input="\n", text=True, stdout=fh, stderr=fh)
 
@@ -306,11 +162,15 @@ class RunXDS(RunBase):
             xds_inp.write_text(text)
 
     def _inject_lib(self, xds_inp):
-        """Prepend LIB= to XDS.INP so neggia can read HDF5 data. No-op for CBF."""
+        """Prepend LIB= to XDS.INP so neggia can read HDF5 data. No-op for CBF
+        or when an active LIB= line is already present."""
         if self.data_format != 'hdf5':
             return
+        existing = xds_inp.read_text()
+        if any(line.lstrip().startswith("LIB=") for line in existing.splitlines()):
+            return
         neggia = self._xds_dir / "lib" / "dectris-neggia.so"
-        xds_inp.write_text(f"LIB={neggia}\n" + xds_inp.read_text())
+        xds_inp.write_text(f"LIB={neggia}\n" + existing)
 
     def _recycle_detector_params(self, xds_dir, xds_inp, is_job2=False):
         """
@@ -327,9 +187,9 @@ class RunXDS(RunBase):
         xds_inp : Path
             XDS.INP file to update in place.
         is_job2 : bool
-            True when this is job 2: the divergence/range parameters are
-            *inserted* after DETECTOR_DISTANCE rather than overwriting
-            existing lines.
+            True when recycling into the detector-only step: BEAM_DIVERGENCE and
+            REFLECTING_RANGE are *inserted* after DETECTOR_DISTANCE rather than
+            overwriting existing lines.
         """
         hkl_text = (xds_dir / "XDS_ASCII.HKL").read_text()
         int_lp   = (xds_dir / "INTEGRATE.LP").read_text()
@@ -381,23 +241,39 @@ class RunXDS(RunBase):
             text = re.sub(r"REFLECTING_RANGE=.*", reflecting_range, text)
             xds_inp.write_text(text)
 
+    def _xds_processor_settings(self):
+        """Return ``(processors, jobs)`` for this XDS run.
+
+        Normally both are concrete ints baked into params.json at submit time
+        (RunProcess.run).  If 'auto' leaks through (e.g. a direct/legacy caller),
+        size them here from the frame count of the range being processed so the
+        run never crashes on a string."""
+        procs, jobs = self.ncpu, self.njobs
+        if resources.is_auto(procs):
+            rng  = self.data_range if self.data_range != "false" else self.image_range
+            nums = [int(x) for x in str(rng).split() if x.lstrip("-").isdigit()]
+            if len(nums) >= 2:
+                frames = nums[-1] - nums[0] + 1
+            else:
+                frames = nums[0] if nums else 1
+            _, jobs, procs = resources.xds_slots(frames)
+        return int(procs), int(jobs)
+
     # ------------------------------------------------------------------
     # Scenario methods
     # ------------------------------------------------------------------
 
     def xds_initial_indexing(self):
         """
-        Default first-pass XDS run (job 1, force_integration=False).
+        Default first-pass XDS run (step 1_xds).
 
         Generates XDS.INP from scratch using the generate_XDS.INP helper
         script, then runs the full XYCORR → INIT → COLSPOT → IDXREF →
         DEFPIX → INTEGRATE → CORRECT pipeline.  Optionally seeds XDS.INP
         with a known space group and unit cell for constrained indexing,
         and injects a reference HKL for isomorphism-guided integration.
-        Corresponds to the ``job == 1 and force_integration == false``
-        branch in run_xds.sh.
         """
-        job_dir = self.pipeline_subdir / f"{self.job}_xds"
+        job_dir = self.pipeline_subdir / self.step_id
         job_dir.mkdir(parents=True, exist_ok=True)
         os.chdir(job_dir)
 
@@ -420,9 +296,16 @@ class RunXDS(RunBase):
         xds_inp = job_dir / "XDS.INP"
         text = xds_inp.read_text()
 
-        # Set number of processors
+        # Set the XDS parallelism.  MAXIMUM_NUMBER_OF_JOBS forks processes over
+        # frame batches (COLSPOT / INTEGRATE); MAXIMUM_NUMBER_OF_PROCESSORS
+        # threads within each (and drives the phases that do not fork).  Both are
+        # resolved from ncpu -- normally concrete ints baked at submit time, with
+        # an 'auto' fallback sized here from the frame count.
+        procs, jobs = self._xds_processor_settings()
         text = text.replace("MAXIMUM_NUMBER_OF_PROCESSORS=1",
-                            f"MAXIMUM_NUMBER_OF_PROCESSORS={self.ncpu}")
+                            f"MAXIMUM_NUMBER_OF_PROCESSORS={procs}")
+        text = text.replace("MAXIMUM_NUMBER_OF_JOBS=1",
+                            f"MAXIMUM_NUMBER_OF_JOBS={jobs}")
 
         # Override data range if specified
         if self.data_range != "false":
@@ -454,17 +337,13 @@ class RunXDS(RunBase):
 
     def xds_forced_integration(self):
         """
-        Force integration using geometry from a prior XPARM.XDS (job 1, force_integration=True).
+        Force integration using geometry from a prior XPARM.XDS (step 1_xds, force_integration=True).
 
-        Skips the spot-finding and indexing steps (XYCORR, INIT, COLSPOT,
-        IDXREF) and runs only DEFPIX → INTEGRATE → CORRECT, seeding the
-        geometry from the XPARM.XDS produced during the very first XDS run
-        (``../../1_xds``).  Used when auto-indexing fails but a good initial
-        geometry estimate is already available from a previous dataset.
-        Corresponds to the ``job == 1 and force_integration == true`` branch
-        in run_xds.sh.
+        Skips spot-finding and indexing, runs only DEFPIX → INTEGRATE → CORRECT,
+        seeding geometry from XPARM.XDS produced during the very first XDS run
+        (../../1_xds relative to the force subdirectory).
         """
-        job_dir = self.pipeline_subdir / f"{self.job}_xds"
+        job_dir = self.pipeline_subdir / self.step_id
         job_dir.mkdir(parents=True, exist_ok=True)
         os.chdir(job_dir)
 
@@ -480,17 +359,18 @@ class RunXDS(RunBase):
         text = re.sub(r"SPOT_RANGE=.*", f"SPOT_RANGE={self.image_range}", text)
         text = re.sub(r"SPACE_GROUP_NUMBER=.*!",
                       f"SPACE_GROUP_NUMBER= {self.sg_number} !", text)
-        text = re.sub(r"UNIT_CELL_CONSTANTS=.*!",
-                      f"UNIT_CELL_CONSTANTS= {self.cell} !", text)
+        if self.cell != "none":
+            text = re.sub(r"UNIT_CELL_CONSTANTS=.*!",
+                          f"UNIT_CELL_CONSTANTS= {self.cell} !", text)
         text = text.replace(
             "JOB= XYCORR INIT COLSPOT IDXREF DEFPIX INTEGRATE CORRECT",
             "JOB= DEFPIX INTEGRATE CORRECT",
         )
-        if self.data_format == 'hdf5':
-            master = self.image_dir / f"{self.image_prefix}_master.h5"
-            text = re.sub(r"NAME_TEMPLATE_OF_DATA_FRAMES=.*",
-                          f"NAME_TEMPLATE_OF_DATA_FRAMES={master}", text)
-        else:
+        if self.data_format == 'cbf':
+            # CBF NAME_TEMPLATE may need to be re-pointed at the original image
+            # dir (the source XDS.INP may reference a scratch path from a prior
+            # task).  HDF5 templates use a ?????? placeholder that's already
+            # correct in the copied XDS.INP, so leave them alone.
             text = re.sub(r"NAME_TEMPLATE_OF_DATA_FRAMES=.*",
                           f"NAME_TEMPLATE_OF_DATA_FRAMES={self.image_dir}/{self.image_prefix}_0????.cbf",
                           text)
@@ -498,86 +378,81 @@ class RunXDS(RunBase):
         self._inject_lib(job_dir / "XDS.INP")
 
         shutil.copy(str(xparm), "XPARM.XDS")
-        if self.data_format == 'cbf':
-            for cbf in xds_dir.glob("*.cbf"):
-                shutil.copy(str(cbf), ".")
+        # Copy XDS-generated correction frames (X-CORRECTIONS, Y-CORRECTIONS,
+        # BKGINIT, BLANK, GAIN, ...). Raw images live in image_dir for CBF and
+        # in the HDF5 master for hdf5, so this glob only catches XDS output.
+        for cbf in xds_dir.glob("*.cbf"):
+            shutil.copy(str(cbf), ".")
 
+        self._run_xds()
+        self._run_xdsstat()
+
+    def xds_bypass_indexing_failure(self):
+        """
+        In-place bypass of indexing failure: modify the existing XDS.INP to
+        run JOB= DEFPIX INTEGRATE CORRECT using the XPARM.XDS already present
+        in the step directory.  Used when on_indexing_failure = bypass.
+        """
+        job_dir = self.pipeline_subdir / self.step_id
+        os.chdir(job_dir)
+        xds_inp = job_dir / "XDS.INP"
+        text = xds_inp.read_text()
+        text = text.replace(
+            "JOB= XYCORR INIT COLSPOT IDXREF DEFPIX INTEGRATE CORRECT",
+            "JOB= DEFPIX INTEGRATE CORRECT",
+        )
+        xds_inp.write_text(text)
         self._run_xds()
         self._run_xdsstat()
 
     def xds_recycle_detector(self):
         """
-        Second XDS run recycling refined detector geometry (job 2).
+        Second XDS run recycling refined detector geometry (step 4_xds).
 
-        Copies XDS.INP and geometry files from the first XDS run, reduces
-        the job list to DEFPIX → INTEGRATE → CORRECT, and injects refined
-        detector parameters (ROTATION_AXIS, INCIDENT_BEAM_DIRECTION, ORGX,
-        DETECTOR_DISTANCE, BEAM_DIVERGENCE, REFLECTING_RANGE) extracted from
-        the XDS_ASCII.HKL and INTEGRATE.LP outputs of job 1.  No symmetry
-        update is performed at this stage.
-        Corresponds to the ``job == 2`` branch in run_xds.sh.
+        Copies XDS.INP and geometry files from prev_xds_id, reduces the job
+        list to DEFPIX → INTEGRATE → CORRECT, and injects refined detector
+        parameters from XDS_ASCII.HKL and INTEGRATE.LP of the previous run.
         """
-        last_xds_job = self.job - 1
-        xds_dir = self.pipeline_subdir / f"{last_xds_job}_xds"
-
-        job_dir = self.pipeline_subdir / f"{self.job}_xds"
+        xds_dir = self.pipeline_subdir / self.prev_xds_id
+        job_dir = self.pipeline_subdir / self.step_id
         job_dir.mkdir(parents=True, exist_ok=True)
         os.chdir(job_dir)
 
         shutil.copy(str(xds_dir / "XDS.INP"), "XDS.INP")
-        if self.data_format == 'cbf':
-            for cbf in xds_dir.glob("*.cbf"):
-                shutil.copy(str(cbf), ".")
+        for cbf in xds_dir.glob("*.cbf"):
+            shutil.copy(str(cbf), ".")
         shutil.copy(str(xds_dir / "XPARM.XDS"), "XPARM.XDS")
 
-        if self.recycle_xds == "true":
-            self._recycle_detector_params(xds_dir, job_dir / "XDS.INP", is_job2=True)
-
+        self._recycle_detector_params(xds_dir, job_dir / "XDS.INP", is_job2=True)
         self._run_xds()
         self._run_xdsstat()
 
     def xds_refine_symmetry(self):
         """
-        Third (and optional fourth) XDS run with updated symmetry and resolution (jobs 5 / 8).
+        XDS run with updated symmetry and resolution (step 7_xds).
 
-        Copies XDS.INP and geometry files from the previous XDS run, recycles
-        refined detector parameters (same as xds_recycle_detector), and
-        additionally updates SPACE_GROUP_NUMBER, UNIT_CELL_CONSTANTS, and
-        INCLUDE_RESOLUTION_RANGE using values parsed from the most recent
-        Aimless and Pointless log files.  The resolution limit is derived from
-        the CC½ criterion or a completeness threshold, then clipped to the
-        detector edge.
-        Corresponds to the ``job == 5`` and ``job == 8`` branches in run_xds.sh.
+        Copies XDS.INP and geometry from prev_xds_id, recycles refined
+        detector parameters, and additionally updates SPACE_GROUP_NUMBER,
+        UNIT_CELL_CONSTANTS, and INCLUDE_RESOLUTION_RANGE using values parsed
+        from prev_aimless_id and prev_pointless_id logs.
         """
-        # Determine which previous XDS directory to use
-        if self.job == 5:
-            last_xds_job = (self.job - 1) - 2 if self.recycle_xds == "true" else (self.job - 1) - 3
-        elif self.job == 8:
-            last_xds_job = (self.job - 1) - 2
-        else:
-            raise ValueError(f"xds_refine_symmetry does not apply to job {self.job}")
+        xds_dir       = self.pipeline_subdir / self.prev_xds_id
+        aimless_log   = (self.pipeline_subdir / self.prev_aimless_id
+                         / f"{self.prev_aimless_id}.log")
+        pointless_log = (self.pipeline_subdir / self.prev_pointless_id
+                         / f"{self.prev_pointless_id}.log")
 
-        last_job        = self.job - 1
-        second_last_job = self.job - 2
-        xds_dir         = self.pipeline_subdir / f"{last_xds_job}_xds"
-        aimless_log     = self.pipeline_subdir / f"{last_job}_aimless" / f"{last_job}_aimless.log"
-        pointless_log   = (self.pipeline_subdir / f"{second_last_job}_pointless"
-                           / f"{second_last_job}_pointless.log")
-
-        job_dir = self.pipeline_subdir / f"{self.job}_xds"
+        job_dir = self.pipeline_subdir / self.step_id
         job_dir.mkdir(parents=True, exist_ok=True)
         os.chdir(job_dir)
 
         shutil.copy(str(xds_dir / "XDS.INP"), "XDS.INP")
-        if self.data_format == 'cbf':
-            for cbf in xds_dir.glob("*.cbf"):
-                shutil.copy(str(cbf), ".")
+        for cbf in xds_dir.glob("*.cbf"):
+            shutil.copy(str(cbf), ".")
         shutil.copy(str(xds_dir / "XPARM.XDS"), "XPARM.XDS")
 
         xds_inp = job_dir / "XDS.INP"
-
-        if self.recycle_xds == "true":
-            self._recycle_detector_params(xds_dir, xds_inp, is_job2=False)
+        self._recycle_detector_params(xds_dir, xds_inp, is_job2=False)
 
         # Parse symmetry from Aimless / Pointless logs
         aim_text = aimless_log.read_text()
@@ -667,60 +542,58 @@ class RunPointless(RunBase):
     Aimless run.
     """
 
-    def __init__(self, params, job, ccp4_bin):
+    def __init__(self, params, step_id, ccp4_bin, prev_xds_id=None, prev_aimless_id=None):
         """
         Parameters
         ----------
         params : dict
             Pipeline parameters from RunProcess.
-        job : int
-            Sequential job number within the pipeline (e.g. 3, 6, 9).
+        step_id : str
+            Step identifier and output directory name (e.g. "2_pointless").
         ccp4_bin : Path
             Path to the CCP4 bin/ directory (from _find_ccp4_bin()).
+        prev_xds_id : str or None
+            step_id of the preceding XDS run to read reflection data from.
+        prev_aimless_id : str or None
+            step_id of the preceding Aimless run to read space group from.
+            None means first pass: Pointless chooses freely.
         """
-        self.params      = params
-        self.job         = job
-        self.sg          = params.get("sg", "none")
-        self.known_sg    = params.get("known_sg", "none")
-        self.scaling     = params.get("scaling", "correct")
-        self.recycle_xds = params.get("recycle_xds", "false")
+        self.params          = params
+        self.step_id         = step_id
+        self.prev_xds_id     = prev_xds_id
+        self.prev_aimless_id = prev_aimless_id
+        self.sg              = params.get("sg", "none")
+        self.known_sg        = params.get("known_sg", "none")
+        self.scaling         = params.get("scaling", "correct")
         self.pipeline_subdir = Path(params.get("pipeline_subdir"))
-        self.pointless   = Path(ccp4_bin) / "pointless"
+        self.pointless       = Path(ccp4_bin) / "pointless"
 
     def run(self):
         """
-        Execute Pointless for this job.
+        Execute Pointless for this step.
 
         Input file is INTEGRATE.HKL when scaling will be done by Aimless, or
         XDS_ASCII.HKL when XDS CORRECT already scaled the data.  The previous
-        XDS directory is job-1, except when recycle_xds is false and this is
-        job 3, in which case job-2 is used (no second XDS run was performed).
+        XDS directory is given by prev_xds_id.
 
         Space group handling:
-          - job 3, sg=="none": let Pointless choose freely (first pass, no prior)
-          - job >3, sg=="none": read the space group decided by the previous
-            Aimless run from its log and enforce it
-          - sg provided: enforce the supplied space group unconditionally
+          - prev_aimless_id is None: first pass, let Pointless choose freely
+            (or enforce known_sg if supplied)
+          - prev_aimless_id set: read the space group from that Aimless log
+            and enforce it
         """
-        job_dir = self.pipeline_subdir / f"{self.job}_pointless"
+        job_dir = self.pipeline_subdir / self.step_id
         job_dir.mkdir(parents=True, exist_ok=True)
         os.chdir(job_dir)
 
         pointless_input = "INTEGRATE.HKL" if self.scaling == "aimless" else "XDS_ASCII.HKL"
+        hklin   = f"../{self.prev_xds_id}/{pointless_input}"
+        hklout  = f"XDS_ASCII_{self.step_id}.mtz"
+        log_path = job_dir / f"{self.step_id}.log"
 
-        # Which XDS directory to read from
-        if self.recycle_xds == "false" and self.job == 3:
-            last_xds_job = self.job - 2
-        else:
-            last_xds_job = self.job - 1
-
-        hklin = f"../{last_xds_job}_xds/{pointless_input}"
-        hklout = f"XDS_ASCII_{self.job}_pointless.mtz"
-        log_path = job_dir / f"{self.job}_pointless.log"
-
-        if self.job == 3:
+        if self.prev_aimless_id is None:
+            # First pass: no prior aimless result — let Pointless choose freely
             if self.known_sg != "none":
-                # User explicitly provided symmetry — constrain from the start
                 stdin = (
                     f"HKLIN {hklin}\n"
                     f"HKLOUT {hklout}\n"
@@ -729,7 +602,6 @@ class RunPointless(RunBase):
                     "END\n"
                 )
             else:
-                # Free run or auto-forced integration — let Pointless choose freely
                 stdin = (
                     f"HKLIN {hklin}\n"
                     f"HKLOUT {hklout}\n"
@@ -738,14 +610,12 @@ class RunPointless(RunBase):
                 )
         else:
             # Read space group chosen by the previous Aimless run
-            last_aimless_job = last_xds_job - 1
-            aimless_log = (self.pipeline_subdir
-                            / f"{last_aimless_job}_aimless"
-                            / f"{last_aimless_job}_aimless.log")
+            aimless_log = (self.pipeline_subdir / self.prev_aimless_id
+                           / f"{self.prev_aimless_id}.log")
             aim_text = aimless_log.read_text()
             sg = next(
                 (line.split(":", 1)[1].replace(" ", "").strip()
-                    for line in aim_text.splitlines() if "Space group:" in line),
+                 for line in aim_text.splitlines() if "Space group:" in line),
                 "P1",
             )
             stdin = (
@@ -756,7 +626,6 @@ class RunPointless(RunBase):
                 "END\n"
             )
 
-
         with open(log_path, "w") as fh:
             subprocess.run([str(self.pointless)], input=stdin, text=True, stdout=fh, stderr=fh)
 
@@ -766,55 +635,59 @@ class RunAimless(RunBase):
     Create and run an Aimless scaling and merging job.
 
     Accepts merged MTZ output from Pointless and applies scaling/merging via
-    Aimless.  On the first pass no resolution cutoff is applied; on subsequent
-    passes the cutoff is derived from CC1/2 or completeness statistics
-    extracted from the previous Aimless log, subject to detector-edge and
-    user-supplied limits.
+    Aimless.  When apply_res_cutoff is False no resolution cutoff is applied;
+    when True the cutoff is derived from CC1/2 or completeness statistics
+    extracted from prev_aimless_id's log.
     """
 
-    def __init__(self, params, job, ccp4_bin):
+    def __init__(self, params, step_id, ccp4_bin,
+                 prev_pointless_id=None, prev_aimless_id=None, apply_res_cutoff=False):
         """
         Parameters
         ----------
         params : dict
             Pipeline parameters from RunProcess.
-        job : int
-            Sequential job number within the pipeline (e.g. 4, 7, 10).
+        step_id : str
+            Step identifier and output directory name (e.g. "3_aimless").
         ccp4_bin : Path
             Path to the CCP4 bin/ directory (from _find_ccp4_bin()).
+        prev_pointless_id : str or None
+            step_id of the preceding Pointless run to read MTZ from.
+        prev_aimless_id : str or None
+            step_id of a prior Aimless run to derive the resolution cutoff from.
+        apply_res_cutoff : bool
+            If True, derive and apply a resolution cutoff from prev_aimless_id.
         """
-        self.params          = params
-        self.job             = job
-        self.detector_edge   = float(params.get("detector_edge", 0.8))
-        self.res_limit       = params.get("res_limit", "cc12")
-        self.custom_res      = params.get("custom_res", "false")
-        self.pipeline_subdir = Path(params.get("pipeline_subdir"))
-        self.aimless         = Path(ccp4_bin) / "aimless"
+        self.params            = params
+        self.step_id           = step_id
+        self.prev_pointless_id = prev_pointless_id
+        self.prev_aimless_id   = prev_aimless_id
+        self.apply_res_cutoff  = apply_res_cutoff
+        self.detector_edge     = float(params.get("detector_edge", 0.8))
+        self.res_limit         = params.get("res_limit", "cc12")
+        self.custom_res        = params.get("custom_res", "false")
+        self.pipeline_subdir   = Path(params.get("pipeline_subdir"))
+        self.aimless           = Path(ccp4_bin) / "aimless"
 
     def run(self):
         """
-        Execute Aimless for this job.
+        Execute Aimless for this step.
 
-        Job 4 is the first Aimless pass: no resolution cutoff is applied so
-        that the full resolution range is merged and statistics can be used to
-        determine the cutoff for subsequent runs.
-
-        For later jobs the resolution limit is derived from the previous Aimless
-        log using either the CC½ > 0.30 criterion or the last shell where
-        completeness exceeds a numeric threshold, whichever is less restrictive.
-        The limit is then clipped to the detector edge (never finer than the
-        physical limit) and to any user-supplied custom resolution.
+        When apply_res_cutoff is False, merges without a resolution cutoff so
+        that the full range is available for statistics.  When True, the
+        resolution limit is derived from prev_aimless_id using either the
+        CC½ > 0.30 criterion or a completeness threshold, clipped to the
+        detector edge and any user-supplied custom resolution.
         """
-        last_job = self.job - 1
-        job_dir  = self.pipeline_subdir / f"{self.job}_aimless"
+        job_dir = self.pipeline_subdir / self.step_id
         job_dir.mkdir(parents=True, exist_ok=True)
         os.chdir(job_dir)
 
-        hklin  = f"../{last_job}_pointless/XDS_ASCII_{last_job}_pointless.mtz"
-        hklout = f"XDS_ASCII_{self.job}_aimless.mtz"
-        log_path = job_dir / f"{self.job}_aimless.log"
+        hklin    = f"../{self.prev_pointless_id}/XDS_ASCII_{self.prev_pointless_id}.mtz"
+        hklout   = f"XDS_ASCII_{self.step_id}.mtz"
+        log_path = job_dir / f"{self.step_id}.log"
 
-        if self.job == 4:
+        if not self.apply_res_cutoff:
             # First pass: merge without resolution cutoff
             stdin = (
                 f"HKLIN {hklin}\n"
@@ -823,10 +696,8 @@ class RunAimless(RunBase):
                 "END\n"
             )
         else:
-            last_aimless_job = last_job - 2
-            aimless_log = (self.pipeline_subdir
-                           / f"{last_aimless_job}_aimless"
-                           / f"{last_aimless_job}_aimless.log")
+            aimless_log = (self.pipeline_subdir / self.prev_aimless_id
+                           / f"{self.prev_aimless_id}.log")
             aim_text = aimless_log.read_text()
 
             # CC½-based limit
@@ -895,19 +766,22 @@ class RunRfree(RunBase):
     (freerflag COMPLETE).  Amplitude conversion is performed by ctruncate.
     """
 
-    def __init__(self, params, job, ccp4_bin):
+    def __init__(self, params, step_id, ccp4_bin, prev_aimless_id=None):
         """
         Parameters
         ----------
         params : dict
             Pipeline parameters from RunProcess.
-        job : int
-            Sequential job number within the pipeline.
+        step_id : str
+            Step identifier and output directory name (e.g. "10_rfree").
         ccp4_bin : Path
             Path to the CCP4 bin/ directory (from _find_ccp4_bin()).
+        prev_aimless_id : str or None
+            step_id of the last Aimless run to read scaled MTZ and stats from.
         """
         self.params          = params
-        self.job             = job
+        self.step_id         = step_id
+        self.prev_aimless_id = prev_aimless_id
         self.ref_mtz         = params.get("ref_mtz", "none")
         self.pipeline_subdir = Path(params.get("pipeline_subdir"))
         ccp4_bin             = Path(ccp4_bin)
@@ -921,9 +795,7 @@ class RunRfree(RunBase):
         """
         Generate R-free flags and convert intensities to amplitudes.
 
-        The last Aimless job is job-1; if that directory does not exist (the
-        third XDS pass was skipped) job-4 is used instead.  Cell, space group,
-        and resolution are read from the Aimless log.
+        Cell, space group, and resolution are read from the prev_aimless_id log.
 
         Without a reference MTZ: freerflag assigns a fresh random 5% test set,
         mtzutils strips anomalous columns, and ctruncate converts I → F.
@@ -933,18 +805,12 @@ class RunRfree(RunBase):
         extends the flags to the full resolution range, mtzutils strips
         unwanted columns, and ctruncate converts I → F.
         """
-        last_job = self.job - 1
-        job_dir  = self.pipeline_subdir / f"{self.job}_rfree"
+        job_dir = self.pipeline_subdir / self.step_id
         job_dir.mkdir(parents=True, exist_ok=True)
         os.chdir(job_dir)
 
-        # Fall back to job-4 if the expected Aimless directory is absent
-        if not (self.pipeline_subdir / f"{last_job}_aimless").is_dir():
-            last_job = self.job - 4
-
-        aimless_log = (self.pipeline_subdir
-                       / f"{last_job}_aimless"
-                       / f"{last_job}_aimless.log")
+        aimless_log = (self.pipeline_subdir / self.prev_aimless_id
+                       / f"{self.prev_aimless_id}.log")
         aim_text = aimless_log.read_text()
 
         res_lim = next(
@@ -963,8 +829,8 @@ class RunRfree(RunBase):
             "P1",
         )
 
-        log_path  = job_dir / f"{self.job}_rfree.log"
-        aimless_mtz = f"../{last_job}_aimless/XDS_ASCII_{last_job}_aimless.mtz"
+        log_path    = job_dir / f"{self.step_id}.log"
+        aimless_mtz = f"../{self.prev_aimless_id}/XDS_ASCII_{self.prev_aimless_id}.mtz"
 
         if self.ref_mtz in (None, "none", ""):
             # Fresh R-free flags
@@ -1053,39 +919,33 @@ class RunXtriage(RunBase):
     other data pathologies.
     """
 
-    def __init__(self, params, job, phenix_bin):
+    def __init__(self, params, step_id, phenix_bin, prev_xds_id=None):
         """
         Parameters
         ----------
         params : dict
             Pipeline parameters from RunProcess.
-        job : int
-            Sequential job number within the pipeline.
+        step_id : str
+            Step identifier and output directory name (e.g. "11_xtriage").
         phenix_bin : Path
             Path to the Phenix bin directory (from _find_phenix_bin()).
+        prev_xds_id : str or None
+            step_id of the final XDS run to read XDS_ASCII.HKL from.
         """
         self.params          = params
-        self.job             = job
+        self.step_id         = step_id
+        self.prev_xds_id     = prev_xds_id
         self.pipeline_subdir = Path(params.get("pipeline_subdir"))
         self.xtriage         = Path(phenix_bin) / "phenix.xtriage"
 
     def run(self):
-        """
-        Execute phenix.xtriage on the final XDS_ASCII.HKL.
-
-        The last XDS directory is job-5; if that directory is absent (the
-        third XDS pass was not run) job-8 is used instead.
-        """
-        last_xds_job = self.job - 5
-        if not (self.pipeline_subdir / f"{last_xds_job}_xds").is_dir():
-            last_xds_job = self.job - 8
-
-        job_dir = self.pipeline_subdir / f"{self.job}_xtriage"
+        """Execute phenix.xtriage on XDS_ASCII.HKL from prev_xds_id."""
+        job_dir = self.pipeline_subdir / self.step_id
         job_dir.mkdir(parents=True, exist_ok=True)
         os.chdir(job_dir)
 
-        hkl_input = f"../{last_xds_job}_xds/XDS_ASCII.HKL"
-        log_path  = job_dir / f"{self.job}_xtriage.log"
+        hkl_input = f"../{self.prev_xds_id}/XDS_ASCII.HKL"
+        log_path  = job_dir / f"{self.step_id}.log"
 
         with open(log_path, "w") as fh:
             subprocess.run([str(self.xtriage), hkl_input], stdout=fh, stderr=fh)
@@ -1098,7 +958,7 @@ class RunProcess:
 
     Intended to be importable and callable from other modules::
 
-        from avicenna.pipelines.proc_pipeline import RunProcess
+        from avicenna.pipelines.processing_runner import RunProcess
         proc = RunProcess(params)
         proc.run()
 
@@ -1120,63 +980,50 @@ class RunProcess:
       5.  Write and submit xds_pipeline_index_qsub_submit.sh as an SGE array
           (-t 1-N); each task cd's into its pipeline_subdir and calls run_pipeline.py.
 
-    run_single() — sequential per-dataset pipeline, mirrors xds_pipeline_index_qsub.sh:
-      Normal indexing path (job 1 produces XDS_ASCII.HKL):
-        job  1  RunXDS.xds_initial_indexing
-        job  2  RunXDS.xds_recycle_detector    [only if recycle_xds=true]
-        job  3  RunPointless
-        job  4  RunAimless  (no resolution cutoff — first-pass statistics)
-        job  5  RunXDS.xds_refine_symmetry
-        job  6  RunPointless
-        job  7  RunAimless  (CC½ / completeness cutoff applied)
-        -- if 7_aimless CC½ limit is finer than 5_xds INCLUDE_RESOLUTION_RANGE --
-        job  8  RunXDS.xds_refine_symmetry
-        job  9  RunPointless
-        job 10  RunAimless
+    Per-dataset pipeline (executed by ProcessingPipelineInterpreter on the
+    compute node):
+      Normal indexing path (1_xds produces XDS_ASCII.HKL):
+        1_xds   RunXDS.xds_initial_indexing
+        2_pointless  RunPointless  (free SG choice)
+        3_aimless    RunAimless    (no resolution cutoff)
+        4_xds   RunXDS.xds_recycle_detector
+        5_pointless  RunPointless  (SG from 3_aimless)
+        6_aimless    RunAimless    (CC½ cutoff from 3_aimless)
+        -- if 6_aimless CC½ limit improved over 3_aimless --
+        7_xds   RunXDS.xds_refine_symmetry
+        8_pointless  RunPointless
+        9_aimless    RunAimless
         -- always --
-        job 11  RunRfree
-        job 13  RunXtriage
+        10_rfree   RunRfree
+        11_xtriage RunXtriage
 
-      Forced integration path (job 1 produces XPARM.XDS but not XDS_ASCII.HKL):
-        - Parse IDXREF.LP for starred Bravais lattice solutions; map to space
-          groups via xds_lattices.txt.
-          (try_alt_sym=all: every starred lattice; try_alt_sym=top: best only;
-           known_sg supplied: use it directly, skip IDXREF.LP.)
-        - For each candidate SG create pipeline_subdir/{prefix}_{sg}_force/
-          and submit a second SGE array (xds_pipeline_lattice_qsub_submit.sh,
-          h_rt=02:00:00):
-            job  1  RunXDS.xds_forced_integration
-            job  2  RunXDS.xds_recycle_detector   [only if recycle_xds=true]
-            job  3  RunPointless
-            job  4  RunAimless
-            job  5  RunXDS.xds_refine_symmetry
-            job  6  RunPointless
-            job  7  RunAimless
-            job  8  RunXDS.xds_refine_symmetry    (always — no convergence check)
-            job  9  RunPointless
-            job 10  RunAimless
-            job 11  RunRfree
-            job 13  RunXtriage
+      Forced integration path (on_indexing_failure=retry; 1_xds produces
+      XPARM.XDS but not XDS_ASCII.HKL):
+        Submits a new SGE job per candidate SG (controlled by retry_mode).
+        The forced path runs the same step sequence with xds_forced_integration
+        and all Pointless steps as free runs (prev_aimless_id=None); 7_xds
+        always runs (no skip check).
     """
 
     MIN_IMAGES         = 180
 
     def __init__(self, params):
-        _xds_dir              = _find_latest_xds_dir(params.get("xds_root"))
-        self.XDS_EXECUTABLE   = _xds_dir / "bin" / "xds_par"
-        self.XDSSTAT_EXECUTABLE = _find_xdsstat()
-        self.CCP4_BIN         = _find_ccp4_bin()
-        self.PHENIX_BIN       = _find_phenix_bin()
+        _xds_bin, _xdsstat, _ = find_xds(root=params.get("xds_root"))
+        self.XDS_EXECUTABLE     = _xds_bin / "xds_par"
+        self.XDSSTAT_EXECUTABLE = _xdsstat
+        self.CCP4_BIN           = find_ccp4()[0]
+        self.PHENIX_BIN         = find_phenix()[0]
         self.params        = params
         self.process_dir   = Path(params.get("process_dir", os.getcwd()))
         self._output_dir   = self.process_dir / "processing"
         self._logs_dir     = self.process_dir / "processing_logs"
         self.transfer_dir  = Path(params.get("image_dir", ""))
-        self.ncpu          = int(params.get("ncpu", 8))
+        # Kept raw: "auto" (the default) is resolved per dataset from the frame
+        # count at submit time (run); an explicit integer is used verbatim.
+        self.ncpu          = params.get("ncpu", "auto")
         self.indexing_images = params.get("indexing_images", "first_half")
         self.no_symmetry   = params.get("no_symmetry", "false")
-        self.try_alt_sym   = params.get("try_alt_sym", "all")
-        self.recycle_xds   = params.get("recycle_xds", "false")
+        self.retry_mode    = params.get("retry_mode", params.get("try_alt_sym", "auto")).lower()
         # Absolute path to the src/ directory so worker scripts can import this module
         self._src_dir = str(Path(__file__).parents[3] / "src")
 
@@ -1215,10 +1062,15 @@ class RunProcess:
                     continue
                 key, _, val = line.partition("=")
                 kv[key.strip()] = val.strip()
+            sg = kv.get("sg", "none")
+            try:
+                sg_number = str(sg_lookup(space_group=sg)[0]) if sg != "none" else "none"
+            except ValueError:
+                sg_number = "none"
             crystals.append({
                 "first_pass": kv.get("first_pass", "none"),
-                "sg":         kv.get("sg", "none"),
-                "sg_number":  kv.get("number", "none"),
+                "sg":         sg,
+                "sg_number":  sg_number,
                 "cell":       kv.get("cell", "none"),
                 "ref_hkl":    kv.get("ref_hkl", "none"),
                 "ref_mtz":    kv.get("ref_mtz", "none"),
@@ -1244,11 +1096,16 @@ class RunProcess:
                 parts = line.split(",")
                 if len(parts) < 8:
                     continue
+                sg = parts[2]
+                try:
+                    sg_number = str(sg_lookup(space_group=sg)[0]) if sg != "none" else "none"
+                except ValueError:
+                    sg_number = "none"
                 entries.append({
                     "crystal_number":        parts[0],
                     "first_pass":            parts[1],
-                    "sg":                    parts[2],
-                    "sg_number":             parts[3],
+                    "sg":                    sg,
+                    "sg_number":             sg_number,
                     "cell":                  parts[4],
                     "ref_hkl":               parts[5],
                     "ref_mtz":               parts[6],
@@ -1325,7 +1182,14 @@ class RunProcess:
                 ranges.append((int(s), int(e)))
         return ranges
 
-    def _sym_from_idxref(self, idxref_lp):
+    def _cell_from_xparm(self, xparm_path):
+        """Read unit cell constants from XPARM.XDS (line 4: SG a b c alpha beta gamma)."""
+        line = Path(xparm_path).read_text().splitlines()[3]
+        parts = line.split()
+        # parts[0] is the SG number; parts[1:7] are a b c alpha beta gamma
+        return " ".join(parts[1:7])
+
+    def _sym_from_idxref(self, idxref_lp, retry_mode=None):
         """
         Parse IDXREF.LP and map starred Bravais lattice solutions to candidate
         space groups using BRAVAIS_LATTICES from avicenna.utils.utils.
@@ -1334,8 +1198,10 @@ class RunProcess:
         lowest-penalty solution first (matching the tac/reverse ordering in
         the bash).
         """
-        # Parse starred solutions
-        solutions = []
+        retry_mode = retry_mode if retry_mode is not None else self.retry_mode
+
+        # Parse all starred solutions including the first aP/P1 row
+        all_solutions = []
         in_table = False
         for line in Path(idxref_lp).read_text().splitlines():
             if "LATTICE-  BRAVAIS-   QUALITY" in line:
@@ -1348,11 +1214,15 @@ class RunProcess:
                 continue
             lattice = clean[1]
             cell    = " ".join(clean[3:9])
-            solutions.append((lattice, cell))
-        solutions = solutions[1:]               # skip first row (aP/P1 — trivially correct, uninformative)
-        solutions = list(reversed(solutions))   # lowest penalty first → highest symmetry first
+            all_solutions.append((lattice, cell))
 
-        if self.try_alt_sym == "all":
+        # IDXREF.LP lists starred rows ascending by quality penalty (aP at 0.0,
+        # highest-symmetry lattices at the end).  After skipping aP and reversing,
+        # solutions[0] = highest-symmetry candidate (highest penalty, tried first).
+        solutions = all_solutions[1:]           # drop aP/P1 — trivially correct, uninformative
+        solutions = list(reversed(solutions))   # highest-symmetry (highest penalty) first
+
+        if retry_mode == "top_ten":
             results = []
             prefix = 0
             for lattice, cell in solutions:
@@ -1362,60 +1232,23 @@ class RunProcess:
                     prefix += 1
                     results.append((str(prefix), name, str(number), cell.replace(" ", "-")))
             return results
-        elif self.try_alt_sym == "top":
+        elif retry_mode == "best":
             if not solutions:
                 return []
-            lattice, cell = solutions[-1]   # best before reversal
+            lattice, cell = solutions[0]    # highest-symmetry candidate
             sg_list = BRAVAIS_LATTICES.get(lattice, [])
             if sg_list:
                 number, name = sg_list[0]
                 return [("1", name, str(number), cell.replace(" ", "-"))]
         return []
 
-    def _write_worker_script(self, pipeline_subdir, per_params, method="run_single"):
-        """
-        Serialise per_params to params.json and write a run_pipeline.py that
-        imports this module and calls RunProcess(params).{method}().
-        """
-        Path(pipeline_subdir, "params.json").write_text(
-            json.dumps(per_params, indent=2, default=str)
-        )
-        script = Path(pipeline_subdir) / "run_pipeline.py"
-        script.write_text(f"""\
-#!/usr/bin/env python3
-import json, os, subprocess, sys
-from pathlib import Path
-sys.path.insert(0, {self._src_dir!r})
-from avicenna.pipelines.proc_pipeline import RunProcess
-                          
-shell = os.environ.get('SHELL', '/bin/bash')
-if any(s in shell for s in ('csh', 'tcsh')):
-    _sbgrid_cmd = "tcsh -c 'source /programs/sbgrid.cshrc && env'"
-else:
-    _sbgrid_cmd = "bash --norc --noprofile -c 'source /programs/sbgrid.shrc && env'"
-_result = subprocess.run(_sbgrid_cmd, shell=True, capture_output=True, text=True)
-for _line in _result.stdout.splitlines():
-    if '=' in _line:
-        _key, _, _val = _line.partition('=')
-        if _key.isidentifier():
-            os.environ[_key] = _val
+    def _submit_sge_array(self, job_list_path, submit_script_path, h_rt="06:00:00",
+                          logs_dir=None, slots=None):
+        """Write and qsub an SGE array job over the paths listed in job_list_path.
 
-params = json.loads(Path('params.json').read_text())
-print("=" * 60)
-print(f"pin          : {{params.get('pin', 'n/a')}}")
-print(f"dataset      : {{params.get('pin_id', 'n/a')}}")
-print(f"image_dir    : {{params.get('image_dir', 'n/a')}}")
-print(f"image_range  : {{params.get('image_range', 'n/a')}}")
-print(f"workdir      : {{params.get('pipeline_subdir', 'n/a')}}")
-print(f"space_group  : {{params.get('sg', 'n/a')}}")
-print(f"cell         : {{params.get('cell', 'n/a')}}")
-print("=" * 60, flush=True)
-RunProcess(params).{method}()
-""")
-        script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IRUSR | stat.S_IWUSR)
-
-    def _submit_sge_array(self, job_list_path, submit_script_path, h_rt="06:00:00", logs_dir=None):
-        """Write and qsub an SGE array job over the paths listed in job_list_path."""
+        *slots* is the ``-pe smp`` request (one value for the whole array, so it
+        is the max of the per-dataset XDS sizing).  When None it falls back to
+        ``self.ncpu`` for an explicit override, or 1 when ncpu is 'auto'."""
         if not Path(job_list_path).is_file():
             print(f"No jobs found — {job_list_path} was not created. Check that datasets exist and have >= {self.MIN_IMAGES} images.")
             return
@@ -1423,6 +1256,8 @@ RunProcess(params).{method}()
         njob  = len(lines)
         if njob == 0:
             return
+        if slots is None:
+            slots = 1 if resources.is_auto(self.ncpu) else int(self.ncpu)
         logs_line = f"#$ -o {logs_dir}\n" if logs_dir else ""
         submit_script_path.write_text(
             "#!/bin/bash\n"
@@ -1430,7 +1265,7 @@ RunProcess(params).{method}()
             "#$ -cwd\n"
             f"#$ -t 1-{njob}\n"
             "#$ -j y\n"
-            f"#$ -pe smp {self.ncpu}\n"
+            f"#$ -pe smp {slots}\n"
             "#$ -l mem_free=2G\n"
             f"#$ -l h_rt={h_rt}\n"
             "#$ -l scratch=20G\n"
@@ -1442,29 +1277,36 @@ RunProcess(params).{method}()
         submit_script_path.chmod(
             submit_script_path.stat().st_mode | stat.S_IXUSR | stat.S_IRUSR | stat.S_IWUSR
         )
-        subprocess.run(["qsub", str(submit_script_path)])
+        return qsub_terse([submit_script_path])
 
     # ------------------------------------------------------------------
     # Per-step dispatch helpers
     # ------------------------------------------------------------------
 
-    def _xds(self, job, params, scenario):
-        RunXDS(params, job, self.XDS_EXECUTABLE, self.XDSSTAT_EXECUTABLE).__getattribute__(scenario)()
+    def _xds(self, step_id, params, scenario,
+             prev_xds_id=None, prev_aimless_id=None, prev_pointless_id=None):
+        RunXDS(params, step_id, self.XDS_EXECUTABLE, self.XDSSTAT_EXECUTABLE,
+               prev_xds_id=prev_xds_id, prev_aimless_id=prev_aimless_id,
+               prev_pointless_id=prev_pointless_id).__getattribute__(scenario)()
 
-    def _pointless(self, job, params):
-        RunPointless(params, job, self.CCP4_BIN).run()
+    def _pointless(self, step_id, params, prev_xds_id=None, prev_aimless_id=None):
+        RunPointless(params, step_id, self.CCP4_BIN,
+                     prev_xds_id=prev_xds_id, prev_aimless_id=prev_aimless_id).run()
 
-    def _aimless(self, job, params):
-        RunAimless(params, job, self.CCP4_BIN).run()
+    def _aimless(self, step_id, params, prev_pointless_id=None,
+                 prev_aimless_id=None, apply_res_cutoff=False):
+        RunAimless(params, step_id, self.CCP4_BIN,
+                   prev_pointless_id=prev_pointless_id, prev_aimless_id=prev_aimless_id,
+                   apply_res_cutoff=apply_res_cutoff).run()
 
-    def _rfree(self, job, params):
-        RunRfree(params, job, self.CCP4_BIN).run()
+    def _rfree(self, step_id, params, prev_aimless_id=None):
+        RunRfree(params, step_id, self.CCP4_BIN, prev_aimless_id=prev_aimless_id).run()
 
-    def _xtriage(self, job, params):
-        RunXtriage(params, job, self.PHENIX_BIN).run()
+    def _xtriage(self, step_id, params, prev_xds_id=None):
+        RunXtriage(params, step_id, self.PHENIX_BIN, prev_xds_id=prev_xds_id).run()
 
-    def _xds_ascii_ok(self, pipeline_subdir, job):
-        return (Path(pipeline_subdir) / f"{job}_xds" / "XDS_ASCII.HKL").is_file()
+    def _xds_ascii_ok(self, pipeline_subdir, step_id):
+        return (Path(pipeline_subdir) / step_id / "XDS_ASCII.HKL").is_file()
 
     def _setup_scratch(self, params):
         """Copy image directory to SGE scratch ($TMPDIR) if not already there.
@@ -1499,15 +1341,35 @@ RunProcess(params).{method}()
     def _log(self, pipeline_subdir, tag, message):
         """Append a timestamped line to pipeline.log in pipeline_subdir."""
         context = self.params.get("pin_id") if pipeline_subdir is not None else None
+        forced_dir = (
+            Path(pipeline_subdir).name
+            if pipeline_subdir is not None
+            and self.params.get("force_integration") == "true"
+            else None
+        )
         line = format_log_line(tag, message, context=context,
-                               context_width=self.params.get("context_width"))
+                               context_width=self.params.get("context_width"),
+                               forced_dir=forced_dir)
         if pipeline_subdir is not None:
             with open(Path(pipeline_subdir) / "pipeline.log", "a") as fh:
                 fh.write(line)
 
+    def _record_rejection(self, pin_id, reason):
+        """Record a rejected dataset: write a per-pin marker so the scraper
+        can surface the reason, and log REJECT to the omnibus log.
+        """
+        rejected_dir = self._output_dir / ".rejected"
+        rejected_dir.mkdir(exist_ok=True)
+        (rejected_dir / f"{pin_id}.txt").write_text(reason + "\n")
+        self.params["pin_id"] = pin_id
+        self._log(None, "REJECT", reason)
+
     def _aimless_summary(self, log_path):
-        """Extract SG, resolution, completeness, multiplicity, and Rpim
-        from the last 100 lines of an aimless log. Returns a string."""
+        """Extract resolution, SG, unit cell, completeness, Rpim, and CC1/2
+        from the last 100 lines of an aimless log. Returns a string.
+
+        Completeness, Rpim, and CC1/2 are read from the overall column (first
+        number); resolution is the high-resolution-limit (last column)."""
         summary = {}
         if not Path(log_path).is_file():
             return "completed"
@@ -1526,26 +1388,29 @@ RunProcess(params).{method}()
                 nums = [s for s in line.split() if s.replace(".", "", 1).isdigit()]
                 if nums:
                     summary["comp"] = nums[0]
-            if "Multiplicity" in line and "mult" not in summary:
-                nums = [s for s in line.split() if s.replace(".", "", 1).isdigit()]
-                if nums:
-                    summary["mult"] = nums[0]
             if "Rpim (within I+/I-)" in line and "rpim" not in summary:
                 nums = [s for s in line.split() if s.replace(".", "", 1).isdigit()]
                 if nums:
                     summary["rpim"] = nums[0]
+            # The summary block's CC1/2 row is "Mn(I) half-set correlation
+            # CC(1/2)  0.999  0.999  0.315"; "half-set correlation" uniquely
+            # identifies it (other CC(1/2) lines are table/graph headers).
+            if "half-set correlation" in line and "cchalf" not in summary:
+                nums = [s for s in line.split() if s.replace(".", "", 1).isdigit()]
+                if nums:
+                    summary["cchalf"] = nums[0]
         parts = []
-        if "sg"   in summary: parts.append(f"SG={summary['sg']}")
-        if "res"  in summary: parts.append(f"res={summary['res']}Å")
-        if "uc"   in summary: parts.append(f"UC={summary['uc']}")
-        if "comp" in summary: parts.append(f"comp={summary['comp']}")
-        if "mult" in summary: parts.append(f"mult={summary['mult']}")
-        if "rpim" in summary: parts.append(f"rpim={summary['rpim']}")
+        if "res"    in summary: parts.append(f"res={summary['res']}Å")
+        if "sg"     in summary: parts.append(f"SG={summary['sg']}")
+        if "uc"     in summary: parts.append(f"UC={summary['uc']}")
+        if "comp"   in summary: parts.append(f"comp={summary['comp']}")
+        if "rpim"   in summary: parts.append(f"rpim={summary['rpim']}")
+        if "cchalf" in summary: parts.append(f"CC½={summary['cchalf']}")
         return " ".join(parts) if parts else "completed"
 
-    def _xds_error(self, pipeline_subdir, job):
+    def _xds_error(self, pipeline_subdir, step_id):
         """Return the first ERROR line from an XDS log, or None."""
-        log = Path(pipeline_subdir) / f"{job}_xds" / f"{job}_xds.log"
+        log = Path(pipeline_subdir) / step_id / f"{step_id}.log"
         if not log.is_file():
             return None
         for line in log.read_text().splitlines():
@@ -1572,7 +1437,13 @@ RunProcess(params).{method}()
         self._output_dir.mkdir(exist_ok=True)
         self._logs_dir.mkdir(exist_ok=True)
 
+        # Wipe stale rejection markers from any prior run in this output dir.
+        rejected_dir = self._output_dir / ".rejected"
+        if rejected_dir.is_dir():
+            shutil.rmtree(rejected_dir)
+
         sym_entries = self._known_symmetry_entries()
+        sge_slots   = 1   # max XDS slot count across the array (see -pe smp below)
 
         self._context_width = ProcessingWatcher(procpath=self._output_dir).context_width
 
@@ -1585,21 +1456,47 @@ RunProcess(params).{method}()
             data_range  = parts[2].strip() if len(parts) > 2 else "false"
             collection_id = Path(collection).name.replace("_transfer", "")
 
-            image_dir = Path(collection) / pin_id
+            pin_root = Path(collection) / pin_id
 
             # Detect data format and build per-series groups.
-            # HDF5: each master file is one series; image counting deferred (see TODO above).
-            # CBF: group files by series key (strip frame-number suffix).
-            hdf5_masters = sorted(image_dir.glob(f"{pin_id}_*_master.h5"))
+            # HDF5 masters may be nested under per-scan subdirs (e.g. NSLS layout
+            # <pin>/<N>/<pin>/<pin>_<run>_master.h5); raster pre-scans live in
+            # rasterImages/ and are filtered out.  Each master is its own series.
+            # CBF files are expected directly under the pin dir; group by series key.
+            if not pin_root.is_dir():
+                reason = f"image directory not found: {pin_root}"
+                print(f"No image dir for {pin_id} — skipping")
+                self._record_rejection(f"{collection_id}_{pin_id}", reason)
+                continue
+
+            hdf5_masters = sorted(
+                m for m in pin_root.rglob(f"{pin_id}_*_master.h5")
+                if "rasterImages" not in m.parts and "_r_Raster_" not in m.name
+            )
             if hdf5_masters:
                 data_format = 'hdf5'
                 groups = {m.stem[:-7]: [m] for m in hdf5_masters}  # strip "_master"
             else:
                 data_format = 'cbf'
                 groups = {}
-                for f in image_dir.glob(f"{pin_id}_*.cbf"):
+                for f in pin_root.glob(f"{pin_id}_*.cbf"):
                     series_key = "_".join(f.stem.split("_")[:-1])
                     groups.setdefault(series_key, []).append(f)
+
+            if not groups:
+                # No diffraction data: any *_master.h5 was filtered as a raster
+                # pre-scan, and no CBF series were found.
+                any_raster = any(
+                    "_r_Raster_" in m.name or "rasterImages" in m.parts
+                    for m in pin_root.rglob(f"{pin_id}_*_master.h5")
+                )
+                if any_raster:
+                    reason = "no diffraction data — only raster pre-scans present"
+                else:
+                    reason = f"no diffraction data found in {pin_root}"
+                print(f"No diffraction data for {pin_id} — skipping")
+                self._record_rejection(f"{collection_id}_{pin_id}", reason)
+                continue
 
             for series_key, files in sorted(groups.items()):
                 pin_dir_check = self._output_dir / f"{collection_id}_{series_key}"
@@ -1607,29 +1504,52 @@ RunProcess(params).{method}()
                     print(f"Output folder already exists — skipping {series_key}")
                     continue
 
+                # For HDF5 the master file's parent is the per-dataset image_dir;
+                # for CBF the pin dir is the image_dir.
+                if data_format == 'hdf5':
+                    image_dir = files[0].parent
+                else:
+                    image_dir = pin_root
+
                 if data_range == "false":
                     if data_format == 'hdf5':
-                        image_count = None  # HDF5 image counting not yet implemented (see TODO)
-                        first_image = 1
+                        try:
+                            image_count = count_hdf5_images(files[0])
+                        except Exception as exc:
+                            reason = f"HDF5 image count unreadable: {exc}"
+                            print(f"Could not read image count from {files[0]}: {exc} — skipping {series_key}")
+                            self._record_rejection(f"{collection_id}_{series_key}", reason)
+                            continue
                     else:
                         image_count = len(files)
-                        first_image = 1
+                    first_image = 1
                 else:
                     first_str, last_str = data_range.split("-")
                     first_image = int(first_str)
                     image_count = int(last_str)
 
-                if data_format == 'cbf' and image_count is not None and image_count < self.MIN_IMAGES:
+                if image_count is not None and image_count < self.MIN_IMAGES:
+                    reason = f"partial dataset ({image_count} images, minimum is {self.MIN_IMAGES})"
                     print(f"Partial dataset ({image_count} images) — skipping {series_key}")
-                    self.params["pin_id"] = f"{collection_id}_{series_key}"
-                    self._log(None, "REJECT",
-                              f"partial dataset ({image_count} images, minimum is {self.MIN_IMAGES})")
+                    self._record_rejection(f"{collection_id}_{series_key}", reason)
                     continue
 
                 pin_dir = self._output_dir / f"{collection_id}_{series_key}"
                 pin_dir.mkdir(exist_ok=True)
 
                 index_ranges = self._indexing_ranges(image_count, first_image)
+
+                # Resolve the XDS parallelism for this dataset.  auto sizes it
+                # from the frame count (split into forked jobs x threads); an
+                # explicit ncpu forces that many processors with one XDS job.
+                # The SGE slot request (-pe smp, one value for the whole array)
+                # is the max across all datasets, so no task is oversubscribed.
+                if resources.is_auto(self.ncpu):
+                    slots, xds_jobs, xds_procs = resources.xds_slots(image_count or 1)
+                else:
+                    xds_procs, xds_jobs = int(self.ncpu), 1
+                    slots = xds_procs
+                sge_slots = max(sge_slots, slots)
 
                 for sym in sym_entries:
                     crystal_number        = sym["crystal_number"]
@@ -1670,6 +1590,8 @@ RunProcess(params).{method}()
                             "cell":                  "none",
                             "data_range":            data_range,
                             "data_format":           data_format,
+                            "ncpu":                  xds_procs,
+                            "xds_jobs":              xds_jobs,
                         }
                         self._write_worker_script(pipeline_subdir, per_params, method="run_single")
                         with open(qsub_list, "a") as fh:
@@ -1679,109 +1601,19 @@ RunProcess(params).{method}()
                     fh.write(f"{collection_id}_{series_key}\n")
 
         submit_sh = self.process_dir / "xds_pipeline_index_qsub_submit.sh"
-        self._submit_sge_array(qsub_list, submit_sh, h_rt="06:00:00", logs_dir=self._logs_dir)
+        job_id = self._submit_sge_array(qsub_list, submit_sh, h_rt="06:00:00",
+                                        logs_dir=self._logs_dir, slots=sge_slots)
         print(f"Done in {time.time() - _run_start:.1f}s")
+        return job_id
 
-    def run_single(self):
-        """
-        Sequential pipeline for one dataset. Called by run_pipeline.py on a
-        compute node. Mirrors xds_pipeline_index_qsub.sh.
-        """
-        params          = self.params
-        pipeline_subdir = Path(params["pipeline_subdir"])
-        sg   = params.get("known_sg", "none")
-        cell = params.get("known_cell", "none")
-        self._log(pipeline_subdir, "START",
-                  f"{params.get('pin_id','?')} | {pipeline_subdir.parent.name} | sg={sg} cell={cell}")
-
-        self._setup_scratch(params)
-
-        # --- job 1: initial indexing ---
-        self._xds(1, params, "xds_initial_indexing")
-
-        if self._xds_ascii_ok(pipeline_subdir, 1):
-            self._log(pipeline_subdir, "RUN", "1_xds: completed")
-            job = 1
-            if params.get("recycle_xds") == "true":
-                self._xds(2, params, "xds_recycle_detector")
-                job = 2
-                if self._xds_ascii_ok(pipeline_subdir, 2):
-                    self._log(pipeline_subdir, "RUN", "2_xds: completed")
-                else:
-                    self._log(pipeline_subdir, "ERROR", f"2_xds: {self._xds_error(pipeline_subdir, 2) or 'unknown error'}")
-
-            if self._xds_ascii_ok(pipeline_subdir, job):
-                self._pointless(3, params)
-                self._log(pipeline_subdir, "RUN", "3_pointless: completed")
-                self._aimless(4, params)
-                self._log(pipeline_subdir, "RUN", "4_aimless: completed")
-                self._xds(5, params, "xds_refine_symmetry")
-
-                if self._xds_ascii_ok(pipeline_subdir, 5):
-                    self._log(pipeline_subdir, "RUN", "5_xds: completed")
-                    self._pointless(6, params)
-                    self._log(pipeline_subdir, "RUN", "6_pointless: completed")
-                    self._aimless(7, params)
-                    self._log(pipeline_subdir, "RUN", "7_aimless: completed")
-
-                    # Third XDS round only if resolution improved after job 7
-                    aim7_log = pipeline_subdir / "7_aimless" / "7_aimless.log"
-                    xds5_inp = pipeline_subdir / "5_xds" / "XDS.INP"
-                    res_lim_7 = next(
-                        (l.split("=", 1)[1].split("A")[0].strip()
-                         for l in aim7_log.read_text().splitlines()
-                         if "0.30: limit =" in l),
-                        "0.00",
-                    )
-                    res_lim_5 = next(
-                        (l.split()[1]
-                         for l in xds5_inp.read_text().splitlines()
-                         if "INCLUDE_RESOLUTION_RANGE=" in l),
-                        "0.00",
-                    )
-
-                    if float(res_lim_7) > float(res_lim_5):
-                        self._log(pipeline_subdir, "RUN", f"resolution improved ({res_lim_5} → {res_lim_7} Å), running third XDS round")
-                        self._xds(8, params, "xds_refine_symmetry")
-                        if self._xds_ascii_ok(pipeline_subdir, 8):
-                            self._log(pipeline_subdir, "RUN", "8_xds: completed")
-                            self._pointless(9, params)
-                            self._log(pipeline_subdir, "RUN", "9_pointless: completed")
-                            self._aimless(10, params)
-                            self._log(pipeline_subdir, "RUN", "10_aimless: completed")
-                        else:
-                            self._log(pipeline_subdir, "ERROR", f"8_xds: {self._xds_error(pipeline_subdir, 8) or 'unknown error'}")
-
-                    self._rfree(11, params)
-                    self._log(pipeline_subdir, "RUN", "11_rfree: completed")
-                    self._xtriage(13, params)
-                    # Extract final SG and resolution from last aimless log
-                    last_aimless = max(
-                        (p for p in pipeline_subdir.glob("*_aimless/*_aimless.log")),
-                        key=lambda p: int(p.parent.name.split("_")[0]),
-                        default=None,
-                    )
-                    summary = self._aimless_summary(last_aimless) if last_aimless else "completed"
-                    self._log(pipeline_subdir, "DONE", summary)
-                    QRefineWriter(params["process_dir"]).write()
-                else:
-                    self._log(pipeline_subdir, "ERROR", f"5_xds: {self._xds_error(pipeline_subdir, 5) or 'unknown error'}")
-            else:
-                self._log(pipeline_subdir, "ERROR", f"{job}_xds: {self._xds_error(pipeline_subdir, job) or 'unknown error'}")
-
-        elif (pipeline_subdir / "1_xds" / "XPARM.XDS").is_file():
-            err = self._xds_error(pipeline_subdir, 1) or "indexing failed"
-            self._log(pipeline_subdir, "ERROR", f"1_xds: {err}")
-            self._log(pipeline_subdir, "FORCE", "submitting forced integration jobs")
-            self._run_forced_integration(params, pipeline_subdir)
-        else:
-            self._log(pipeline_subdir, "ERROR", "1_xds: XDS did not attempt to index")
-
-    def _run_forced_integration(self, params, pipeline_subdir):
+    def _run_forced_integration(self, params, pipeline_subdir, retry_mode=None):
         """
         Enumerate candidate space groups and submit a second SGE array for
         forced integration. Mirrors the XPARM.XDS branch of xds_pipeline_index_qsub.sh.
         """
+        retry_mode = retry_mode if retry_mode is not None else self.retry_mode
+        if retry_mode == "auto":
+            retry_mode = "best"
         known_sg = params.get("known_sg", "none")
         if known_sg != "none":
             sym_to_try = [(
@@ -1790,8 +1622,13 @@ RunProcess(params).{method}()
                 params["known_sg_number"],
                 params.get("known_cell", "none"),
             )]
+        elif retry_mode == "p1":
+            xparm = pipeline_subdir / "1_xds" / "XPARM.XDS"
+            cell = self._cell_from_xparm(xparm)
+            sym_to_try = [("1", "P1", "1", cell)]
         else:
-            sym_to_try = self._sym_from_idxref(pipeline_subdir / "1_xds" / "IDXREF.LP")
+            sym_to_try = self._sym_from_idxref(
+                pipeline_subdir / "1_xds" / "IDXREF.LP", retry_mode)
 
         if not sym_to_try:
             print("## No candidate lattices found in IDXREF.LP")
@@ -1822,80 +1659,11 @@ RunProcess(params).{method}()
         self._log(pipeline_subdir, "FORCE",
                   f"submitting {len(sg_list)} job(s): {', '.join(sg_list)}")
         submit_sh = pipeline_subdir / "xds_pipeline_lattice_qsub_submit.sh"
-        self._submit_sge_array(lattice_list, submit_sh, h_rt="02:00:00", logs_dir=self._logs_dir)
-
-    def run_single_forced(self):
-        """
-        Forced-integration pipeline for one candidate space group. Called by
-        run_pipeline.py inside a {prefix}_{sg}_force/ directory.
-        Mirrors xds_pipeline_lattice_qsub.sh.
-
-        Always runs three full rounds of XDS (jobs 1/5/8) without the
-        resolution-convergence check used in run_single(), because the symmetry
-        was externally imposed and a fixed three-round protocol is sufficient.
-        """
-        params          = self.params
-        pipeline_subdir = Path(params["pipeline_subdir"])
-        sg   = params.get("sg", "none")
-        cell = params.get("cell", "none")
-        self._log(pipeline_subdir, "START",
-                  f"{params.get('pin_id','?')} | {pipeline_subdir.name} | sg={sg} cell={cell}")
-
-        self._setup_scratch(params)
-
-        self._xds(1, params, "xds_forced_integration")
-
-        if not self._xds_ascii_ok(pipeline_subdir, 1):
-            self._log(pipeline_subdir, "ERROR", f"1_xds: {self._xds_error(pipeline_subdir, 1) or 'XDS did not produce XDS_ASCII.HKL'}")
-            return
-
-        self._log(pipeline_subdir, "RUN", "1_xds: completed")
-        job = 1
-        if params.get("recycle_xds") == "true":
-            self._xds(2, params, "xds_recycle_detector")
-            job = 2
-            if self._xds_ascii_ok(pipeline_subdir, 2):
-                self._log(pipeline_subdir, "RUN", "2_xds: completed")
-            else:
-                self._log(pipeline_subdir, "ERROR", f"2_xds: {self._xds_error(pipeline_subdir, 2) or 'unknown error'}")
-
-        if not self._xds_ascii_ok(pipeline_subdir, job):
-            self._log(pipeline_subdir, "ERROR", f"{job}_xds: {self._xds_error(pipeline_subdir, job) or 'unknown error'}")
-            return
-
-        # Round 2: first symmetry refinement
-        self._pointless(3, params)
-        self._log(pipeline_subdir, "RUN", "3_pointless: completed")
-        self._aimless(4, params)
-        self._log(pipeline_subdir, "RUN", "4_aimless: completed")
-        self._xds(5, params, "xds_refine_symmetry")
-
-        if not self._xds_ascii_ok(pipeline_subdir, 5):
-            self._log(pipeline_subdir, "ERROR", f"5_xds: {self._xds_error(pipeline_subdir, 5) or 'unknown error'}")
-            return
-
-        self._log(pipeline_subdir, "RUN", "5_xds: completed")
-
-        # Round 3: second symmetry refinement (always runs for forced path)
-        self._pointless(6, params)
-        self._log(pipeline_subdir, "RUN", "6_pointless: completed")
-        self._aimless(7, params)
-        self._log(pipeline_subdir, "RUN", "7_aimless: completed")
-        self._xds(8, params, "xds_refine_symmetry")
-
-        if not self._xds_ascii_ok(pipeline_subdir, 8):
-            self._log(pipeline_subdir, "ERROR", f"8_xds: {self._xds_error(pipeline_subdir, 8) or 'unknown error'}")
-            return
-
-        self._log(pipeline_subdir, "RUN", "8_xds: completed")
-        self._pointless(9, params)
-        self._log(pipeline_subdir, "RUN", "9_pointless: completed")
-        self._aimless(10, params)
-        self._log(pipeline_subdir, "RUN", "10_aimless: completed")
-        self._rfree(11, params)
-        self._log(pipeline_subdir, "RUN", "11_rfree: completed")
-        self._xtriage(13, params)
-        # Extract final SG and resolution
-        last_aimless = pipeline_subdir / "10_aimless" / "10_aimless.log"
-        self._log(pipeline_subdir, "DONE", self._aimless_summary(last_aimless))
-        QRefineWriter(params["process_dir"]).write()
+        # Forced jobs reuse the dataset's resolved XDS sizing (baked into params);
+        # the slot request is processors x jobs.
+        if resources.is_auto(params.get("ncpu", "auto")):
+            forced_slots = None
+        else:
+            forced_slots = int(params["ncpu"]) * int(params.get("xds_jobs", 1))
+        self._submit_sge_array(lattice_list, submit_sh, h_rt="02:00:00",
+                               logs_dir=self._logs_dir, slots=forced_slots)

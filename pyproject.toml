@@ -4,19 +4,23 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "avicenna"
-version = "0.4.4"
+version = "1.0.0"
 requires-python = ">=3.11"
-dependencies = ["h5py"]
+dependencies = ["h5py", "freephil"]
 
 [project.scripts]
+"vic.check_programs"    = "avicenna.command_line.vic_check_programs:main"
 "vic.process"           = "avicenna.command_line.vic_process:main"
 "vic.refine"            = "avicenna.command_line.vic_refine:main"
 "vic.watch"             = "avicenna.command_line.vic_watch:main"
-"vic.scrape"            = "avicenna.command_line.vic_scrape_logs:main"
-"vic.pandda"            = "avicenna.command_line.vic_pandda:main"
+"vic.summary"           = "avicenna.command_line.vic_summary:main"
+"vic.analysis"          = "avicenna.command_line.vic_analysis:main"
+"vic.settings"          = "avicenna.command_line.vic_settings:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
+"avicenna.resources" = ["*.phil"]
 "avicenna.resources.scripts" = ["generate_XDS.INP"]
+"avicenna.resources.pipelines" = ["*.phil"]
