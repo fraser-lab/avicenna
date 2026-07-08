@@ -1469,8 +1469,13 @@ class RunProcess:
                 self._record_rejection(f"{collection_id}_{pin_id}", reason)
                 continue
 
+            # Frame filenames are NOT assumed to start with the pin code: SSRL
+            # (and other beamlines) name frames by puck position (e.g. C6_*.cbf
+            # in pin folder FRS050_06).  Discover every series present and key
+            # each group by its own file prefix; the pin code supplies dataset
+            # identity below.
             hdf5_masters = sorted(
-                m for m in pin_root.rglob(f"{pin_id}_*_master.h5")
+                m for m in pin_root.rglob("*_master.h5")
                 if "rasterImages" not in m.parts and "_r_Raster_" not in m.name
             )
             if hdf5_masters:
@@ -1479,16 +1484,16 @@ class RunProcess:
             else:
                 data_format = 'cbf'
                 groups = {}
-                for f in pin_root.glob(f"{pin_id}_*.cbf"):
-                    series_key = "_".join(f.stem.split("_")[:-1])
-                    groups.setdefault(series_key, []).append(f)
+                for f in pin_root.glob("*.cbf"):
+                    file_prefix = "_".join(f.stem.split("_")[:-1])
+                    groups.setdefault(file_prefix, []).append(f)
 
             if not groups:
                 # No diffraction data: any *_master.h5 was filtered as a raster
                 # pre-scan, and no CBF series were found.
                 any_raster = any(
                     "_r_Raster_" in m.name or "rasterImages" in m.parts
-                    for m in pin_root.rglob(f"{pin_id}_*_master.h5")
+                    for m in pin_root.rglob("*_master.h5")
                 )
                 if any_raster:
                     reason = "no diffraction data — only raster pre-scans present"
@@ -1498,10 +1503,20 @@ class RunProcess:
                 self._record_rejection(f"{collection_id}_{pin_id}", reason)
                 continue
 
-            for series_key, files in sorted(groups.items()):
-                pin_dir_check = self._output_dir / f"{collection_id}_{series_key}"
+            # Each distinct frame series in the pin folder is one sweep (usually
+            # one, sometimes more).  Dataset identity is the pin code plus a
+            # 1-based sweep number (e.g. FRS046_03_1): this preserves pin
+            # provenance, keeps puck positions from colliding across pins, and
+            # restores the original naming convention.  The frame prefix carries
+            # the beamline's own name (a puck position like C6, or an already
+            # sweep-numbered stem like FRS046_03_1) and feeds image_prefix only.
+            # Sweeps are numbered in sorted-prefix order, which matches any sweep
+            # index already encoded in the filenames.
+            for sweep_num, (file_prefix, files) in enumerate(sorted(groups.items()), start=1):
+                series_id = f"{pin_id}_{sweep_num}"
+                pin_dir_check = self._output_dir / f"{collection_id}_{series_id}"
                 if pin_dir_check.is_dir():
-                    print(f"Output folder already exists — skipping {series_key}")
+                    print(f"Output folder already exists — skipping {series_id}")
                     continue
 
                 # For HDF5 the master file's parent is the per-dataset image_dir;
@@ -1517,8 +1532,8 @@ class RunProcess:
                             image_count = count_hdf5_images(files[0])
                         except Exception as exc:
                             reason = f"HDF5 image count unreadable: {exc}"
-                            print(f"Could not read image count from {files[0]}: {exc} — skipping {series_key}")
-                            self._record_rejection(f"{collection_id}_{series_key}", reason)
+                            print(f"Could not read image count from {files[0]}: {exc} — skipping {series_id}")
+                            self._record_rejection(f"{collection_id}_{series_id}", reason)
                             continue
                     else:
                         image_count = len(files)
@@ -1530,11 +1545,11 @@ class RunProcess:
 
                 if image_count is not None and image_count < self.MIN_IMAGES:
                     reason = f"partial dataset ({image_count} images, minimum is {self.MIN_IMAGES})"
-                    print(f"Partial dataset ({image_count} images) — skipping {series_key}")
-                    self._record_rejection(f"{collection_id}_{series_key}", reason)
+                    print(f"Partial dataset ({image_count} images) — skipping {series_id}")
+                    self._record_rejection(f"{collection_id}_{series_id}", reason)
                     continue
 
-                pin_dir = self._output_dir / f"{collection_id}_{series_key}"
+                pin_dir = self._output_dir / f"{collection_id}_{series_id}"
                 pin_dir.mkdir(exist_ok=True)
 
                 index_ranges = self._indexing_ranges(image_count, first_image)
@@ -1570,9 +1585,9 @@ class RunProcess:
 
                         per_params = {
                             **self.params,
-                            "pin_id":                f"{collection_id}_{series_key}",
+                            "pin_id":                f"{collection_id}_{series_id}",
                             "context_width":         self._context_width,
-                            "image_prefix":          series_key,
+                            "image_prefix":          file_prefix,
                             "image_dir":             str(image_dir),
                             "pipeline_subdir":       str(pipeline_subdir),
                             "process_dir":           str(self.process_dir),
@@ -1598,7 +1613,7 @@ class RunProcess:
                             fh.write(str(pipeline_subdir) + "\n")
 
                 with open(processed, "a") as fh:
-                    fh.write(f"{collection_id}_{series_key}\n")
+                    fh.write(f"{collection_id}_{series_id}\n")
 
         submit_sh = self.process_dir / "xds_pipeline_index_qsub_submit.sh"
         job_id = self._submit_sge_array(qsub_list, submit_sh, h_rt="06:00:00",

@@ -19,12 +19,10 @@ src/avicenna/pipelines/__init__.py
 src/avicenna/pipelines/analysis.py
 src/avicenna/pipelines/jobbase.py
 src/avicenna/pipelines/processing.py
+src/avicenna/pipelines/processing_runner.py
 src/avicenna/pipelines/refinement.py
+src/avicenna/pipelines/refinement_runner.py
 src/avicenna/pipelines/sentinel.py
-src/avicenna/pipelines/legacy/__init__.py
-src/avicenna/pipelines/legacy/pandda_pipeline.py
-src/avicenna/pipelines/legacy/proc_pipeline.py
-src/avicenna/pipelines/legacy/qrefine_pipeline.py
 src/avicenna/resources/__init__.py
 src/avicenna/resources/default_software_registry.phil
 src/avicenna/resources/software_registry.phil
@@ -42,6 +40,8 @@ src/avicenna/utils/phil/_base.py
 src/avicenna/utils/phil/_serialize.py
 src/avicenna/utils/phil/analysis/__init__.py
 src/avicenna/utils/phil/analysis/pandda.py
+src/avicenna/utils/phil/analysis/pandda2.py
+src/avicenna/utils/phil/analysis/pandda_preparer.py
 src/avicenna/utils/phil/processing/__init__.py
 src/avicenna/utils/phil/processing/merge.py
 src/avicenna/utils/phil/processing/xds.py
