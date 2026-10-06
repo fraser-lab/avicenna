@@ -22,14 +22,93 @@ cannot run its own monitor thread; only an external ``qdel``-based monitor would
 catch that.  See the ``stall-detection-and-completion-disconnect`` project memory
 for the recorded child-process / external-monitor alternatives.  The SGE
 ``h_rt`` remains the ultimate backstop.
+
+Run-time limit
+--------------
+A job killed at its hard run-time limit cannot log anything, so its last
+pipeline.log line stays non-terminal and the sentinel waits on it forever.  A
+job submitted with a soft limit (every job script ``pipelines.sge`` writes) is
+warned with ``SIGUSR1`` first.  ``RuntimeLimited`` turns that warning into the
+job's own failure report, then exits, before the hard kill arrives.
 """
 
 import contextlib
+import functools
 import os
+import signal
 import sys
 import threading
 import time
 from pathlib import Path
+
+
+#: Signal SGE sends when a job passes its soft run-time limit (``s_rt``).
+RUNTIME_WARNING_SIGNAL = signal.SIGUSR1
+
+
+class RuntimeLimitReached(BaseException):
+    """Raised in the main thread when the run-time warning arrives.
+
+    A BaseException, so a backend's ``except Exception`` cannot swallow it, and
+    so ``subprocess.run`` kills the running program on the way out.
+    """
+
+
+class RuntimeLimited:
+    """Mixin: a subclass's ``run()`` always runs under the run-time guard.
+
+    Any ``run`` a subclass defines is wrapped when the class is created, so a
+    new job type is covered without opting in.  On the warning the guard calls
+    ``_on_runtime_limit()`` -- the subclass reports the failure there -- and
+    exits with status 1.
+    """
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        run = cls.__dict__.get("run")
+        if run is None or getattr(run, "_runtime_limited", False):
+            return
+
+        @functools.wraps(run)
+        def guarded(self, *args, **kw):
+            with self._runtime_limit_guard():
+                return run(self, *args, **kw)
+
+        guarded._runtime_limited = True
+        cls.run = guarded
+
+    def _on_runtime_limit(self):
+        """Report that the job is stopping at its run-time limit."""
+
+    @contextlib.contextmanager
+    def _runtime_limit_guard(self):
+        # A signal handler can only be installed from the main thread; a nested
+        # run() (a subclass calling super().run()) is already guarded.
+        if (threading.current_thread() is not threading.main_thread()
+                or getattr(self, "_runtime_guard_active", False)):
+            yield
+            return
+        fired = []
+
+        def _handler(signum, frame):
+            # The warning can arrive more than once (to the process group and
+            # forwarded by the job script); only the first one counts.
+            if fired:
+                return
+            fired.append(signum)
+            signal.signal(signum, signal.SIG_IGN)
+            raise RuntimeLimitReached()
+
+        previous = signal.signal(RUNTIME_WARNING_SIGNAL, _handler)
+        self._runtime_guard_active = True
+        try:
+            yield
+        except RuntimeLimitReached:
+            self._on_runtime_limit()
+            raise SystemExit(1)
+        finally:
+            self._runtime_guard_active = False
+            signal.signal(RUNTIME_WARNING_SIGNAL, previous)
 
 
 def _has_recent_activity(roots, since):
@@ -53,8 +132,9 @@ def _has_recent_activity(roots, since):
     return False
 
 
-class SubPipelineJob:
-    """Mixin providing the progress-based stall watchdog.
+class SubPipelineJob(RuntimeLimited):
+    """Mixin providing the progress-based stall watchdog (and, through
+    ``RuntimeLimited``, the run-time guard).
 
     Subclasses (the interpreters) override ``_watch_roots`` and the stall-log
     hooks, and wrap their run body in ``with self._stall_watchdog():``.
@@ -153,6 +233,20 @@ class SubPipelineInterpreter(SubPipelineJob):
 
     STREAMS_PROGRAM_OUTPUT = False
 
+    # Step being executed, so a run-time stop can name where it happened.
+    _current_step = None
+
+    # -- run-time limit (see RuntimeLimited) ---------------------------------
+
+    def _on_runtime_limit(self):
+        """One terminal ERROR line, and the record closed as failed at the
+        current step."""
+        from avicenna.utils.info import OUTCOME_FAILED
+        step = self._current_step
+        reason = "run-time limit reached -- job stopped"
+        self._log("ERROR", f"{step}: {reason}" if step else reason)
+        self._close_record(OUTCOME_FAILED, failed_step=step, reason=reason)
+
     # -- logging -------------------------------------------------------------
 
     def _log_context(self):
@@ -202,6 +296,102 @@ class SubPipelineInterpreter(SubPipelineJob):
         """Hook invoked on a fatal error, before the loop breaks."""
         return None
 
+    # -- per-process record ---------------------------------------------------
+    #
+    # Each job keeps its own record of what it did, beside its own logs, and
+    # rewrites it after every step.  The stage sentinel gathers those records
+    # when the run ends -- several per dataset -- and merges the selected one
+    # into the project's info.json.  The values come from the steps themselves,
+    # where the dataset, the attempt and the file are all unambiguous, instead
+    # of being recovered afterwards by walking the output tree.
+    #
+    # A sub-pipeline opts in by returning a directory and a key below; one that
+    # does not keeps no record and behaves exactly as before.
+
+    _record = None
+    _record_warned = False
+
+    def _record_directory(self):
+        """Where this job keeps its record, or None to keep none."""
+        return None
+
+    def _record_key(self):
+        """Dataset tag the record is filed under."""
+        return None
+
+    def _record_fields(self):
+        """What the job already knows before its first step runs."""
+        return {}
+
+    def _open_record(self):
+        """Start the record, if this sub-pipeline keeps one."""
+        directory, key = self._record_directory(), self._record_key()
+        if not directory or not key:
+            return None
+        try:
+            from avicenna.utils.info import ProcessInfo
+            self._record = ProcessInfo.start(directory, key,
+                                             **self._record_fields())
+        except Exception as exc:
+            self._record = None
+            self._log("WARN", f"could not open the process record: {exc}")
+            return None
+        self._save_record()
+        return self._record
+
+    def _save_record(self):
+        """Persist the record.
+
+        A record is metadata and never a precondition, so a failure warns once
+        and the job carries on: a dataset whose record never arrived is a state
+        the sentinel can already see and name, whereas a dataset killed over
+        its metadata is real work lost.
+        """
+        if self._record is None:
+            return
+        try:
+            self._record.write()
+        except Exception as exc:
+            if not self._record_warned:
+                self._record_warned = True
+                self._log("WARN", f"could not write {self._record.path}: {exc}")
+
+    def _note_step(self, step, result, seconds):
+        if self._record is None:
+            return
+        try:
+            self._record.note_step(step.id, program=step.program,
+                                   status=result.get("status", "completed"),
+                                   message=result.get("message"),
+                                   seconds=seconds)
+        except Exception:
+            return
+        self._save_record()
+
+    def _record_update(self, **fields):
+        """Merge fields into the record without touching how it ended."""
+        if self._record is None:
+            return
+        try:
+            self._record.update(self._record.key, **fields)
+        except Exception:
+            return
+        self._save_record()
+
+    def _close_record(self, outcome, failed_step=None, reason=None, **fields):
+        """Set how the job ended, with any final fields, and write."""
+        if self._record is None:
+            return
+        try:
+            if fields:
+                self._record.update(self._record.key, **fields)
+            self._record.set_outcome(outcome, failed_step=failed_step,
+                                     reason=reason)
+        except Exception as exc:
+            self._log("WARN", f"could not finalise the process record: {exc}")
+            return
+        self._save_record()
+
     def _run_steps(self, steps, ctx):
         """Execute *steps* in order, logging one ``<tag> <step.id>: <message>``
         line each.  Returns True if a fatal error broke the loop.
@@ -238,10 +428,19 @@ class SubPipelineInterpreter(SubPipelineJob):
                           f"{step.id}: no backend registered for program '{program}'")
                 return True
 
-            result  = self._invoke(step, ctx)
+            started = time.time()
+            self._current_step = step.id
+            result = self._invoke(step, ctx)
+            self._current_step = None
             status  = result.get("status", "completed")
             message = result.get("message", status)
             line    = f"{step.id}: {message}"
+
+            # Noted before the branches below so the record and the log line
+            # always describe the same step in the same terms.  Only steps that
+            # actually ran are noted: a step skipped by a guard is a
+            # consequence of an earlier one, and the log already carries it.
+            self._note_step(step, result, time.time() - started)
 
             if status == "completed":
                 self._log("RUN", line)
@@ -259,6 +458,11 @@ class SubPipelineInterpreter(SubPipelineJob):
                 self._log("ERROR", line)
                 ctx["failed_steps"].add(step.id)
                 if result.get("fatal", False):
+                    # Closed before the hook, which may submit further jobs and
+                    # has its own ways to fail.
+                    from avicenna.utils.info import OUTCOME_FAILED
+                    self._close_record(OUTCOME_FAILED, failed_step=step.id,
+                                       reason=message)
                     self._on_fatal(step, ctx, result)
                     return True
         return False

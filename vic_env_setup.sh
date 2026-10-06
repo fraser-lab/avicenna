@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Make avicenna commands available in the current shell session.
-# Source this file — do not execute it directly.
+# Source this file -- do not execute it directly.
 # Usage:   source /path/to/vic_env_setup.sh
 # To have it run automatically, add that line to your ~/.bashrc or ~/.zshrc.
 

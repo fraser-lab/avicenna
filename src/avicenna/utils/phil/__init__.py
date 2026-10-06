@@ -41,7 +41,7 @@ __all__ = [
 ]
 
 # ---------------------------------------------------------------------------
-# Master PHIL preamble (project scope — not a sub-pipeline plugin)
+# Master PHIL preamble (project scope -- not a sub-pipeline plugin)
 # ---------------------------------------------------------------------------
 
 _AVICENNA_PREAMBLE = """\

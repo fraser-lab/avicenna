@@ -8,13 +8,13 @@ dict that is loaded from params_{suffix}.json on the compute node.
 
 Context dict keys set and consumed by these handlers
 -----------------------------------------------------
-  rfree_after_rigid_body  : float — set by a phenix.refine (rigid_body) step, if any
-  jelly_input             : str   — set by phaser (default) or a rigid_body step, used by refmac jelly
-  data_mtz                : str   — set by phaser; the data MTZ (in the solution frame) refmac refines against
-  rfree_threshold         : float — set by phaser (for downstream skip decisions)
-  phaser_succeeded        : bool  — set by phaser
-  jelly_succeeded         : bool  — set by refmac (jelly)
-  final_rfree             : float — set by refmac (restrained)
+  rfree_after_rigid_body  : float -- set by a phenix.refine (rigid_body) step, if any
+  jelly_input             : str   -- set by phaser (default) or a rigid_body step, used by refmac jelly
+  data_mtz                : str   -- set by phaser; the data MTZ (in the solution frame) refmac refines against
+  rfree_threshold         : float -- set by phaser (for downstream skip decisions)
+  phaser_succeeded        : bool  -- set by phaser
+  jelly_succeeded         : bool  -- set by refmac (jelly)
+  final_rfree             : float -- set by refmac (restrained)
 """
 
 import pathlib
@@ -535,7 +535,7 @@ def _run_phaser(step, ctx, params, suffix, job_dir):
     comp = s.asu_composition
     if comp.derive_from_pdb:
         mw, copies = _derive_composition(reference, search_model)
-        if mw is None:            # parse failed — fall back to explicit values
+        if mw is None:            # parse failed -- fall back to explicit values
             mw, copies = comp.mw, comp.num_copies
     else:
         mw, copies = comp.mw, comp.num_copies

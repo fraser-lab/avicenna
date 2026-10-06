@@ -111,25 +111,20 @@ pandda
 # Step execution
 # ---------------------------------------------------------------------------
 
-def _build_pin_map(source):
-    """Map full_pin -> dataset_code from <source>/qrefine_list.txt (info.csv pin codes)."""
-    import pathlib
-    pin_map = {}
-    list_file = pathlib.Path(str(source)) / "qrefine_list.txt"
-    if not list_file.is_file():
-        return pin_map
-    for line in list_file.read_text().splitlines():
-        parts = line.strip().split(",")
-        if not parts or not parts[0]:
-            continue
-        full_pin = parts[0]
-        p = full_pin.split("_")
-        if len(p) >= 3:
-            pin_map[full_pin] = "_".join(p[-3:-1])
-    return pin_map
+def _load_records(source):
+    """The dataset records of <source>/info.json, by dataset tag."""
+    from avicenna.utils.info import ProjectInfo
+    return dict(ProjectInfo.load(str(source)).datasets)
 
 
-def make_preparer(inp, p, dry_run=None):
+def _selected_libraries(inp):
+    """The ligand_library selection as a filter: None means every library."""
+    from avicenna.utils.phil.analysis import LIGAND_LIBRARIES, resolve_ligand_libraries
+    selected = resolve_ligand_libraries(getattr(inp, "ligand_library", None))
+    return None if set(selected) == set(LIGAND_LIBRARIES) else selected
+
+
+def make_preparer(inp, p, dry_run=None, on_submit=None, project_dir=None):
     """Build a PanDDAPreparer from the shared ``input`` scope and a ``pandda``
     step block.  Shared by the interpreter (run_step) and the CLI --legacy path.
 
@@ -160,6 +155,7 @@ def make_preparer(inp, p, dry_run=None):
                 f"input.ground_state_datasets is not a directory: {gs_folder}")
         gs_dirs = [gs_path]
 
+    records = _load_records(source)
     return PanDDAPreparer(
         process_dirs=[source],
         ground_state_dirs=gs_dirs,
@@ -177,7 +173,11 @@ def make_preparer(inp, p, dry_run=None):
         no_lr_comp_check=p.analyse.no_lr_comp_check,
         log_time_out=p.run.log_time_out,
         dry_run=p.run.dry_run if dry_run is None else dry_run,
-        pin_map=_build_pin_map(source),
+        on_submit=on_submit,
+        project_dir=project_dir,
+        records=records,
+        ligand_source_path=getattr(inp, "ligand_source_path", None),
+        ligand_libraries=_selected_libraries(inp),
     )
 
 
@@ -187,9 +187,18 @@ def run_step(step, ctx):
     Program-agnostic input comes from the shared ``analysis.input`` scope,
     passed in via ``ctx['input']`` by the interpreter.
     """
+    from avicenna.utils.utils import SENTINEL_WAIT_DONE, SENTINEL_WAIT_FAILED
+
     try:
-        preparer = make_preparer(ctx.get("input"), step.pandda)
-        preparer.run()
+        preparer = make_preparer(ctx.get("input"), step.pandda,
+                                 on_submit=ctx.get("on_submit"),
+                                 project_dir=ctx.get("project_dir"))
+        outcome = preparer.run()
     except ValueError as e:
         return {"status": "error", "fatal": True, "message": str(e)}
-    return {"status": "completed", "message": "pandda.analyse finished"}
+    if outcome == SENTINEL_WAIT_FAILED:
+        return {"status": "error", "fatal": True,
+                "message": "pandda.analyse did not finish"}
+    if outcome == SENTINEL_WAIT_DONE:
+        return {"status": "completed", "message": "pandda.analyse finished"}
+    return {"status": "completed", "message": "pandda.analyse submitted"}

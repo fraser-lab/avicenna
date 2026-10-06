@@ -2,15 +2,27 @@ import contextlib
 import io
 import os
 import re
+import shutil
 import sys
 import argparse
 import pathlib
 import time
 from importlib.metadata import version, PackageNotFoundError
 sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "src"))
-from avicenna.utils.utils import DataFinder, Watcher, ProcessingScraper, ProgressBar, log_phil_diff, wait_for_sentinel
+from avicenna.utils.utils import (DataFinder, Watcher, ProcessingScraper, ProgressBar,
+                                 log_phil_diff, log_offset, enumerate_datasets,
+                                 clear_stage_outputs,
+                                 EXIT_FAILURE, EXIT_RUN_ACTIVE, EXIT_RUN_COMPLETE,
+                                 EXIT_RUN_INCOMPLETE,
+                                 SENTINEL_WAIT_FAILED, SENTINEL_WAIT_TIMEOUT)
+from avicenna.utils.crystal_list import (CrystalList, CrystalListError, TAG_NO_IMAGE_DATA,
+                                         TAG_PRE_SCAN, log_tag, match_folders,
+                                         report_matches)
+from avicenna.utils.info import ProjectInfo
+from avicenna.utils.runlock import RunLock, RunLockHeld
 from avicenna.pipelines.processing import ProcessingOrchestrator
 from avicenna.pipelines.sentinel import ProcessingSentinel
+from avicenna.pipelines.survey import RUN_COMPLETE, RUN_NONE, survey_run
 from avicenna.utils.phil import ProcessingPHIL
 from avicenna.utils.software import check_programs
 
@@ -28,11 +40,18 @@ parser.add_argument("--settings", type=pathlib.Path, metavar="FILE",
                     help=f"PHIL settings file (default: auto-load {_DEFAULT_PHIL} if present)")
 parser.add_argument("-d", "--data", type=pathlib.Path, nargs="+", help="Path(s) to data; each should have the format <synchrotron>_<date_YYYYMMDD>_transfer")
 parser.add_argument("-p", "--pinlist", type=str, help="Filename for pin list file, typically pin_list.txt")
+parser.add_argument("-x", "--xtal_list", type=str, help="Crystal list spreadsheet (.xlsx, .csv or .tsv) naming the fragment soaked into each crystal")
 parser.add_argument("-o", "--output", type=pathlib.Path, default=pathlib.Path(os.curdir), help="Path to output folder (default: current directory)")
 parser.add_argument("--dry_run", action="store_true", help=f"Create pin_list.txt and {_TEMPLATE_PHIL} without submitting jobs")
 parser.add_argument("--silent",    action="store_true", help="Submit jobs without tailing the log")
 parser.add_argument("--no-prog-log", dest="no_prog_log", action="store_true", help="Disable the multiline progress bar; show plain progress updates instead")
 parser.add_argument("--no_filter", action="store_true", help="Skip quality filter when writing qrefine_list.txt; write all completed results")
+parser.add_argument("--ignore_lock", action="store_true", help="Start even if another run holds the lock on the output folder")
+_rerun_group = parser.add_mutually_exclusive_group()
+_rerun_group.add_argument("--resume", action="store_true",
+                          help="Complete an incomplete run in the output folder")
+_rerun_group.add_argument("--overwrite", action="store_true",
+                          help="Discard this stage's results in the output folder and start over")
 parser.add_argument("--xds_root", type=pathlib.Path, help="Path to the XDS install folder, default is an SBGrid install (/programs/<OS>/xds)")
 _phil_group = parser.add_mutually_exclusive_group()
 _phil_group.add_argument("-c", dest="phil", action="store_true",
@@ -99,9 +118,99 @@ def _params_from_phil(phil):
     out["indexing_images"]       = p.dataset.indexing_images
     out["refine_cell_integrate"] = p.dataset.refine_cell_integrate
     out["no_symmetry"]           = "true" if p.dataset.no_symmetry else "false"
+    out["skip_prescans"]         = "true" if p.dataset.skip_prescans else "false"
     out["ref_hkl"]               = "none" if p.dataset.reference_hkl is None else str(p.dataset.reference_hkl)
     out["ref_mtz"]               = "none" if p.input.reference_mtz is None else str(p.input.reference_mtz)
     return out
+
+
+def _init_info_json(pin_lines, crystal_list_path, project_dir, skip_prescans=True):
+    """Create info.json for this run, before any job is submitted.
+
+    The record is keyed by the dataset tags the run will produce, so every later
+    stage can find its datasets by tag alone.  A crystal list adds the fragment
+    each crystal was soaked in; without one the record is still written, simply
+    without ligand fields.  It is additive metadata and never a precondition for
+    processing -- only an unreadable crystal list, which is a user error worth
+    catching before cluster time is spent, stops the run.
+    """
+    datasets, empty, prescans = enumerate_datasets(pin_lines,
+                                                   skip_prescans=skip_prescans)
+    for folder, prefix, reason in prescans:
+        print(log_tag(TAG_PRE_SCAN, f"{folder}/{prefix} not a dataset: {reason}"))
+    for folder, reason in empty:
+        print(log_tag(TAG_NO_IMAGE_DATA, f"{folder} skipped: {reason}"))
+
+    result = None
+    if crystal_list_path:
+        try:
+            crystals = CrystalList.from_file(crystal_list_path)
+        except CrystalListError as exc:
+            sys.exit(f"ERROR: {exc}")
+        print(f"Read {len(crystals)} entries from {crystal_list_path}")
+        result = match_folders(crystals, [d.folder_name for d in datasets])
+        report_matches(result)
+
+    info = ProjectInfo.create_from(project_dir, datasets, result,
+                                   crystal_list=crystal_list_path)
+    try:
+        info.write()
+    except OSError as exc:
+        print(f"WARNING: could not write {info.path}: {exc}")
+        return None
+    print(f"Wrote {info.path} ({len(info)} datasets)")
+    return info
+
+
+# What --overwrite removes from the project directory: this stage's results and
+# logs.  Settings (.phil) and the input lists are kept, so a restart with changed
+# settings can happen in the same folder; other stages' results are not this
+# stage's to remove.
+_OVERWRITE_DIRS  = ("processing", "processing_logs")
+_OVERWRITE_FILES = ("info.json", "info.json.prev", "info.csv", "qrefine_list.txt",
+                    "sentinel_processing.py", "sentinel_processing_submit.sh")
+_OVERWRITE_GLOBS = ("info.json.bad.*", "sentinel_processing_submit.sh.o*")
+
+
+def _clear_processing(project_dir):
+    """Remove what an earlier processing run left, keeping its log as a backup."""
+    clear_stage_outputs(project_dir, "processing.log", _OVERWRITE_DIRS,
+                        _OVERWRITE_FILES, _OVERWRITE_GLOBS)
+
+
+def _existing_results(pin_lines, project_dir, resume=False, overwrite=False,
+                      skip_prescans=True):
+    """Deal with what an earlier run left in *project_dir*.
+
+    Returns None to go ahead, or the exit status to stop with.  Stopping writes
+    nothing, so the folder is left as the earlier run left it.
+    """
+    project_dir = pathlib.Path(project_dir)
+    if overwrite:
+        _clear_processing(project_dir)
+        return None
+    survey = survey_run(pin_lines, project_dir / "processing",
+                        skip_prescans=skip_prescans)
+    if survey.state == RUN_NONE:
+        return None
+    if survey.state == RUN_COMPLETE:
+        if resume:
+            print(f"All {survey.total} datasets already processed; nothing to resume.")
+            return 0
+        print("WARNING: Results found for all data. Either re-run with --overwrite "
+              "option or create a new folder.")
+        return EXIT_RUN_COMPLETE
+    if not resume:
+        print(f"WARNING: Results found for {survey.done}/{survey.total} datasets. "
+              "Re-run with --overwrite option or create a new folder to start over "
+              "or re-run with --resume to complete current run.")
+        return EXIT_RUN_INCOMPLETE
+    # Unfinished datasets stopped for reasons unrelated to their data, so what
+    # they left is redone rather than kept.
+    for key in survey.frayed:
+        shutil.rmtree(project_dir / "processing" / key)
+        print(f"Removed unfinished {key}; it will be processed again")
+    return None
 
 
 def _watch_with_bar(watcher, omnibus):
@@ -162,6 +271,7 @@ def _auto_enable_known_symmetry(phil, extras):
 
 
 def main():
+    lock = None
     try:
         args, _extras = parser.parse_known_args()
 
@@ -216,6 +326,8 @@ def main():
             args.data = [pathlib.Path(x) for x in (_d if isinstance(_d, (list, tuple)) else [_d])]
         if _pi.pinlist:
             args.pinlist = _pi.pinlist
+        if _pi.crystal_list:
+            args.xtal_list = _pi.crystal_list
         if _po.directory and _po.directory != ".":
             args.output = pathlib.Path(_po.directory)
 
@@ -298,7 +410,25 @@ processing {{
         project_dir = os.path.abspath(args.output)
         procpath    = os.path.join(project_dir, "processing")
         omnibus     = os.path.join(project_dir, "processing.log")
-        sentinel_submitted = False
+        sentinel = None
+
+        # Claimed before anything is written or submitted: a second run into
+        # this directory does not overwrite the first, it silently skips the
+        # datasets the first already created.  --dry_run submits nothing and
+        # exited above, so it never reaches this.
+        lock = RunLock(project_dir, "processing")
+        try:
+            lock.acquire(ignore=args.ignore_lock)
+        except RunLockHeld as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(EXIT_RUN_ACTIVE if exc.active else EXIT_FAILURE)
+        stop = _existing_results(params["pins"], project_dir,
+                                 resume=args.resume, overwrite=args.overwrite,
+                                 skip_prescans=params["skip_prescans"] == "true")
+        if stop is not None:
+            lock.release()
+            sys.exit(stop)
+        log_start = log_offset(omnibus)
 
         if args.xds_root:
             params["xds_root"] = args.xds_root
@@ -312,6 +442,8 @@ processing {{
         if args.data:
             _snap.append("    data = " + " ".join(f'"{d}"' for d in args.data))
         _snap.append(f'    pinlist = "{args.pinlist or "pin_list.txt"}"')
+        if args.xtal_list:
+            _snap.append(f'    crystal_list = "{args.xtal_list}"')
         _snap += ["  }", "  output {", f'    directory = "{project_dir}"', "  }", "}"]
         phil.adopt_phil_string("\n".join(_snap) + "\n")
         # Drop the shipped empty isoform template when a real isoform was
@@ -323,6 +455,10 @@ processing {{
         print(f"Wrote {_DEFAULT_PHIL} (effective settings for this run)")
         log_phil_diff(phil, omnibus)
         with contextlib.redirect_stdout(_Tee(sys.stdout, omnibus)):
+            # info.json first: the crystal list is read and reported here, and
+            # its report belongs in processing.log with everything else.
+            _init_info_json(params["pins"], args.xtal_list, project_dir,
+                            skip_prescans=params["skip_prescans"] == "true")
             params["phil_string"] = phil.diff_phil_string()
             main_job_id = ProcessingOrchestrator(params).run()
         # All finalization (filtered qrefine_list.txt + refine.phil) is done by
@@ -331,8 +467,13 @@ processing {{
         # submitting shell disconnects.  The sentinel is the sole arbiter of
         # completion; the foreground watcher below is display-only.
         if main_job_id:
-            ProcessingSentinel(project_dir, no_filter=args.no_filter).submit(main_job_id)
-            sentinel_submitted = True
+            sentinel = ProcessingSentinel(project_dir, no_filter=args.no_filter)
+            sentinel_job_id = sentinel.submit(main_job_id)
+            # The lock is now held by the cluster, not by this shell: the job
+            # ids are what tells a later run whether it is still real.
+            lock.record_jobs(main_job_id, sentinel_job_id)
+        else:
+            lock.release()
 
         if args.silent or args.dry_run:
             return
@@ -354,8 +495,18 @@ processing {{
         # The file-structure sweep above is idle; wait for the held SGE sentinel
         # to record completion (it also writes the filtered qrefine_list.txt +
         # refine.phil) before declaring the run done.  Safe to Ctrl-C.
-        if sentinel_submitted:
-            if not wait_for_sentinel(omnibus):
+        finalized = True
+        if sentinel is not None:
+            outcome = sentinel.wait(start=log_start)
+            if outcome == SENTINEL_WAIT_FAILED:
+                # The summaries below read the job tree, not the sentinel's
+                # output, so they are still worth printing -- but this run did
+                # not produce the files the next stage reads.
+                finalized = False
+                print("ERROR: the completion sentinel failed to finalize this run; "
+                      "qrefine_list.txt and refine.phil may be missing or incomplete.")
+                print(f"The sentinel's log is in {project_dir}.")
+            elif outcome == SENTINEL_WAIT_TIMEOUT:
                 print("Sentinel marker not seen within the timeout; it will still "
                       "finalize on the cluster (qrefine_list.txt + refine.phil).")
         watcher.print_summary(omnibus=omnibus)
@@ -365,8 +516,14 @@ processing {{
         scraper = ProcessingScraper(procpath)
         scraper.scrape_all()
         scraper.print_summary(omnibus=omnibus)
+        if not finalized:
+            sys.exit(1)
     except KeyboardInterrupt:
         print("\nInterrupted. Any submitted jobs are still running on the cluster.")
+        # An interrupt before submission leaves a lock nothing will ever
+        # release; after it, the cluster jobs still hold the directory.
+        if lock is not None:
+            lock.release()
         sys.exit(1)
 
 

@@ -12,3 +12,8 @@ python = ">=3.12,<3.14"
 freephil = ">=0.2.1,<0.3"
 setuptools = "<71"
 h5py = "*"
+openpyxl = ">=3.1.5,<4"
+pytest = ">=9.1.1,<10"
+
+[pypi-dependencies]
+avicenna = { path = ".", editable = true }

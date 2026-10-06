@@ -3,7 +3,7 @@ refine {
   ncpu = auto
   input {
     output_dir = "."
-    dataset_list = "qrefine_list.txt"
+    dataset_list = None
     reference_mtz = None
     reference_pdb = None
   }

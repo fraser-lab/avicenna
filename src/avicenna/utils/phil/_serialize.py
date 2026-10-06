@@ -56,7 +56,7 @@ def _render_value(obj, val) -> str:
     """Format a leaf value, rendering a multi-choice as its full option menu.
 
     A multi-choice (``.type = choice(multi=True)``) is emitted as every option
-    with ``*`` on the selected ones (e.g. ``DSI_1 DSI_2 *EE all``).  This keeps
+    with ``*`` on the selected ones (e.g. ``DSI_1 DSI_2 *EE_1 all``).  This keeps
     the menu discoverable AND re-parses correctly -- a bare space-separated list
     of values parses to an EMPTY selection in freephil.  Everything else falls
     through to ``_val_str``.
@@ -198,7 +198,7 @@ def compact_phil_string(phil_base, expert_level=None, attributes=False) -> str:
     Parameters
     ----------
     phil_base : PhilBase
-        Any avicenna PHIL parameter object (ProcessingPHIL, RefinePHIL, …).
+        Any avicenna PHIL parameter object (ProcessingPHIL, RefinePHIL, ...).
     expert_level : int or None
         When given, parameters (and sub-scopes) whose expert_level exceeds this
         value are omitted, mirroring freephil ``show(expert_level=...)``.  None

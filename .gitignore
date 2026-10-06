@@ -7,3 +7,5 @@ __pycache__/
 # Claude Code local memory
 .claude/
 .gitattributes
+# development docs
+dev_docs/

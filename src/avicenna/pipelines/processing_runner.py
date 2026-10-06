@@ -27,11 +27,47 @@ import time
 from datetime import datetime
 from pathlib import Path
 sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "src"))
-from avicenna.utils.utils import BRAVAIS_LATTICES, QRefineWriter, format_log_line, ProcessingWatcher, sg_lookup, count_hdf5_images, qsub_terse
+from avicenna.pipelines.sge import SGESubmitter
+from avicenna.utils.utils import BRAVAIS_LATTICES, MIN_IMAGES, QRefineWriter, format_log_line, ProcessingWatcher, sg_lookup, count_hdf5_images, qsub_terse, collection_id, dataset_tag, discover_sweeps, numeric_tokens
 from avicenna.utils.software import find_xds, find_ccp4, find_phenix, suite_setup_sources
+from avicenna.utils.crystal_list import TAG_REJECTED, log_tag
 from avicenna.utils import resources
 
 
+# Rows of the aimless summary block, as (record field, text aimless prints).
+# The label is matched as a substring of the line; the first line that carries
+# it wins, since the block appears once.  "half-set correlation" identifies the
+# CC1/2 row on its own -- the other CC(1/2) lines are table and graph headers.
+_AIMLESS_SHELL_ROWS = (
+    ("low_res_limit",  "Low resolution limit"),
+    ("high_res_limit", "High resolution limit"),
+    ("completeness",   "Completeness"),
+    ("multiplicity",   "Multiplicity"),
+    ("cc_half",        "half-set correlation"),
+    ("rpim",           "Rpim (within I+/I-)"),
+    ("i_sig_i",        "Mn(I/sd(I))"),
+    ("unit_cell",      "Average unit cell"),
+)
+
+_AIMLESS_TEXT_ROWS = (
+    ("space_group", "Space group"),
+    ("mosaicity",   "Average mosaicity"),
+)
+
+
+def format_aimless_summary(stats):
+    """The one-line scaling summary, derived from ``_aimless_stats`` values.
+
+    Resolution is the outer shell; the rest are overall.
+    """
+    parts = []
+    if "high_res_limit" in stats: parts.append(f"res={stats['high_res_limit'][-1]}Å")
+    if "space_group"    in stats: parts.append(f"SG={stats['space_group']}")
+    if "unit_cell"      in stats: parts.append(f"UC={' '.join(stats['unit_cell'])}")
+    if "completeness"   in stats: parts.append(f"comp={stats['completeness'][0]}")
+    if "rpim"           in stats: parts.append(f"rpim={stats['rpim'][0]}")
+    if "cc_half"        in stats: parts.append(f"CC½={stats['cc_half'][0]}")
+    return " ".join(parts) if parts else "completed"
 
 
 class RunBase:
@@ -40,7 +76,7 @@ class RunBase:
 
     Responsible for assembling a command, executing it in the appropriate
     working directory, and capturing stdout/stderr.  Specific job types
-    (RunXDS, RunPointless, …) subclass this and supply the command details.
+    (RunXDS, RunPointless, ...) subclass this and supply the command details.
     """
     pass
 
@@ -268,8 +304,8 @@ class RunXDS(RunBase):
         Default first-pass XDS run (step 1_xds).
 
         Generates XDS.INP from scratch using the generate_XDS.INP helper
-        script, then runs the full XYCORR → INIT → COLSPOT → IDXREF →
-        DEFPIX → INTEGRATE → CORRECT pipeline.  Optionally seeds XDS.INP
+        script, then runs the full XYCORR -> INIT -> COLSPOT -> IDXREF ->
+        DEFPIX -> INTEGRATE -> CORRECT pipeline.  Optionally seeds XDS.INP
         with a known space group and unit cell for constrained indexing,
         and injects a reference HKL for isomorphism-guided integration.
         """
@@ -339,7 +375,7 @@ class RunXDS(RunBase):
         """
         Force integration using geometry from a prior XPARM.XDS (step 1_xds, force_integration=True).
 
-        Skips spot-finding and indexing, runs only DEFPIX → INTEGRATE → CORRECT,
+        Skips spot-finding and indexing, runs only DEFPIX -> INTEGRATE -> CORRECT,
         seeding geometry from XPARM.XDS produced during the very first XDS run
         (../../1_xds relative to the force subdirectory).
         """
@@ -410,7 +446,7 @@ class RunXDS(RunBase):
         Second XDS run recycling refined detector geometry (step 4_xds).
 
         Copies XDS.INP and geometry files from prev_xds_id, reduces the job
-        list to DEFPIX → INTEGRATE → CORRECT, and injects refined detector
+        list to DEFPIX -> INTEGRATE -> CORRECT, and injects refined detector
         parameters from XDS_ASCII.HKL and INTEGRATE.LP of the previous run.
         """
         xds_dir = self.pipeline_subdir / self.prev_xds_id
@@ -592,7 +628,7 @@ class RunPointless(RunBase):
         log_path = job_dir / f"{self.step_id}.log"
 
         if self.prev_aimless_id is None:
-            # First pass: no prior aimless result — let Pointless choose freely
+            # First pass: no prior aimless result -- let Pointless choose freely
             if self.known_sg != "none":
                 stdin = (
                     f"HKLIN {hklin}\n"
@@ -676,7 +712,7 @@ class RunAimless(RunBase):
         When apply_res_cutoff is False, merges without a resolution cutoff so
         that the full range is available for statistics.  When True, the
         resolution limit is derived from prev_aimless_id using either the
-        CC½ > 0.30 criterion or a completeness threshold, clipped to the
+        CC1/2 > 0.30 criterion or a completeness threshold, clipped to the
         detector edge and any user-supplied custom resolution.
         """
         job_dir = self.pipeline_subdir / self.step_id
@@ -700,7 +736,7 @@ class RunAimless(RunBase):
                            / f"{self.prev_aimless_id}.log")
             aim_text = aimless_log.read_text()
 
-            # CC½-based limit
+            # CC1/2-based limit
             res_lim_cc12 = next(
                 (line.split("=", 1)[1].split("A")[0].strip()
                  for line in aim_text.splitlines() if "0.30: limit =" in line),
@@ -798,12 +834,12 @@ class RunRfree(RunBase):
         Cell, space group, and resolution are read from the prev_aimless_id log.
 
         Without a reference MTZ: freerflag assigns a fresh random 5% test set,
-        mtzutils strips anomalous columns, and ctruncate converts I → F.
+        mtzutils strips anomalous columns, and ctruncate converts I -> F.
 
         With a reference MTZ: unique builds a complete set of Miller indices,
         cad merges the reference FreeR_flag column in, freerflag COMPLETE
         extends the flags to the full resolution range, mtzutils strips
-        unwanted columns, and ctruncate converts I → F.
+        unwanted columns, and ctruncate converts I -> F.
         """
         job_dir = self.pipeline_subdir / self.step_id
         job_dir.mkdir(parents=True, exist_ok=True)
@@ -951,7 +987,7 @@ class RunXtriage(RunBase):
             subprocess.run([str(self.xtriage), hkl_input], stdout=fh, stderr=fh)
 
 
-class RunProcess:
+class RunProcess(SGESubmitter):
     """
     Orchestrator that instantiates and executes the appropriate Run* classes.
     Submits per-dataset jobs to the Wynton cluster as SGE arrays (qsub).
@@ -964,17 +1000,17 @@ class RunProcess:
 
     Order of events
     ---------------
-    run() — outer loop, mirrors xds_pipeline_prep.sh:
+    run() -- outer loop, mirrors xds_pipeline_prep.sh:
       1.  Read symmetry entries from known_symmetry.txt (or build from params).
       2.  For each pin in params["pins"] (format "collection,dset[,data_range]"):
             - Detect up to 4 collection prefixes; skip datasets with < 180 images.
             - Compute indexing image ranges (first_half / last_half / all /
               quarters / eighths / explicit start-end).
-      3.  For each (dataset × symmetry_entry × image_range) combination:
+      3.  For each (dataset x symmetry_entry x image_range) combination:
             - Create directory tree:
                 {process_dir}/{collection_id}_{dset}_{prefix}/
                   {crystal_number}_{sg}_{refine_cell_integrate}/
-                    index_{start}_{end}/          ← pipeline_subdir
+                    index_{start}_{end}/          <- pipeline_subdir
             - Write params.json and run_pipeline.py into pipeline_subdir.
       4.  Collect all pipeline_subdir paths into xds_pipeline_index_qsub_list.txt.
       5.  Write and submit xds_pipeline_index_qsub_submit.sh as an SGE array
@@ -988,8 +1024,8 @@ class RunProcess:
         3_aimless    RunAimless    (no resolution cutoff)
         4_xds   RunXDS.xds_recycle_detector
         5_pointless  RunPointless  (SG from 3_aimless)
-        6_aimless    RunAimless    (CC½ cutoff from 3_aimless)
-        -- if 6_aimless CC½ limit improved over 3_aimless --
+        6_aimless    RunAimless    (CC1/2 cutoff from 3_aimless)
+        -- if 6_aimless CC1/2 limit improved over 3_aimless --
         7_xds   RunXDS.xds_refine_symmetry
         8_pointless  RunPointless
         9_aimless    RunAimless
@@ -1005,7 +1041,9 @@ class RunProcess:
         always runs (no skip check).
     """
 
-    MIN_IMAGES         = 180
+    # One definition, in the discovery module, because discovery needs the same
+    # threshold to tell a snapshot from a short collection.
+    MIN_IMAGES         = MIN_IMAGES
 
     def __init__(self, params):
         _xds_bin, _xdsstat, _ = find_xds(root=params.get("xds_root"))
@@ -1023,6 +1061,7 @@ class RunProcess:
         self.ncpu          = params.get("ncpu", "auto")
         self.indexing_images = params.get("indexing_images", "first_half")
         self.no_symmetry   = params.get("no_symmetry", "false")
+        self.skip_prescans = params.get("skip_prescans", "true") == "true"
         self.retry_mode    = params.get("retry_mode", params.get("try_alt_sym", "auto")).lower()
         # Absolute path to the src/ directory so worker scripts can import this module
         self._src_dir = str(Path(__file__).parents[3] / "src")
@@ -1219,7 +1258,7 @@ class RunProcess:
         # IDXREF.LP lists starred rows ascending by quality penalty (aP at 0.0,
         # highest-symmetry lattices at the end).  After skipping aP and reversing,
         # solutions[0] = highest-symmetry candidate (highest penalty, tried first).
-        solutions = all_solutions[1:]           # drop aP/P1 — trivially correct, uninformative
+        solutions = all_solutions[1:]           # drop aP/P1 -- trivially correct, uninformative
         solutions = list(reversed(solutions))   # highest-symmetry (highest penalty) first
 
         if retry_mode == "top_ten":
@@ -1258,24 +1297,12 @@ class RunProcess:
             return
         if slots is None:
             slots = 1 if resources.is_auto(self.ncpu) else int(self.ncpu)
-        logs_line = f"#$ -o {logs_dir}\n" if logs_dir else ""
-        submit_script_path.write_text(
-            "#!/bin/bash\n"
-            "#$ -S /bin/bash\n"
-            "#$ -cwd\n"
-            f"#$ -t 1-{njob}\n"
-            "#$ -j y\n"
-            f"#$ -pe smp {slots}\n"
-            "#$ -l mem_free=2G\n"
-            f"#$ -l h_rt={h_rt}\n"
-            "#$ -l scratch=20G\n"
-            f"{logs_line}\n"
-            f'input_dir=$(sed "${{SGE_TASK_ID}}q;d" {job_list_path})\n'
-            "cd ${input_dir}\n"
-            "./run_pipeline.py\n"
-        )
-        submit_script_path.chmod(
-            submit_script_path.stat().st_mode | stat.S_IXUSR | stat.S_IRUSR | stat.S_IWUSR
+        self._write_sge_script(
+            submit_script_path, "./run_pipeline.py",
+            h_rt=h_rt, slots=slots, mem_free="2G", array=njob,
+            logs_dir=logs_dir, resources=("scratch=20G",),
+            preamble=(f'input_dir=$(sed "${{SGE_TASK_ID}}q;d" {job_list_path})\n'
+                      "cd ${input_dir}\n"),
         )
         return qsub_terse([submit_script_path])
 
@@ -1354,59 +1381,51 @@ class RunProcess:
             with open(Path(pipeline_subdir) / "pipeline.log", "a") as fh:
                 fh.write(line)
 
-    def _record_rejection(self, pin_id, reason):
-        """Record a rejected dataset: write a per-pin marker so the scraper
-        can surface the reason, and log REJECT to the omnibus log.
+    def _record_rejection(self, dataset_key, reason):
+        """Record a dataset rejected before submission.
+
+        The marker is what the gather reads into info.json; the printed line
+        reaches processing.log through the CLI's stdout tee, so the log and the
+        record give the same reason.
         """
         rejected_dir = self._output_dir / ".rejected"
         rejected_dir.mkdir(exist_ok=True)
-        (rejected_dir / f"{pin_id}.txt").write_text(reason + "\n")
-        self.params["pin_id"] = pin_id
-        self._log(None, "REJECT", reason)
+        (rejected_dir / f"{dataset_key}.txt").write_text(reason + "\n")
+        print(log_tag(TAG_REJECTED, f"{dataset_key}: {reason}"))
+
+    def _aimless_stats(self, log_path):
+        """Parse the aimless summary block into structured values.
+
+        Read where the dataset's identity, attempt and log file are all
+        unambiguous, so nothing downstream has to re-derive them by walking
+        directories and guessing which log counts.
+
+        Per-shell rows are kept whole, in the order aimless prints them
+        (overall, inner shell, outer shell), so a consumer picks the column it
+        means rather than the parser choosing one for it.  An absent or
+        unrecognisable log gives an empty dict, which is not an error: a step
+        that did not reach scaling has nothing to report.
+        """
+        stats = {}
+        if not Path(log_path).is_file():
+            return stats
+        for line in Path(log_path).read_text().splitlines()[-100:]:
+            for field, label in _AIMLESS_TEXT_ROWS:
+                if label in line and field not in stats:
+                    value = (line.replace(label, "").replace(" ", "")
+                             .strip().lstrip(":"))
+                    if value:
+                        stats[field] = value
+            for field, label in _AIMLESS_SHELL_ROWS:
+                if label in line and field not in stats:
+                    numbers = numeric_tokens(line)
+                    if numbers:
+                        stats[field] = numbers
+        return stats
 
     def _aimless_summary(self, log_path):
-        """Extract resolution, SG, unit cell, completeness, Rpim, and CC1/2
-        from the last 100 lines of an aimless log. Returns a string.
-
-        Completeness, Rpim, and CC1/2 are read from the overall column (first
-        number); resolution is the high-resolution-limit (last column)."""
-        summary = {}
-        if not Path(log_path).is_file():
-            return "completed"
-        for line in Path(log_path).read_text().splitlines()[-100:]:
-            if "Space group:" in line and "sg" not in summary:
-                summary["sg"] = line.split(":", 1)[1].strip().replace(" ", "")
-            if "High resolution limit" in line and "res" not in summary:
-                nums = [s for s in line.split() if s.replace(".", "", 1).isdigit()]
-                if nums:
-                    summary["res"] = nums[-1]
-            if "Average unit cell" in line and "uc" not in summary:
-                nums = [s for s in line.split() if s.replace(".", "", 1).isdigit()]
-                if nums:
-                    summary["uc"] = " ".join(nums)
-            if "Completeness" in line and "comp" not in summary:
-                nums = [s for s in line.split() if s.replace(".", "", 1).isdigit()]
-                if nums:
-                    summary["comp"] = nums[0]
-            if "Rpim (within I+/I-)" in line and "rpim" not in summary:
-                nums = [s for s in line.split() if s.replace(".", "", 1).isdigit()]
-                if nums:
-                    summary["rpim"] = nums[0]
-            # The summary block's CC1/2 row is "Mn(I) half-set correlation
-            # CC(1/2)  0.999  0.999  0.315"; "half-set correlation" uniquely
-            # identifies it (other CC(1/2) lines are table/graph headers).
-            if "half-set correlation" in line and "cchalf" not in summary:
-                nums = [s for s in line.split() if s.replace(".", "", 1).isdigit()]
-                if nums:
-                    summary["cchalf"] = nums[0]
-        parts = []
-        if "res"    in summary: parts.append(f"res={summary['res']}Å")
-        if "sg"     in summary: parts.append(f"SG={summary['sg']}")
-        if "uc"     in summary: parts.append(f"UC={summary['uc']}")
-        if "comp"   in summary: parts.append(f"comp={summary['comp']}")
-        if "rpim"   in summary: parts.append(f"rpim={summary['rpim']}")
-        if "cchalf" in summary: parts.append(f"CC½={summary['cchalf']}")
-        return " ".join(parts) if parts else "completed"
+        """The one-line scaling summary for the pipeline log."""
+        return format_aimless_summary(self._aimless_stats(log_path))
 
     def _xds_error(self, pipeline_subdir, step_id):
         """Return the first ERROR line from an XDS log, or None."""
@@ -1454,54 +1473,21 @@ class RunProcess:
             collection  = parts[0].strip()
             pin_id      = parts[1].strip()
             data_range  = parts[2].strip() if len(parts) > 2 else "false"
-            collection_id = Path(collection).name.replace("_transfer", "")
+            coll_id     = collection_id(collection)
+            pin_root    = Path(collection) / pin_id
 
-            pin_root = Path(collection) / pin_id
-
-            # Detect data format and build per-series groups.
-            # HDF5 masters may be nested under per-scan subdirs (e.g. NSLS layout
-            # <pin>/<N>/<pin>/<pin>_<run>_master.h5); raster pre-scans live in
-            # rasterImages/ and are filtered out.  Each master is its own series.
-            # CBF files are expected directly under the pin dir; group by series key.
-            if not pin_root.is_dir():
-                reason = f"image directory not found: {pin_root}"
-                print(f"No image dir for {pin_id} — skipping")
-                self._record_rejection(f"{collection_id}_{pin_id}", reason)
+            # Frame discovery is shared with the CLI, which builds info.json
+            # from the same sweeps before any job exists.
+            found = discover_sweeps(pin_root, skip_prescans=self.skip_prescans)
+            # Logged, not recorded as a rejection: a rejection marker means a
+            # candidate dataset failed a gate, and one marker per grid point
+            # would bury the datasets that really did.
+            for prefix, reason in found.prescans:
+                print(f"Pre-scan, not a dataset — skipping {pin_id}/{prefix} ({reason})")
+            if not found:
+                self._record_rejection(f"{coll_id}_{pin_id}", found.reason)
                 continue
-
-            # Frame filenames are NOT assumed to start with the pin code: SSRL
-            # (and other beamlines) name frames by puck position (e.g. C6_*.cbf
-            # in pin folder FRS050_06).  Discover every series present and key
-            # each group by its own file prefix; the pin code supplies dataset
-            # identity below.
-            hdf5_masters = sorted(
-                m for m in pin_root.rglob("*_master.h5")
-                if "rasterImages" not in m.parts and "_r_Raster_" not in m.name
-            )
-            if hdf5_masters:
-                data_format = 'hdf5'
-                groups = {m.stem[:-7]: [m] for m in hdf5_masters}  # strip "_master"
-            else:
-                data_format = 'cbf'
-                groups = {}
-                for f in pin_root.glob("*.cbf"):
-                    file_prefix = "_".join(f.stem.split("_")[:-1])
-                    groups.setdefault(file_prefix, []).append(f)
-
-            if not groups:
-                # No diffraction data: any *_master.h5 was filtered as a raster
-                # pre-scan, and no CBF series were found.
-                any_raster = any(
-                    "_r_Raster_" in m.name or "rasterImages" in m.parts
-                    for m in pin_root.rglob("*_master.h5")
-                )
-                if any_raster:
-                    reason = "no diffraction data — only raster pre-scans present"
-                else:
-                    reason = f"no diffraction data found in {pin_root}"
-                print(f"No diffraction data for {pin_id} — skipping")
-                self._record_rejection(f"{collection_id}_{pin_id}", reason)
-                continue
+            data_format = found.data_format
 
             # Each distinct frame series in the pin folder is one sweep (usually
             # one, sometimes more).  Dataset identity is the pin code plus a
@@ -1510,21 +1496,16 @@ class RunProcess:
             # restores the original naming convention.  The frame prefix carries
             # the beamline's own name (a puck position like C6, or an already
             # sweep-numbered stem like FRS046_03_1) and feeds image_prefix only.
-            # Sweeps are numbered in sorted-prefix order, which matches any sweep
-            # index already encoded in the filenames.
-            for sweep_num, (file_prefix, files) in enumerate(sorted(groups.items()), start=1):
-                series_id = f"{pin_id}_{sweep_num}"
-                pin_dir_check = self._output_dir / f"{collection_id}_{series_id}"
+            for sweep in found.sweeps():
+                file_prefix = sweep.prefix
+                files       = sweep.files
+                image_dir   = sweep.image_dir
+                series_id   = f"{pin_id}_{sweep.number}"
+                tag         = dataset_tag(collection, pin_id, sweep.number)
+                pin_dir_check = self._output_dir / tag
                 if pin_dir_check.is_dir():
                     print(f"Output folder already exists — skipping {series_id}")
                     continue
-
-                # For HDF5 the master file's parent is the per-dataset image_dir;
-                # for CBF the pin dir is the image_dir.
-                if data_format == 'hdf5':
-                    image_dir = files[0].parent
-                else:
-                    image_dir = pin_root
 
                 if data_range == "false":
                     if data_format == 'hdf5':
@@ -1532,8 +1513,7 @@ class RunProcess:
                             image_count = count_hdf5_images(files[0])
                         except Exception as exc:
                             reason = f"HDF5 image count unreadable: {exc}"
-                            print(f"Could not read image count from {files[0]}: {exc} — skipping {series_id}")
-                            self._record_rejection(f"{collection_id}_{series_id}", reason)
+                            self._record_rejection(tag, reason)
                             continue
                     else:
                         image_count = len(files)
@@ -1545,11 +1525,10 @@ class RunProcess:
 
                 if image_count is not None and image_count < self.MIN_IMAGES:
                     reason = f"partial dataset ({image_count} images, minimum is {self.MIN_IMAGES})"
-                    print(f"Partial dataset ({image_count} images) — skipping {series_id}")
-                    self._record_rejection(f"{collection_id}_{series_id}", reason)
+                    self._record_rejection(tag, reason)
                     continue
 
-                pin_dir = self._output_dir / f"{collection_id}_{series_id}"
+                pin_dir = self._output_dir / tag
                 pin_dir.mkdir(exist_ok=True)
 
                 index_ranges = self._indexing_ranges(image_count, first_image)
@@ -1585,7 +1564,7 @@ class RunProcess:
 
                         per_params = {
                             **self.params,
-                            "pin_id":                f"{collection_id}_{series_id}",
+                            "pin_id":                tag,
                             "context_width":         self._context_width,
                             "image_prefix":          file_prefix,
                             "image_dir":             str(image_dir),
@@ -1613,7 +1592,7 @@ class RunProcess:
                             fh.write(str(pipeline_subdir) + "\n")
 
                 with open(processed, "a") as fh:
-                    fh.write(f"{collection_id}_{series_id}\n")
+                    fh.write(f"{tag}\n")
 
         submit_sh = self.process_dir / "xds_pipeline_index_qsub_submit.sh"
         job_id = self._submit_sge_array(qsub_list, submit_sh, h_rt="06:00:00",

@@ -2,12 +2,15 @@ import math
 import os
 import pathlib
 import re
+import shutil
 import statistics
 import sys
 import threading
 import time
 from datetime import datetime
 from html import unescape as html_unescape
+
+from avicenna.utils.crystal_list import TAG_NO_IMAGE_DATA, log_tag, parse_code
 
 # Suffixes appended to crystal directory names to indicate cell-refinement mode.
 # New data uses '_refined'; older data on disk may carry '_true', '_false', or '_both'.
@@ -44,6 +47,18 @@ def format_log_line(tag, message, context=None, context_width=None, forced_dir=N
     return f"[{ts}] {tag_field}  {ctx}{prefix}{message}\n"
 
 
+def numeric_tokens(line):
+    """The numbers in *line*, as written.  A leading minus is part of the
+    number: an outer shell can correlate negatively, and dropping the value
+    would silently shift every column after it."""
+    numbers = []
+    for token in line.split():
+        body = token[1:] if token.startswith("-") else token
+        if body.replace(".", "", 1).isdigit():
+            numbers.append(token)
+    return numbers
+
+
 def log_phil_diff(phil, omnibus_path):
     """Emit the run's non-default PHIL settings to the console and omnibus log.
 
@@ -76,38 +91,145 @@ def log_phil_diff(phil, omnibus_path):
         pass
 
 
-def wait_for_sentinel(omnibus_path, marker="[ sentinel ]", poll=3.0, timeout=3600):
-    """Block until the completion sentinel records its marker in *omnibus_path*.
+# The completion sentinel's two terminal lines, shared by the writer
+# (PipelineSentinel) and the reader (wait_for_sentinel) so the completion signal
+# cannot drift apart: every other line the sentinel logs is progress, not an
+# outcome, and must not be mistaken for one.
+SENTINEL_CONTEXT = "sentinel"
+SENTINEL_DONE = "Run complete."
+SENTINEL_FAILED = "Finalization failed."
+
+SENTINEL_WAIT_DONE = "done"
+SENTINEL_WAIT_FAILED = "failed"
+SENTINEL_WAIT_TIMEOUT = "timeout"
+
+# Exit statuses a wrapper script can act on.  2 is argparse's usage error.
+EXIT_FAILURE = 1
+EXIT_RUN_INCOMPLETE = 3     # partial results; needs --resume or --overwrite
+EXIT_RUN_COMPLETE = 4       # results for every dataset; needs --overwrite
+EXIT_RUN_ACTIVE = 5         # another run's jobs are confirmed alive
+
+
+def log_offset(path):
+    """Where this run's lines will start in the log at *path*.
+
+    The omnibus log is appended to across runs, so a run that is only
+    interested in its own sentinel's outcome reads from here on.
+    """
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def echo_log(path, start):
+    """Print what was appended to the log at *path* since byte *start*.
+
+    For text another process wrote into a log this one also writes to, so
+    the terminal shows the same lines as the file.  Returns the new end.
+    """
+    try:
+        with open(path, "rb") as fh:
+            if os.fstat(fh.fileno()).st_size < start:
+                return start
+            fh.seek(start)
+            data = fh.read()
+    except OSError:
+        return start
+    if data:
+        sys.stdout.write(data.decode("utf-8", errors="replace"))
+        sys.stdout.flush()
+    return start + len(data)
+
+
+def next_backup(path):
+    """The first free ``<path>.N``, counting from 1."""
+    number = 1
+    while os.path.exists(f"{path}.{number}"):
+        number += 1
+    return f"{path}.{number}"
+
+
+def clear_stage_outputs(project_dir, log_name, dirs=(), files=(), globs=()):
+    """Remove what an earlier run of one stage left in *project_dir*.
+
+    The stage's omnibus log is kept as a numbered backup so runs can be
+    compared; everything else named is deleted.
+    """
+    project_dir = pathlib.Path(project_dir)
+    log = project_dir / log_name
+    if log.is_file():
+        backup = next_backup(log)
+        os.rename(log, backup)
+        print(f"Backed up {log.name} -> {os.path.basename(backup)}")
+    targets = [project_dir / name for name in tuple(dirs) + tuple(files)]
+    for pattern in globs:
+        targets.extend(sorted(project_dir.glob(pattern)))
+    for target in targets:
+        if target.is_dir():
+            shutil.rmtree(target)
+        elif target.exists():
+            target.unlink()
+        else:
+            continue
+        print(f"Removed {target.name}")
+
+
+def wait_for_sentinel(omnibus_path, poll=3.0, timeout=3600, start=0):
+    """Block until the completion sentinel reports an outcome in *omnibus_path*.
 
     The foreground watcher's done-detection is a file-structure sweep, but the
     authoritative arbiter of completion is the SGE-held sentinel (which also
     writes the next-stage .phil and the filtered result list).  After the sweep
-    goes idle the foreground waits here for the sentinel's marker so a run is not
-    declared "done" before finalization has actually happened.
+    goes idle the foreground waits here so a run is not declared "done" before
+    finalization has actually happened.
 
     Interruptible with Ctrl-C -- the sentinel runs independently on the cluster,
-    so interrupting the wait does not affect finalization.  Returns True if the
-    marker appeared, False on timeout.
-    """
-    def _seen():
-        try:
-            with open(omnibus_path) as fh:
-                return any(marker in line for line in fh)
-        except OSError:
-            return False
+    so interrupting the wait does not affect finalization.  Returns
+    SENTINEL_WAIT_DONE, SENTINEL_WAIT_FAILED or SENTINEL_WAIT_TIMEOUT.
 
-    if _seen():
-        return True
+    *start* is a byte offset from ``log_offset``: lines before it belong to an
+    earlier run in the same directory, whose outcome is not this run's.  A
+    log shorter than *start* has been replaced, so it is read from the top.
+    """
+    outcome = sentinel_outcome(omnibus_path, start)
+    if outcome:
+        return outcome
     deadline = time.time() + timeout if timeout else None
     with Spinner(height=1, message="Waiting for completion sentinel to finalize..."):
-        while not _seen():
+        while outcome is None:
             if deadline and time.time() > deadline:
-                return False
+                return SENTINEL_WAIT_TIMEOUT
             time.sleep(poll)
-    return True
+            outcome = sentinel_outcome(omnibus_path, start)
+    return outcome
 
 
-# Bravais lattice → list of (sg_number, sg_name) tuples.
+def sentinel_outcome(omnibus_path, start=0):
+    """The sentinel's outcome in *omnibus_path* after byte *start*, or None.
+
+    SENTINEL_WAIT_DONE or SENTINEL_WAIT_FAILED once the sentinel has written
+    one; see ``wait_for_sentinel`` for *start*.
+    """
+    context = f"[ {SENTINEL_CONTEXT} ]"
+    try:
+        with open(omnibus_path, "rb") as fh:
+            if os.fstat(fh.fileno()).st_size >= start:
+                fh.seek(start)
+            for raw in fh:
+                line = raw.decode("utf-8", errors="replace")
+                if context not in line:
+                    continue
+                if SENTINEL_DONE in line:
+                    return SENTINEL_WAIT_DONE
+                if SENTINEL_FAILED in line:
+                    return SENTINEL_WAIT_FAILED
+    except OSError:
+        pass
+    return None
+
+
+# Bravais lattice -> list of (sg_number, sg_name) tuples.
 # Derived from xds_lattices.txt in the processing pipeline scripts directory.
 BRAVAIS_LATTICES = {
     "aP": [(1,   "P1")],
@@ -219,7 +341,7 @@ def has_image_data(path, max_depth=4):
 
     Used by DataFinder to skip non-dataset sibling folders (e.g. autoProc_dir,
     jpegs) so they don't inflate the pin list.  Folders with only raster
-    pre-scans still pass — they're filtered downstream with a specific reason.
+    pre-scans still pass -- they're filtered downstream with a specific reason.
     """
     base = os.path.normpath(str(path))
     base_sep = base.count(os.sep)
@@ -230,6 +352,247 @@ def has_image_data(path, max_depth=4):
             if fname.endswith('_master.h5') or fname.endswith('.cbf'):
                 return True
     return False
+
+
+# --------------------------------------------------------------------------- #
+# Frame-series discovery                                                       #
+# --------------------------------------------------------------------------- #
+# Dataset identity is formed here and nowhere else.  The CLI builds info.json
+# from these sweeps before any job exists and the runner processes them on the
+# cluster, so the two must see the same series, in the same order, under the
+# same tags -- keys nobody reads are the failure mode of a second copy of this
+# logic.
+
+# Fewest frames a series can have and still be a dataset.  Lives here rather
+# than on the runner because discovery now needs it too, and two copies of a
+# threshold drift.
+MIN_IMAGES = 180
+
+
+def hdf5_trigger_count(master_path):
+    """Triggers in an Eiger master file, or None when it cannot be read.
+
+    A rotation dataset is collected in one trigger; a grid scan fires one per
+    grid point.  That is the property that separates a pre-scan from data at
+    any beamline, whatever the file happens to be named.
+    """
+    try:
+        import h5py
+        with h5py.File(str(master_path), "r") as handle:
+            spec = handle.get("/entry/instrument/detector/detectorSpecific")
+            if spec is None or "ntrigger" not in spec:
+                return None
+            return int(spec["ntrigger"][()])
+    except Exception:
+        # Deliberately broad: every way of failing to read this file means the
+        # same thing to the caller, which is that the series must be treated as
+        # data.  Raising here would turn an unreadable pre-scan into a dead run.
+        return None
+
+
+def _prescan_reason(master):
+    """Why an HDF5 series is a pre-scan, or None if it is data.
+
+    The name check costs nothing and covers beamlines that say so in the path.
+    The trigger count covers the ones that do not.  Metadata that cannot be
+    read means DATA: a pre-scan sent to XDS wastes one job and says so in the
+    log, while a dropped collection looks like a crystal that was never
+    mounted.
+    """
+    if "rasterImages" in master.parts or "_r_Raster_" in master.name:
+        return "raster pre-scan"
+    triggers = hdf5_trigger_count(master)
+    if triggers is not None and triggers > 1:
+        return f"grid pre-scan ({triggers} triggers)"
+    return None
+
+
+def _drop_cbf_snapshots(groups):
+    """Split one pin folder's CBF series into real sweeps and snapshots.
+
+    Beamlines that write a centring or test shot into the pin folder leave a
+    series of a few frames beside the collection, and sorted first it takes
+    sweep number 1.  Calling one a snapshot is only safe with a full sweep
+    beside it to compare against: a short series on its own may be an aborted
+    collection that is still wanted, or one a frame range selects from.
+    """
+    if len(groups) < 2 or not any(len(f) >= MIN_IMAGES for f in groups.values()):
+        return groups, []
+    kept, dropped = {}, []
+    for prefix, files in groups.items():
+        if len(files) < MIN_IMAGES:
+            dropped.append((prefix,
+                            f"snapshot ({len(files)} frames) beside a full sweep"))
+        else:
+            kept[prefix] = files
+    return kept, dropped
+
+
+class Sweep(object):
+    """One frame series in a pin folder: one sweep of one crystal."""
+
+    def __init__(self, number, prefix, files, image_dir):
+        self.number = number          # 1-based, in sorted-prefix order
+        self.prefix = prefix          # the beamline's own name for the series
+        self.files = files
+        self.image_dir = image_dir    # directory holding the frames
+
+    def __repr__(self):
+        return (f"Sweep({self.number}, {self.prefix!r}, "
+                f"{len(self.files)} file(s))")
+
+
+class SweepSet(object):
+    """The frame series found in one pin folder.
+
+    Falsy when the folder holds no diffraction data, in which case ``reason``
+    says why -- a raster pre-scan is not the same thing as an empty folder, and
+    the distinction is worth reporting.
+
+    ``prescans`` lists the series that were set aside, as ``(prefix, reason)``.
+    They are reported rather than dropped quietly: the rule that identifies
+    them is a heuristic, and a heuristic the user cannot see was wrong is one
+    they cannot correct.
+    """
+
+    def __init__(self, data_format, groups, pin_root, reason=None, prescans=None):
+        self.data_format = data_format
+        self.groups = groups
+        self.pin_root = pin_root
+        self.reason = reason
+        self.prescans = list(prescans or [])
+
+    def __bool__(self):
+        return bool(self.groups)
+
+    def __len__(self):
+        return len(self.groups)
+
+    def sweeps(self):
+        """Yield one Sweep per series, numbered from 1 in sorted-prefix order.
+
+        Sorted order matches any sweep index already encoded in the filenames,
+        so the numbering agrees with the beamline's when there is one.
+        """
+        for number, (prefix, files) in enumerate(sorted(self.groups.items()),
+                                                 start=1):
+            # For HDF5 the master file's parent is the per-dataset image dir;
+            # for CBF the frames sit in the pin folder itself.
+            image_dir = (files[0].parent if self.data_format == 'hdf5'
+                         else self.pin_root)
+            yield Sweep(number, prefix, files, image_dir)
+
+
+def discover_sweeps(pin_root, skip_prescans=True):
+    """Group the frame files under *pin_root* into one series per sweep.
+
+    Frame filenames are NOT assumed to start with the pin code: some beamlines
+    name frames by puck position, so each series is keyed by its own file
+    prefix and the pin code supplies dataset identity separately.  HDF5 masters
+    may be nested under per-scan subdirectories and each master is its own
+    series.
+
+    Pre-scans are set aside here, and not later, because this is where sweeps
+    are NUMBERED.  One left in the list takes sweep 1 and pushes the real
+    collection to sweep 2, and the sweep number is part of the dataset key,
+    which is fixed from the moment info.json is written.
+    """
+    pin_root = pathlib.Path(pin_root)
+    if not pin_root.is_dir():
+        return SweepSet('cbf', {}, pin_root,
+                        reason=f"image directory not found: {pin_root}")
+
+    prescans = []
+    hdf5_groups = {}
+    for master in sorted(pin_root.rglob("*_master.h5")):
+        prefix = master.stem[:-7]                           # strip "_master"
+        reason = _prescan_reason(master) if skip_prescans else None
+        if reason:
+            prescans.append((prefix, reason))
+        else:
+            hdf5_groups[prefix] = [master]
+    if hdf5_groups:
+        return SweepSet('hdf5', hdf5_groups, pin_root, prescans=prescans)
+
+    groups = {}
+    for f in pin_root.glob("*.cbf"):
+        prefix = "_".join(f.stem.split("_")[:-1])
+        groups.setdefault(prefix, []).append(f)
+    if skip_prescans:
+        groups, dropped = _drop_cbf_snapshots(groups)
+        prescans.extend(dropped)
+    if groups:
+        return SweepSet('cbf', groups, pin_root, prescans=prescans)
+
+    reason = ("no diffraction data -- only pre-scans present" if prescans
+              else f"no diffraction data found in {pin_root}")
+    return SweepSet('cbf', {}, pin_root, reason=reason, prescans=prescans)
+
+
+def collection_id(collection_path):
+    """The collection tag: the transfer directory name without ``_transfer``."""
+    return pathlib.Path(str(collection_path)).name.replace("_transfer", "")
+
+
+def dataset_tag(collection_path, pin_id, sweep_number):
+    """The dataset key: ``<collection>_<pin>_<sweep>``.
+
+    Formed only here.  It is the pipeline's identity for a dataset, immutable
+    from the moment info.json is created, and every stage matches on it.
+    """
+    return f"{collection_id(collection_path)}_{pin_id}_{sweep_number}"
+
+
+class DiscoveredDataset(object):
+    """One sweep as the CLI sees it, before any job exists.
+
+    ``key`` is the tag the run will use; ``folder_name`` is the pin folder it
+    came from, which is what a crystal list is keyed by.  The folder name is
+    not recoverable from the tag -- both the collection and the pin code can
+    contain underscores -- so ``data_path`` keeps it, and ``image_prefix``
+    separates two sweeps that share one folder.
+    """
+
+    def __init__(self, key, folder_name, data_path, image_prefix):
+        self.key = key
+        self.folder_name = folder_name
+        self.data_path = data_path
+        self.image_prefix = image_prefix
+
+    def __repr__(self):
+        return f"DiscoveredDataset({self.key!r}, prefix={self.image_prefix!r})"
+
+
+def enumerate_datasets(pin_lines, skip_prescans=True):
+    """Expand pin-list lines into one dataset per sweep, in pin-list order.
+
+    Returns ``(datasets, empty, prescans)``: *empty* pairs each pin folder that
+    yielded no frames with the reason, and *prescans* carries each series set
+    aside as a pre-scan, as ``(pin folder, prefix, reason)``.  Both are for the
+    caller to report.  Discovery is shared with the runner, so these keys are
+    the tags the run will produce.
+    """
+    datasets, empty, prescans = [], [], []
+    for line in pin_lines:
+        parts = [part.strip() for part in str(line).split(",")]
+        if len(parts) < 2:
+            continue
+        collection, pin_id = parts[0], parts[1]
+        pin_root = pathlib.Path(collection) / pin_id
+        found = discover_sweeps(pin_root, skip_prescans=skip_prescans)
+        prescans.extend((pin_id, prefix, reason)
+                        for prefix, reason in found.prescans)
+        if not found:
+            empty.append((pin_id, found.reason))
+            continue
+        for sweep in found.sweeps():
+            datasets.append(DiscoveredDataset(
+                key=dataset_tag(collection, pin_id, sweep.number),
+                folder_name=pin_id,
+                data_path=os.path.abspath(str(pin_root)),
+                image_prefix=sweep.prefix,
+            ))
+    return datasets, empty, prescans
 
 
 class DataFinder(object):
@@ -270,7 +633,7 @@ class DataFinder(object):
                 if not os.path.isdir(sub):
                     continue
                 if not has_image_data(sub):
-                    print(f"Skipping {sf} — no image data")
+                    print(log_tag(TAG_NO_IMAGE_DATA, f"{sf} skipped"))
                     continue
                 pin_line = f"{path},{sf}"
                 print(pin_line)
@@ -721,8 +1084,7 @@ class ProcessingScraper(ScraperBase):
                     single_params[key] = c.replace(key, '').replace(" ", "").strip().lstrip(':')
             for key, value in multi_params.items():
                 if key in c:
-                    splits = [sp for sp in c.strip().split(' ') if sp != '' and (sp.strip().isdigit() or sp.replace('.','',1).isdigit())]
-                    multi_params[key] = splits
+                    multi_params[key] = numeric_tokens(c)
         info_dict.update(single_params)
         info_dict.update(multi_params)
 
@@ -761,46 +1123,45 @@ class ProcessingScraper(ScraperBase):
     def write_qrefine_list(self, path=None):
         """Write a qrefine_list.txt from the current results list.
 
-        Each completed result is converted back to the
-        pin,crystal_name,cell_refined,index,integration format consumed by
-        QRefineWriter and qrefine_pipeline.py.  Skips failed/unprocessed results.
+        Skips failed/unprocessed results.
         """
         out = pathlib.Path(path) if path else pathlib.Path(os.curdir) / 'qrefine_list.txt'
         lines = []
         for r in self.results:
             if r.get('outcome') != 'completed' or not r.get('pipeline_subdir'):
                 continue
-            pin         = os.path.basename(r['proc_path'])
-            crystal_dir  = os.path.basename(r['result_path'])
-            crystal_name = crystal_dir
-            cell_refined = ''
-            for suffix in _CELL_REFINED_SUFFIXES:
-                if crystal_dir.endswith(suffix):
-                    crystal_name = crystal_dir[:-len(suffix)]
-                    cell_refined = suffix[1:]
-                    break
-            try:
-                rel_parts = (pathlib.Path(r['pipeline_subdir'])
-                             .relative_to(r['result_path']).parts)
-            except ValueError:
-                continue
-            if len(rel_parts) == 1:
-                index_dir   = rel_parts[0]
-                integration = 'integration not forced'
-            elif len(rel_parts) == 2:
-                index_dir  = rel_parts[0]
-                force_base = rel_parts[1][:-len('_force')]
-                prefix, sg = force_base.split('_', 1)
-                integration = f'integration forced in {sg} {prefix}'
-            else:
-                continue
-            if not index_dir.startswith('index_'):
-                continue
-            index = index_dir[len('index_'):].replace('_', ' ')
-            lines.append(f"{pin},{crystal_name},{cell_refined},{index},{integration}\n")
+            row = qrefine_list_row(r['proc_path'], r['result_path'], r['pipeline_subdir'])
+            if row:
+                lines.append(row)
         with open(out, 'w') as fh:
             fh.writelines(lines)
         print(f"Wrote {len(lines)} entries to {out}")
+
+
+def refined_model_stats(pdb_path):
+    """``(rwork, rfree, resolution)`` from REMARK 3 of a refined model; None
+    for any value not found."""
+    rwork = rfree = res = None
+    try:
+        for line in pathlib.Path(pdb_path).read_text().splitlines():
+            if 'R VALUE            (WORKING SET) :' in line:
+                try:
+                    rwork = float(line.split(':')[-1].strip())
+                except ValueError:
+                    pass
+            elif 'FREE R VALUE                     :' in line:
+                try:
+                    rfree = float(line.split(':')[-1].strip())
+                except ValueError:
+                    pass
+            elif 'RESOLUTION RANGE HIGH (ANGSTROMS) :' in line:
+                try:
+                    res = float(line.split(':')[-1].strip())
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+    return rwork, rfree, res
 
 
 class QRefineScraper(ScraperBase):
@@ -820,27 +1181,7 @@ class QRefineScraper(ScraperBase):
 
     def _parse_pdb_stats(self, pdb_path):
         """Extract Rwork, Rfree, and resolution from REMARK 3 in a PDB file."""
-        rwork = rfree = res = None
-        try:
-            for line in pathlib.Path(pdb_path).read_text().splitlines():
-                if 'R VALUE            (WORKING SET) :' in line:
-                    try:
-                        rwork = float(line.split(':')[-1].strip())
-                    except ValueError:
-                        pass
-                elif 'FREE R VALUE                     :' in line:
-                    try:
-                        rfree = float(line.split(':')[-1].strip())
-                    except ValueError:
-                        pass
-                elif 'RESOLUTION RANGE HIGH (ANGSTROMS) :' in line:
-                    try:
-                        res = float(line.split(':')[-1].strip())
-                    except ValueError:
-                        pass
-        except OSError:
-            pass
-        return rwork, rfree, res
+        return refined_model_stats(pdb_path)
 
     def find_results(self):
         qrefine_dir = os.path.join(self.result_path, 'qrefine')
@@ -908,8 +1249,10 @@ class FilterBase:
     """Base class for pipeline result filters.
 
     Subclasses must implement filter_quality() and select_best().
-    run() orchestrates the full two-step filter: quality rejection,
-    then per-folder deduplication (one result per top-level proc_path).
+    run() orchestrates a three-step filter: quality rejection, per-folder
+    deduplication (one result per top-level proc_path), then per-crystal
+    deduplication (one result per physical crystal, where a pin was mounted
+    and collected more than once).
     """
 
     def filter_quality(self, results):
@@ -917,16 +1260,68 @@ class FilterBase:
         raise NotImplementedError
 
     def select_best(self, group):
-        """Given a list of results from the same proc_path, return the single best one."""
+        """Given a list of competing results, return the single best one."""
         raise NotImplementedError
 
-    def run(self, results):
-        """Apply quality filter, group by proc_path, and select the best per group."""
-        passed = self.filter_quality(results)
+    def crystal_key(self, result):
+        """Identity of the physical crystal a result came from.
+
+        Results sharing a key are competing measurements of one crystal and
+        only the best is kept.  The default groups nothing, so a filter that
+        has no notion of a repeated crystal behaves as it always did.
+        """
+        return id(result)
+
+    @staticmethod
+    def _group(results, key):
         groups = {}
-        for r in passed:
-            groups.setdefault(r['proc_path'], []).append(r)
-        return [self.select_best(group) for group in groups.values()]
+        for r in results:
+            groups.setdefault(key(r), []).append(r)
+        return groups
+
+    @staticmethod
+    def _label(result):
+        """How a result is named when explaining that it superseded another.
+
+        The dataset tag when the caller supplies one, since a name that
+        survives the run directory being moved is the one worth recording.
+        Scraped results carry no tag, so those fall back to the folder.
+        """
+        return (result.get('dataset_tag')
+                or os.path.basename(result.get('proc_path', '')) or '?')
+
+    def __init__(self):
+        # (losing result, name of the result that beat it), filled by run().
+        self.superseded = []
+
+    def run(self, results):
+        """Filter on quality, then deduplicate twice: by folder, then by crystal.
+
+        Losers are dropped from the returned list, exactly like a result that
+        failed the quality gate.  That list is derived and regenerated from
+        scratch, so a dataset's absence from it IS the decision and there is
+        nothing for a consumer to interpret.
+
+        The crystal-pass decisions are also recorded in ``superseded``, because
+        why a dataset was set aside belongs in the durable record, which a
+        derived list has no room for.
+        """
+        self.superseded = []
+        passed = self.filter_quality(results)
+        # A result that names no folder competes with nothing, like the
+        # default crystal_key.
+        kept = [self.select_best(group)
+                for group in self._group(
+                    passed, lambda r: r.get('proc_path') or id(r)).values()]
+
+        winners = set()
+        for group in self._group(kept, self.crystal_key).values():
+            best = self.select_best(group)
+            winners.add(id(best))
+            for result in group:
+                if result is not best:
+                    self.superseded.append((result, self._label(best)))
+        return [result for result in kept if id(result) in winners]
 
 
 class ProcessingFilter(FilterBase):
@@ -935,13 +1330,18 @@ class ProcessingFilter(FilterBase):
     Quality thresholds (Step 1):
       - overall completeness >= 80 %
       - overall multiplicity >= 3
-      - overall CC½ >= 0.70
-      - outer-shell CC½ >= 0.30
+      - overall CC1/2 >= 0.70
+      - outer-shell CC1/2 >= 0.30
       - overall Rpim <= 0.20
 
     Deduplication (Step 3): within each proc_path group, prefer lowest
-    overall Rpim; break ties by highest overall CC½; break further ties by
+    overall Rpim; break ties by highest overall CC1/2; break further ties by
     highest resolution (smallest outer-shell limit); fall back to list order.
+
+    Deduplication (Step 4): the same comparison again, across results from one
+    physical crystal.  A pin mounted and collected a second time yields two
+    dataset folders that the tag keeps apart but that measure the same crystal,
+    so only the better of them should reach refinement.
     """
 
     COMPLETENESS_MIN = 80.0
@@ -982,15 +1382,22 @@ class ProcessingFilter(FilterBase):
             return (rpim, -cc12, res)
         return min(group, key=sort_key)
 
+    def crystal_key(self, result):
+        """Group results that measure the same physical crystal.
 
-class RefinementFilter(FilterBase):
-    """Filter and deduplicate refinement results. (Not yet implemented.)"""
+        An explicit ``crystal_code`` is the crystal's own identity and is used
+        when the caller has one -- a path is not an identity, and stops being
+        one as soon as the run directory moves.  Scraped results have only
+        ``dataset_code``, the pin folder, which two collections of one pin share
+        while their dataset tags (which carry the collection) do not.
 
-    def filter_quality(self, results):
-        raise NotImplementedError
-
-    def select_best(self, group):
-        raise NotImplementedError
+        Either is normalised through the crystal code parser, so that a
+        hand-typed ``FRS006_4`` and a ``FRS006_04`` are recognised as one
+        crystal; a code that cannot be parsed falls back to its literal spelling
+        rather than being grouped on a guess.
+        """
+        code = result.get('crystal_code') or result.get('dataset_code') or ''
+        return parse_code(code) or code
 
 
 class _PanddaAnalysisBackend:
@@ -1572,32 +1979,19 @@ class QRefineWatcher(WatcherBase):
     def context_width(self):
         return max((len(pin) for pin in self.datasets), default=0) + self._JOB_ID_FIXED
 
+    def __init__(self, procpath=None, pincode=None, details=False, dataset_list=None):
+        # None watches the info.json winners; a path is the vic.refine -l override.
+        self.dataset_list = dataset_list
+        super().__init__(procpath=procpath, pincode=pincode, details=details)
+
     def get_info(self):
+        from avicenna.pipelines.refinement_runner import load_datasets
         if not os.path.isdir(self.procpath):
             sys.exit(f"Error: processing directory '{self.procpath}' does not exist.")
-        qrefine_list_path = os.path.join(self.procpath, 'qrefine_list.txt')
-        if not os.path.isfile(qrefine_list_path):
-            sys.exit(f"Error: 'qrefine_list.txt' not found in '{self.procpath}'.")
         self.datasets = {}
-        with open(qrefine_list_path) as fh:
-            for line in fh:
-                parts = [p.strip() for p in line.strip().split(',')]
-                if len(parts) < 5:
-                    continue
-                pin, crystal_name, cell_refined, index, integration = (
-                    parts[0], parts[1], parts[2], parts[3], parts[4]
-                )
-                index_dir = index.replace(' ', '_')
-                if integration == 'integration not forced':
-                    forced = 'not_forced'
-                else:
-                    iparts = integration.split()
-                    forced = f"forced_{iparts[3]}_{iparts[4]}"
-                cr = f"_{cell_refined}" if cell_refined else ""
-                job_dir_name = f"{pin}_{crystal_name}{cr}_{index_dir}_{forced}"
-                if pin not in self.datasets:
-                    self.datasets[pin] = {}
-                self.datasets[pin][job_dir_name] = (None, None)
+        for dataset in load_datasets(self.procpath, self.dataset_list):
+            dataset.resolve()
+            self.datasets.setdefault(dataset.pin, {})[dataset.job_dir.name] = (None, None)
 
     def _pipeline_logs(self, job_dir):
         log = os.path.join(job_dir, 'pipeline.log')
@@ -1738,7 +2132,7 @@ Watcher = ProcessingWatcher
 class ProgressBar:
     """Displays an updating progress bar for a watcher.
 
-    Simple mode (default): two-line overwrite display — legend on top, bar below.
+    Simple mode (default): two-line overwrite display -- legend on top, bar below.
     Multiline mode: one line per category (processed / failed / running / rejected),
     each with a fill bar, preceded by a spinner title line. Lines appear and
     disappear as counts change; cursor is repositioned on each redraw using ANSI
@@ -1849,7 +2243,7 @@ class ProgressBar:
         state = (total, tuple(c for _, c in active), self.separator)
 
         # If counts are unchanged since last full draw, update only the spinner
-        # char on the title line in place — leaves the rest of the bar untouched
+        # char on the title line in place -- leaves the rest of the bar untouched
         # so it doesn't blink.  Cursor saved/restored via DEC SC/RC.
         if self._drawn and self._last_state == state:
             n_up = len(active)
@@ -1998,60 +2392,72 @@ class Spinner:
         self.stop()
 
 
+def qrefine_list_row(proc_path, result_path, pipeline_subdir):
+    """One qrefine_list.txt row (pin,crystal_name,cell_refined,index,integration)
+    for a processing result, or None when its folders are not in the expected
+    layout."""
+    pin          = os.path.basename(proc_path)
+    crystal_dir  = os.path.basename(result_path)
+    crystal_name = crystal_dir
+    cell_refined = ''
+    for suffix in _CELL_REFINED_SUFFIXES:
+        if crystal_dir.endswith(suffix):
+            crystal_name = crystal_dir[:-len(suffix)]
+            cell_refined = suffix[1:]
+            break
+    try:
+        rel_parts = pathlib.Path(pipeline_subdir).relative_to(result_path).parts
+    except ValueError:
+        return None
+    if len(rel_parts) == 1:
+        index_dir   = rel_parts[0]
+        integration = 'integration not forced'
+    elif len(rel_parts) == 2 and rel_parts[1].endswith('_force'):
+        index_dir  = rel_parts[0]
+        force_base = rel_parts[1][:-len('_force')]
+        prefix, sg = force_base.split('_', 1)
+        integration = f'integration forced in {sg} {prefix}'
+    else:
+        return None
+    if not index_dir.startswith('index_'):
+        return None
+    index = index_dir[len('index_'):].replace('_', ' ')
+    return f"{pin},{crystal_name},{cell_refined},{index},{integration}\n"
+
+
+def export_qrefine_list(project_dir, path=None):
+    """Write qrefine_list.txt from the processing winners in info.json.
+
+    An export for inspection and for the vic.refine -l override; refinement
+    itself reads info.json.  Returns the number of rows written.
+    """
+    from avicenna.utils.info import ProjectInfo
+    project_dir = pathlib.Path(project_dir)
+    out = pathlib.Path(path) if path else project_dir / 'qrefine_list.txt'
+    info = ProjectInfo.load(project_dir)
+    lines = []
+    for tag in info.select_for_refinement():
+        record = info[tag]
+        paths = [record.get(k) for k in ('proc_path', 'result_path', 'pipeline_subdir')]
+        row = qrefine_list_row(*paths) if all(paths) else None
+        if row is None:
+            print(f"WARNING: {tag} left out of {out.name}: no processing paths in info.json")
+            continue
+        lines.append(row)
+    with open(out, 'w') as fh:
+        fh.writelines(lines)
+    print(f"Wrote {len(lines)} entries to {out}")
+    return len(lines)
+
+
 class QRefineWriter:
-    """
-    Scans a completed XDS pipeline output directory, then writes
-    qrefine_list.txt (one row per completed job -- MTZ file found).
-    """
+    """Writes qrefine_list.txt for a project from the winners in its info.json."""
 
     def __init__(self, process_dir):
         self.process_dir = pathlib.Path(process_dir).resolve()
 
-    def _find_completed(self):
-        entries = []
-        print (self.process_dir)
-
-        for mtz in sorted(self.process_dir.rglob('XDS_ASCII_ctruncate.mtz')):
-            rel = mtz.relative_to(self.process_dir).parts
-            if len(rel) == 6 and rel[0] == 'processing' and rel[4].endswith('_rfree'):
-                pin, crystal_dir, index_dir = rel[1], rel[2], rel[3]
-                integration = 'integration not forced'
-            elif len(rel) == 7 and rel[0] == 'processing' and rel[4].endswith('_force') and rel[5].endswith('_rfree'):
-                pin, crystal_dir, index_dir = rel[1], rel[2], rel[3]
-                force_base = rel[4][:-len('_force')]          # e.g. '1_P43212'
-                prefix, sg = force_base.split('_', 1)
-                integration = f'integration forced in {sg} {prefix}'
-            else:
-                continue
-
-            crystal_name = crystal_dir
-            cell_refined = ''
-            for suffix in _CELL_REFINED_SUFFIXES:
-                if crystal_dir.endswith(suffix):
-                    crystal_name = crystal_dir[:-len(suffix)]
-                    cell_refined = suffix[1:]
-                    break
-
-            if not index_dir.startswith('index_'):
-                continue
-            index = index_dir[len('index_'):].replace('_', ' ')
-
-            entries.append((pin, crystal_name, cell_refined, index, integration))
-
-        return entries
-
     def write_qrefine_list(self, path=None):
-        print(f"Scanning {self.process_dir} for completed jobs...")
-
-        entries = self._find_completed()
-
-        print(f"Found {len(entries)} completed jobs. Writing qrefine_list.txt...")
-
-        out = pathlib.Path(path) if path else self.process_dir / 'qrefine_list.txt'
-        with open(out, 'w') as fh:
-            for pin, crystal_name, cell_refined, index, integration in entries:
-                fh.write(f"{pin},{crystal_name},{cell_refined},{index},{integration}\n")
-        print(str(out))
+        return export_qrefine_list(self.process_dir, path)
 
     def write(self):
         self.write_qrefine_list()

@@ -43,10 +43,11 @@ refine
       .help = Directory that contains completed processing output \
               (and will receive refinement output).
       .expert_level = 0
-    dataset_list = "qrefine_list.txt"
+    dataset_list = None
       .type = path
       .short_caption = Dataset list
-      .help = File listing datasets to refine (one per line).
+      .help = Developer override: a qrefine_list.txt whose rows are refined \
+              instead of the processing winners in info.json. None uses info.json.
       .expert_level = 0
     reference_mtz = None
       .type = path

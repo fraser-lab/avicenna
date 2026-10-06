@@ -12,7 +12,7 @@ cd "$REPO_DIR"
 
 ENV_NAME="avicenna"
 
-# ── 1. Find or install conda ───────────────────────────────────────────────
+# -- 1. Find or install conda -----------------------------------------------
 CONDA=""
 for cmd in mamba conda micromamba; do
     if command -v "$cmd" &>/dev/null; then
@@ -40,15 +40,15 @@ fi
 
 echo "Using: $CONDA ($($CONDA --version))"
 
-# ── 2. Accept Anaconda Terms of Service ───────────────────────────────────
+# -- 2. Accept Anaconda Terms of Service -----------------------------------
 $CONDA tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
 $CONDA tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
 
-# ── 3. Initialize conda shell integration ─────────────────────────────────
+# -- 3. Initialize conda shell integration ---------------------------------
 CONDA_BASE="$($CONDA info --base)"
 source "$CONDA_BASE/etc/profile.d/conda.sh"
 
-# ── 4. Create or update the conda environment ─────────────────────────────
+# -- 4. Create or update the conda environment -----------------------------
 if $CONDA env list | grep -qE "^${ENV_NAME}[[:space:]]"; then
     echo "Conda environment '$ENV_NAME' already exists — updating..."
     $CONDA install -n "$ENV_NAME" "python>=3.11" -y
@@ -60,7 +60,7 @@ fi
 conda activate "$ENV_NAME"
 echo "Activated: $ENV_NAME"
 
-# ── 5. Install pixi into the conda environment if not present ─────────────
+# -- 5. Install pixi into the conda environment if not present -------------
 if ! command -v pixi &>/dev/null; then
     echo "pixi not found — installing into conda environment..."
     curl -fsSL https://pixi.sh/install.sh | PIXI_HOME="$CONDA_PREFIX" bash
@@ -71,7 +71,7 @@ fi
 
 echo "Using: pixi ($(pixi --version))"
 
-# ── 6. Install avicenna ───────────────────────────────────────────────────
+# -- 6. Install avicenna ---------------------------------------------------
 echo "Installing avicenna..."
 pip install -e "$REPO_DIR"
 

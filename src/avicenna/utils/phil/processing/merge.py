@@ -129,7 +129,7 @@ def _run_pointless(step, ctx, rp, pipeline_subdir):
     ]
     if sg:
         # REINDEX is required when the input's reference group differs from
-        # the target SG (e.g. P 4 → P41212).  The identity operator h,k,l
+        # the target SG (e.g. P 4 -> P41212).  The identity operator h,k,l
         # lets Pointless recheck the data without actually changing indices.
         stdin_lines.append(f"SPACEGROUP {sg}")
         stdin_lines.append("REINDEX h,k,l")

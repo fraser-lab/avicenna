@@ -2,11 +2,13 @@ processing {
   input {
     data = None
     pinlist = None
+    crystal_list = None
     reference_mtz = None
   }
   dataset {
     indexing_images = first_half
     refine_cell_integrate = true
+    skip_prescans = True
     no_symmetry = False
     reference_hkl = None
   }

@@ -10,7 +10,7 @@ placing a ``software_registry.phil`` in:
 
 Entries from later files are merged on top of earlier ones (standard PHIL
 semantics).  Adding a new suite requires only a new ``suite { }`` block in
-one of those files — no Python changes are needed.
+one of those files -- no Python changes are needed.
 
 Public API
 ----------

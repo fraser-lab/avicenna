@@ -14,7 +14,7 @@ case "$SHELL_NAME" in
     *)    RC_FILE="$HOME/.bashrc" ;;
 esac
 
-# ── Remove avicenna source line from rc file ─────────────────────────────
+# -- Remove avicenna source line from rc file -----------------------------
 remove_path_entry() {
     [[ -f "$RC_FILE" ]] || return
     if grep -qF 'vic_env_setup.sh' "$RC_FILE"; then
@@ -25,7 +25,7 @@ remove_path_entry() {
     fi
 }
 
-# ── Find conda ────────────────────────────────────────────────────────────
+# -- Find conda ------------------------------------------------------------
 CONDA=""
 for cmd in mamba conda micromamba; do
     if command -v "$cmd" &>/dev/null; then

@@ -3,7 +3,10 @@ import pathlib
 import shutil
 import stat
 import sys
+from collections import Counter
 sys.path.insert(0, str(pathlib.Path(__file__).parents[2]))
+from avicenna.pipelines.sge import SGESubmitter
+from avicenna.utils.info import ProjectInfo
 from avicenna.utils.utils import format_log_line, QRefineWatcher, qsub_terse
 from avicenna.utils import resources
 
@@ -11,11 +14,11 @@ _src_dir = str(pathlib.Path(__file__).parents[3] / "src")
 
 
 class QRefineDataset:
-    """Represent one entry from qrefine_list.txt.
+    """One dataset to refine, in its job folder ``qrefine/<tag>/``.
 
-    Holds pin, crystal_name, cell_refined, index, and integration flag.
-    Derives the input MTZ path (forced vs. non-forced) and the output
-    subdirectory name under qrefine/.
+    Built from the dataset's winning record in info.json (``from_info``) or,
+    as a developer override, from one qrefine_list.txt row, whose columns give
+    the input MTZ path (forced vs. non-forced).
     """
 
     def __init__(self, pin, crystal_name, cell_refined, index, integration, process_dir):
@@ -28,6 +31,18 @@ class QRefineDataset:
         self.forced = None
         self.mtz_path = None
         self.job_dir = None
+
+    @classmethod
+    def from_info(cls, tag, record, process_dir):
+        """The dataset as info.json records its processing winner."""
+        crystal_form = pathlib.Path(record.get("result_path") or "").name
+        dataset = cls(tag, crystal_form, "", record.get("image_range") or "",
+                      None, process_dir)
+        dataset.forced = (f"forced_{record.get('forced_sg')}"
+                          if record.get("forced") else "not_forced")
+        dataset.mtz_path = pathlib.Path(record["final_mtz"])
+        dataset.job_dir = dataset.process_dir / "qrefine" / tag
+        return dataset
 
     @staticmethod
     def _rfree_dir(parent):
@@ -51,6 +66,8 @@ class QRefineDataset:
         return parent / "10_rfree"
 
     def resolve(self):
+        if self.job_dir is not None:
+            return
         crystal_dir = (f"{self.crystal_name}_{self.cell_refined}"
                        if self.cell_refined else self.crystal_name)
         index_dir = self.index.replace(' ', '_')
@@ -66,11 +83,75 @@ class QRefineDataset:
             self.forced = f"forced_{forced_sg}_{forced_prefix}"
             parent = base / f"{forced_prefix}_{forced_sg}_force"
         self.mtz_path = self._rfree_dir(parent) / "XDS_ASCII_ctruncate.mtz"
-        cell_refined_part = f"_{self.cell_refined}" if self.cell_refined else ""
-        self.job_dir = (
-            self.process_dir / "qrefine" /
-            f"{self.pin}_{self.crystal_name}{cell_refined_part}_{index_dir}_{self.forced}"
-        )
+        self.job_dir = self.process_dir / "qrefine" / self.pin
+
+
+REFINED_OUTPUTS = ("final_refined.pdb", "final_refined.mtz")
+
+
+def refine_finished(job_dir):
+    """Whether a refinement job left the canonical outputs the next stage reads."""
+    job_dir = pathlib.Path(job_dir)
+    return all((job_dir / name).is_file() for name in REFINED_OUTPUTS)
+
+
+def read_dataset_list(path, process_dir):
+    """The datasets named in a qrefine_list.txt, in file order.
+
+    Every job folder is named for its dataset tag, so a list naming one tag
+    twice (an unfiltered list, say) is refused rather than letting one row's
+    job replace the other's.
+    """
+    datasets = []
+    with open(path) as fh:
+        for line in fh:
+            parts = [p.strip() for p in line.strip().split(',')]
+            if len(parts) < 5:
+                continue
+            pin, crystal_name, cell_refined, index, integration = (
+                parts[0], parts[1], parts[2],
+                parts[3].replace(' ', '_'), parts[4],
+            )
+            datasets.append(QRefineDataset(
+                pin, crystal_name, cell_refined, index, integration, process_dir
+            ))
+    counts = Counter(d.pin for d in datasets)
+    repeated = sorted(tag for tag, n in counts.items() if n > 1)
+    if repeated:
+        raise ValueError(f"{path} lists more than one row for "
+                         f"{', '.join(repeated)}; refinement keeps one job per "
+                         f"dataset, so keep one row for each")
+    return datasets
+
+
+def datasets_from_info(process_dir):
+    """The processing winners in info.json, as datasets to refine.
+
+    Returns ``(datasets, skipped)``; *skipped* is ``[(tag, reason)]`` for a
+    winner whose record does not name its merged data file, which refinement
+    has no input for.
+    """
+    info = ProjectInfo.load(pathlib.Path(process_dir))
+    datasets, skipped = [], []
+    for tag in info.select_for_refinement():
+        record = info[tag]
+        if not record.get("final_mtz"):
+            skipped.append((tag, "no final_mtz in info.json"))
+            continue
+        datasets.append(QRefineDataset.from_info(tag, record, process_dir))
+    return datasets, skipped
+
+
+def load_datasets(process_dir, dataset_list=None, report=False):
+    """What a refinement run refines: the info.json winners, or the rows of
+    *dataset_list* when one is given.  *report* prints each skipped winner."""
+    if dataset_list is not None:
+        return read_dataset_list(dataset_list, process_dir)
+    datasets, skipped = datasets_from_info(process_dir)
+    if report:
+        for tag, reason in skipped:
+            print(f"WARNING: {tag} not refined: {reason}")
+    return datasets
 
 
 class QRefineWorker:
@@ -105,7 +186,7 @@ class QRefineWorker:
             forced_tag = "nf" if d.forced == "not_forced" else d.forced.split("_")[1]
             job_id = f"{d.pin} | {forced_tag:<7} | {suffix:<5}"
             per_params = {**p, "mtz": str(d.mtz_path), "suffix": suffix,
-                          "pin": d.pin, "job_id": job_id,
+                          "pin": d.pin, "dataset_tag": d.pin, "job_id": job_id,
                           "context_width": self.context_width,
                           "fill": self.fill,
                           **self._extra_params(suffix)}
@@ -144,10 +225,10 @@ print("=" * 60, flush=True)
         return scripts
 
 
-class RunQRefine:
+class RunQRefine(SGESubmitter):
     """Orchestrate the full qrefine preparation and SGE submission.
 
-    Base class for ``RefinementOrchestrator``.  Reads qrefine_list.txt, manages
+    Base class for ``RefinementOrchestrator``.  Reads the datasets, manages
     the qrefine/ output directory, iterates over datasets, calls the worker for
     each, writes qrefine_qsub_list.txt and qrefine_qsub_submit.sh, and submits
     via qsub (unless dry_run=True).  The input seams (``_load_mr_params``,
@@ -158,13 +239,17 @@ class RunQRefine:
     Also ensures CCP4 7.0 is pinned in ~/.sbgrid.conf before job generation.
     """
 
-    def __init__(self, process_dir, dataset_list, data=None, model=None, dry_run=False, fill=True):
+    def __init__(self, process_dir, dataset_list=None, data=None, model=None, dry_run=False,
+                 fill=True, resume=False):
         self.process_dir  = pathlib.Path(process_dir).resolve()
-        self.dataset_list = pathlib.Path(dataset_list)
+        # None refines the info.json winners; a path is the developer override.
+        self.dataset_list = pathlib.Path(dataset_list) if dataset_list else None
         self.data         = pathlib.Path(data) if data else None
         self.model        = pathlib.Path(model) if model else None
         self.dry_run      = dry_run
         self.fill         = fill
+        # Keep jobs that already produced their outputs instead of redoing them.
+        self.resume       = resume
         # SGE slots per refinement job; "auto" -> 1 (REFMAC5 is serial).  The
         # PHIL orchestrator overrides this from refine.ncpu.
         self.ncpu         = "auto"
@@ -195,59 +280,48 @@ class RunQRefine:
             qsub_list.unlink()
 
     def _read_dataset_list(self):
-        datasets = []
-        with open(self.dataset_list) as fh:
-            for line in fh:
-                parts = [p.strip() for p in line.strip().split(',')]
-                if len(parts) < 5:
-                    continue
-                pin, crystal_name, cell_refined, index, integration = (
-                    parts[0], parts[1], parts[2],
-                    parts[3].replace(' ', '_'), parts[4],
-                )
-                datasets.append(QRefineDataset(
-                    pin, crystal_name, cell_refined, index, integration, self.process_dir
-                ))
-        return datasets
+        return load_datasets(self.process_dir, self.dataset_list, report=True)
+
+    H_RT = "02:00:00"
 
     def _write_qsub_submit(self, qsub_list, njob):
-        submit_path = self.process_dir / "qrefine_qsub_submit.sh"
         logs_dir = self.process_dir / "qrefine_logs"
         logs_dir.mkdir(exist_ok=True)
-        submit_path.write_text(
-            "#!/bin/bash\n"
-            "#$ -S /bin/bash\n"
-            "#$ -cwd\n"
-            f"#$ -t 1-{njob}\n"
-            "#$ -j y\n"
-            f"#$ -pe smp {self._refine_slots()}\n"
-            "#$ -l mem_free=2G\n"
-            "#$ -l h_rt=02:00:00\n"
-            f"#$ -o {logs_dir}\n\n"
-            f'script=$(sed "${{SGE_TASK_ID}}q;d" {qsub_list})\n'
-            "cd $(dirname ${script})\n"
-            "./$(basename ${script})\n"
+        return self._write_sge_script(
+            self.process_dir / "qrefine_qsub_submit.sh",
+            "./$(basename ${script})",
+            h_rt=self.H_RT, slots=self._refine_slots(), mem_free="2G",
+            array=njob, logs_dir=logs_dir,
+            preamble=(f'script=$(sed "${{SGE_TASK_ID}}q;d" {qsub_list})\n'
+                      "cd $(dirname ${script})\n"),
         )
-        submit_path.chmod(submit_path.stat().st_mode | stat.S_IXUSR | stat.S_IRUSR | stat.S_IWUSR)
-        return submit_path
 
     def run(self):
+        datasets = self._read_dataset_list()
+        if not datasets:
+            source = self.dataset_list or self.process_dir / "info.json"
+            print(f"ERROR: no datasets to refine in {source}")
+            return None
+
         self._pin_ccp4_version()
         self._setup_output_dir()
 
         mr_params = self._load_mr_params()
         self._validate_inputs(mr_params)
 
-        datasets  = self._read_dataset_list()
         qsub_list = self.process_dir / "qrefine_qsub_list.txt"
 
-        context_width = QRefineWatcher(procpath=self.process_dir).context_width
+        context_width = QRefineWatcher(procpath=self.process_dir,
+                                       dataset_list=self.dataset_list).context_width
 
         for dataset in datasets:
             dataset.resolve()
             print(f"{dataset.pin} {dataset.crystal_name} {dataset.cell_refined} "
                   f"{dataset.index} {dataset.forced}")
 
+            if self.resume and refine_finished(dataset.job_dir):
+                print(f"{dataset.job_dir.name} already refined -- skipping")
+                continue
             if dataset.job_dir.is_dir():
                 print(f"qrefine directory for {dataset.job_dir.name} exists, "
                       f"will delete and continue")

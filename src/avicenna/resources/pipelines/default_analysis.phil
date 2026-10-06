@@ -4,8 +4,8 @@ analysis {
     ground_state_datasets = None
     reference_pdb = None
     reference_mtz = None
-    ligands = None
-    ligand_library = DSI_1 DSI_2 DSI_3 *EE UCSF91_1 all
+    ligand_source_path = None
+    ligand_library = DSI_1 DSI_2 DSI_3 EE_1 UCSF91_1 *all
   }
   output {
     directory = "."

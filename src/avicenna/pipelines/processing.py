@@ -39,11 +39,12 @@ import pkgutil
 import stat
 from pathlib import Path
 
-from avicenna.pipelines.processing_runner import RunProcess
+from avicenna.pipelines.processing_runner import RunProcess, format_aimless_summary
 from avicenna.pipelines.jobbase import SubPipelineInterpreter
+from avicenna.utils.info import OUTCOME_COMPLETED
 from avicenna.utils.phil.processing import ProcessingPHIL
 from avicenna.utils.software import suite_setup_sources
-from avicenna.utils.utils import QRefineWriter, sg_lookup
+from avicenna.utils.utils import sg_lookup
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +243,78 @@ class ProcessingPipelineInterpreter(SubPipelineInterpreter):
             return True
         return False
 
+    # ------------------------------------------------------------------
+    # Per-process record (see avicenna.pipelines.jobbase)
+    # ------------------------------------------------------------------
+
+    def _record_directory(self):
+        return self.params.get("pipeline_subdir")
+
+    def _record_key(self):
+        return self.params.get("pin_id")
+
+    def _record_paths(self):
+        """This job's dataset directory and crystal-form directory.
+
+        Named as the result tree names them, so the sentinel can group records
+        the same way results have always been grouped.  A forced-integration
+        job sits one level deeper than an ordinary one, so the depth is derived
+        rather than assumed.
+        """
+        tag = self.params.get("pin_id")
+        try:
+            dataset_dir = Path(self.rp._output_dir) / tag
+            parts = Path(self.params["pipeline_subdir"]).relative_to(dataset_dir).parts
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return None, None
+        return str(dataset_dir), (str(dataset_dir / parts[0]) if parts else None)
+
+    def _record_fields(self):
+        params = self.params
+        forced = params.get("force_integration") == "true"
+        dataset_dir, crystal_form_dir = self._record_paths()
+        fields = {
+            "proc_path":       dataset_dir,
+            "result_path":     crystal_form_dir,
+            "pipeline_subdir": params.get("pipeline_subdir"),
+            # The images as collected: image_dir is rewritten to the scratch
+            # copy once the job starts, and that path outlives nothing.
+            "image_dir":       params.get("original_image_dir") or params.get("image_dir"),
+            "image_prefix":    params.get("image_prefix"),
+            "image_range":     params.get("image_range"),
+            "data_format":     params.get("data_format"),
+            "forced":          forced,
+            "known_sg":        params.get("known_sg"),
+            "known_cell":      params.get("known_cell"),
+            "refine_cell_integrate": params.get("refine_cell_integrate"),
+            "ncpu":            params.get("ncpu"),
+            "xds_jobs":        params.get("xds_jobs"),
+            "job_id":          os.environ.get("JOB_ID"),
+            "task_id":         os.environ.get("SGE_TASK_ID"),
+        }
+        if forced:
+            # The symmetry this retry was told to force, which is what
+            # distinguishes one retry of a dataset from another.
+            fields["forced_sg"]   = params.get("sg")
+            fields["forced_cell"] = params.get("cell")
+        return fields
+
+    def _final_mtz(self, ctx):
+        """Absolute path of the merged data file refinement starts from, or None.
+
+        Taken from the step that produced it, so the next stage reads the path
+        from the record instead of rebuilding it from folder names.
+        """
+        last_rfree = ctx["last_by_program"].get("rfree")
+        if not last_rfree:
+            self._log("WARN", "no R-free step completed; final_mtz not recorded")
+            return None
+        mtz = Path(ctx["pipeline_subdir"]) / last_rfree / "XDS_ASCII_ctruncate.mtz"
+        if not mtz.is_file():
+            self._log("WARN", f"{mtz} not found; final_mtz not recorded")
+            return None
+        return str(mtz.resolve())
+
     def _on_fatal(self, step, ctx, result):
         if result.get("error_type") == "needs_forced_integration":
             ctx["triggered_forced"] = True
@@ -285,8 +358,8 @@ class ProcessingPipelineInterpreter(SubPipelineInterpreter):
         Parameters
         ----------
         forced : bool
-            False → normal indexing path (xds_initial_indexing).
-            True  → forced-integration path (xds_forced_integration).
+            False -> normal indexing path (xds_initial_indexing).
+            True  -> forced-integration path (xds_forced_integration).
             The ``forced`` flag is passed verbatim to every step handler.
         """
         params          = self.params
@@ -307,6 +380,10 @@ class ProcessingPipelineInterpreter(SubPipelineInterpreter):
         self._log("START",
                   f"{params.get('pin_id', '?')} | {label} | sg={sg} cell={cell}")
 
+        # Opened before the scratch copy, which takes minutes on a big dataset
+        # and is itself a place a job can die.
+        self._open_record()
+
         self.rp._setup_scratch(params)
 
         ctx = {
@@ -322,13 +399,21 @@ class ProcessingPipelineInterpreter(SubPipelineInterpreter):
 
         fatal_break = self._run_steps(steps, ctx)
 
-        if not fatal_break and not ctx["triggered_forced"]:
-            last_aimless = ctx["last_by_program"].get("aimless")
-            if last_aimless:
-                summary = self.rp._aimless_summary(
-                    pipeline_subdir / last_aimless / f"{last_aimless}.log")
-                self._log("DONE", summary)
-            # PHIL path: emit only the dataset list.  MR settings now live in
-            # refine.phil (written by vic.process), so qrefine_input_parameters.txt
-            # is legacy-only and intentionally not produced here.
-            QRefineWriter(params["process_dir"]).write_qrefine_list()
+        if fatal_break:
+            # The record was closed on the failing step.  A handoff to forced
+            # integration is added to it, so a dataset whose retries are still
+            # queued is not read as one that simply stopped here.
+            if ctx["triggered_forced"]:
+                self._record_update(triggered_forced=True)
+            return
+
+        stats = {}
+        last_aimless = ctx["last_by_program"].get("aimless")
+        if last_aimless:
+            stats = self.rp._aimless_stats(
+                pipeline_subdir / last_aimless / f"{last_aimless}.log")
+            self._log("DONE", format_aimless_summary(stats))
+        final_mtz = self._final_mtz(ctx)
+        if final_mtz:
+            stats["final_mtz"] = final_mtz
+        self._close_record(OUTCOME_COMPLETED, **stats)
