@@ -17,10 +17,8 @@ from avicenna.utils.phil._base import PhilBase
 # (built into _HEADER) and resolve_ligand_libraries().
 # ---------------------------------------------------------------------------
 
-LIGAND_LIBRARIES = ("DSI_1", "DSI_2", "DSI_3", "EE", "UCSF91_1")
-_LIGAND_DEFAULT = "EE"
-_LIGAND_CHOICE = " ".join(f"*{lib}" if lib == _LIGAND_DEFAULT else lib
-                          for lib in LIGAND_LIBRARIES) + " all"
+LIGAND_LIBRARIES = ("DSI_1", "DSI_2", "DSI_3", "EE_1", "UCSF91_1")
+_LIGAND_CHOICE = " ".join(LIGAND_LIBRARIES) + " *all"
 
 
 def resolve_ligand_libraries(selected):
@@ -80,18 +78,21 @@ analysis
       .help = Optional path to the reference structure MTZ for pandda.analyse, \
               paired with reference_pdb.
       .expert_level = 0
-    ligands = None
+    ligand_source_path = None
       .type = path
       .short_caption = Ligand structures
-      .help = Optional path to ligand structures and their CIFs, organised by \
-              library and well code.
+      .help = Optional path to the folder holding one folder per ligand, named \
+              <library>_<well> (plus _<isomer> for each stereoisomer), each with \
+              the ligand model (.pdb) and restraints (.cif). A ligand missing \
+              there is generated from its SMILES with phenix.elbow.
       .expert_level = 0
     ligand_library = {ligand_choice}
       .type = choice(multi=True)
       .short_caption = Ligand library
-      .help = Fragment library or libraries soaked into the crystals. Select one \
-              or more. "all" selects every library and overrides any other \
-              selection.
+      .help = Fragment library or libraries whose datasets are analysed. \
+              Datasets soaked from any other library are left out, and datasets \
+              with no library recorded are always kept. "all" (the default) \
+              selects every library and overrides any other selection.
       .expert_level = 0
   }
   output

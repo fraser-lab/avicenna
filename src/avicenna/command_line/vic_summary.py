@@ -6,7 +6,7 @@ from importlib.metadata import version, PackageNotFoundError
 sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "src"))
 from avicenna.utils.utils import (
     ProcessingScraper, ProcessingFilter,
-    QRefineScraper, RefinementFilter,
+    QRefineScraper,
     AnalysisScraper, AnalysisFilter,
 )
 
@@ -25,7 +25,7 @@ parser.add_argument('-l', '--list_write', action='store_true', help="Write a qre
 
 _SCRAPER_CLASSES = {
     "processing": (ProcessingScraper, ProcessingFilter, "processing"),
-    "refine":     (QRefineScraper,    RefinementFilter, None),
+    "refine":     (QRefineScraper,    None,             None),
     "analysis":   (AnalysisScraper,   AnalysisFilter,   None),
 }
 
@@ -36,6 +36,8 @@ def main():
         if (args.filter or args.list_write) and not args.verbose:
             parser.error("-f/--filter and -l/--list_write require --verbose")
         scraper_cls, filter_cls_factory, subdir = _SCRAPER_CLASSES[args.pipeline]
+        if args.filter and filter_cls_factory is None:
+            parser.error(f"-f/--filter is not available for -p {args.pipeline}")
         result_path = args.path / subdir if subdir else args.path
         scraper = scraper_cls(result_path=result_path)
         filter_cls = filter_cls_factory() if args.filter else None

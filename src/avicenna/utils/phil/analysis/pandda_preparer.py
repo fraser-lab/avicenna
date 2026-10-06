@@ -1,10 +1,22 @@
+import json
 import pathlib
 import shutil
 import stat
-import subprocess
-import time
+import sys
 
 from avicenna.utils import resources
+from avicenna.utils.ligands import (GENERATED_DIR, find_ligand_files,
+                                    generated_files, ligand_name)
+from avicenna.utils.utils import qsub_terse
+
+# Run in the pandda job before pandda.analyse: generates the ligands the
+# library did not have.  The script sources SBGrid with CCP4 7.0, whose python
+# cannot import this package, so the interpreter running this code is named
+# outright.
+_GENERATE_LIGANDS = (
+    '{python} -c "import sys; sys.path.insert(0, {src!r}); '
+    'from avicenna.utils.ligands import generate; generate({todo!r}, {cpus})"\n'
+)
 
 
 class PanDDAPreparer:
@@ -23,10 +35,14 @@ class PanDDAPreparer:
                  cpus=32, min_build_datasets=30, max_build_datasets=50,
                  max_new_datasets=1500, high_res_increment=0.05,
                  no_lr_comp_check=False, log_time_out=0, dry_run=False,
-                 pin_map=None):
+                 on_submit=None, project_dir=None,
+                 records=None, ligand_source_path=None, ligand_libraries=None):
         self.process_dirs          = [pathlib.Path(p).resolve() for p in process_dirs]
         self.ground_state_dirs     = [pathlib.Path(p).resolve() for p in (ground_state_dirs or [])]
-        self.pandda_dir            = pathlib.Path.cwd() / "pandda"
+        # The project folder holds this stage's folder, its job logs and the run
+        # lock, as it does for the other stages.
+        self.project_dir           = pathlib.Path(project_dir or pathlib.Path.cwd()).resolve()
+        self.pandda_dir            = self.project_dir / "pandda"
         self.prefix                = prefix
         self.offset                = offset
         self.ground_state_range    = ground_state_range
@@ -45,7 +61,19 @@ class PanDDAPreparer:
         self.no_lr_comp_check      = no_lr_comp_check
         self.log_time_out          = log_time_out
         self.dry_run               = dry_run
-        self.pin_map               = pin_map or {}
+        # The analysed project's info.json records, by dataset tag: what each
+        # dataset was soaked with.
+        self.records               = records or {}
+        self.ligand_source_path    = (pathlib.Path(ligand_source_path).resolve()
+                                      if ligand_source_path else None)
+        # None analyses every library; otherwise datasets recorded as soaked
+        # from any other library are left out.
+        self.ligand_libraries      = (set(ligand_libraries)
+                                      if ligand_libraries is not None else None)
+        # {ligand name: {"smiles", "out_dir", "targets"}} to generate in the job.
+        self._to_generate          = {}
+        # Called with the job id as soon as qsub returns it.
+        self.on_submit             = on_submit
 
     def _scan_qrefine(self, process_dir):
         """Return sorted list of (job_dir, pdb_path, mtz_path) for completed jobs.
@@ -68,6 +96,34 @@ class PanDDAPreparer:
             if pdb.is_file() and mtz.is_file():
                 results.append((job_dir, pdb, mtz))
         return results
+
+    def _recorded_jobs(self, project_dir):
+        """Return (job_dir, pdb_path, mtz_path) for the refined datasets that
+        *project_dir*'s info.json records, sorted by dataset tag.
+
+        The record is the stage's input, as it is for refinement; the job
+        folder is named for the dataset tag.  A dataset whose recorded model
+        is missing on disk is named and skipped.  Ground-state folders are
+        reference data from other projects and are still scanned instead.
+        """
+        from avicenna.utils.info import FILENAME, ProjectInfo
+
+        if not (project_dir / FILENAME).is_file():
+            print(f"WARNING: no {FILENAME} in {project_dir}; no datasets to analyse there.")
+            return []
+        info = ProjectInfo.load(str(project_dir))
+        jobs = []
+        for key in sorted(info.select_for_analysis()):
+            record = info[key]
+            pdb, mtz = record.get("final_refined_pdb"), record.get("final_refined_mtz")
+            if not (pdb and mtz and pathlib.Path(pdb).is_file()
+                    and pathlib.Path(mtz).is_file()):
+                print(f"WARNING: {key} not analysed: its refined model is not on disk")
+                continue
+            job_dir = pathlib.Path(record.get("refine_job_dir")
+                                   or pathlib.Path(pdb).parent).resolve()
+            jobs.append((job_dir, pathlib.Path(pdb), pathlib.Path(mtz)))
+        return jobs
 
     def _place_file(self, src, dest):
         """Put a single PDB/MTZ at *dest*: copy when copy_input, else symlink.
@@ -116,7 +172,7 @@ class PanDDAPreparer:
         Files are copied when ``copy_input`` is True (default) or symlinked when
         False (saves space).  Datasets are placed ground-state-first so the live
         listing is grouped; ``indexed_jobs`` is ``(idx, job_dir, pdb, mtz)`` and
-        the returned mapping is in serial-number order (for a tidy info.csv).
+        the returned mapping is in serial-number order.
         The split is by the flagged ground-state set (what pandda is told), not
         physical origin, so an unflagged apo dataset lists under "to analyze".
         """
@@ -133,6 +189,7 @@ class PanDDAPreparer:
         an_jobs = [t for t in indexed_jobs if f"x{t[0]:04d}" not in gs_set]
 
         records = []
+        ligand_counts = {}
         for label, group in (("Ground-state datasets", gs_jobs),
                              ("Datasets to analyze", an_jobs)):
             if label.startswith("Ground-state") and not group:
@@ -147,25 +204,132 @@ class PanDDAPreparer:
                     dest.mkdir(exist_ok=True)
                     self._place_pdb(pdb, dest / pdb.name)
                     self._place_file(mtz, dest / mtz.name)
-                pin_code = next(
-                    (code for full_pin, code in self.pin_map.items()
-                     if job_dir.name.startswith(full_pin + '_')),
-                    job_dir.name
-                )
-                records.append((idx, dataset_name, str(job_dir), tag, pin_code))
+                found = self._place_ligands(job_dir.name, dest)
+                ligand_counts[found] = ligand_counts.get(found, 0) + 1
+                records.append((idx, dataset_name, job_dir, tag))
 
         if gs_jobs:
             codes = [f"x{idx:04d}" for idx, *_ in gs_jobs]
             print(f"\nGround-state dataset codes ({len(codes)}): {', '.join(codes)}")
+        self._report_ligands(ligand_counts)
 
         records.sort(key=lambda r: r[0])
-        return [(dn, jd, tag, pc) for _, dn, jd, tag, pc in records]
+        return [(dn, jd, tag) for _, dn, jd, tag in records]
 
-    def _write_info_csv(self, mapping):
-        csv_path = self.pandda_dir / "info.csv"
-        with open(csv_path, "w") as fh:
-            for dataset_name, job_dir, _, pin_code in mapping:
-                fh.write(f"{pin_code},{dataset_name},{job_dir}\n")
+    def _place_ligands(self, dataset_tag, dest):
+        """Put one dataset's ligand files beside its model; returns where they
+        came from: "library", "generated earlier", "to generate", or None.
+
+        Only datasets of the analysed project have a record; ground-state
+        datasets, and datasets with no fragment recorded, get no ligand.
+        """
+        record = self.records.get(dataset_tag)
+        if not record:
+            return None
+        library, well = record.get("library_code"), record.get("well_code")
+        if not library or not well:
+            return None
+        pairs = find_ligand_files(self.ligand_source_path, library, well)
+        found = "library"
+        if not pairs:
+            pairs = generated_files(self.project_dir, library, well)
+            found = "generated earlier"
+        if pairs:
+            if not self.dry_run:
+                for cif, pdb in pairs:
+                    self._place_file(cif, dest / cif.name)
+                    self._place_file(pdb, dest / pdb.name)
+            return found
+        smiles = record.get("SMILES")
+        if not smiles:
+            return "no SMILES"
+        name = ligand_name(library, well)
+        item = self._to_generate.setdefault(name, {
+            "name": name, "smiles": smiles, "targets": [],
+            "out_dir": str(self.project_dir / GENERATED_DIR / name)})
+        item["targets"].append(str(dest))
+        return "to generate"
+
+    def _report_ligands(self, counts):
+        counts = {k: v for k, v in counts.items() if k}
+        if not counts:
+            return
+        parts = [f"{counts[k]} {label}" for k, label in (
+            ("library", "from the library"),
+            ("generated earlier", "generated earlier"),
+            ("to generate", "to generate with phenix.elbow"),
+            ("no SMILES", "with no ligand found and no SMILES to generate one"))
+            if counts.get(k)]
+        print(f"\nLigands: {', '.join(parts)}.")
+
+    def _filter_libraries(self, jobs):
+        """Leave out the datasets recorded as soaked from a library that was
+        not selected; a dataset with no library recorded is kept."""
+        if self.ligand_libraries is None:
+            return jobs
+        kept, left_out = [], {}
+        for job in jobs:
+            library = (self.records.get(job[0].name) or {}).get("library_code")
+            if library and library not in self.ligand_libraries:
+                left_out[library] = left_out.get(library, 0) + 1
+            else:
+                kept.append(job)
+        if left_out:
+            print("Left out by ligand_library: " + ", ".join(
+                f"{n} from {lib}" for lib, n in sorted(left_out.items())))
+        return kept
+
+    def _generation_line(self):
+        """The job-script line that generates the missing ligands, or "".
+
+        The list is written beside the script; phenix.elbow is found on the
+        submit host and named outright, so the job does not depend on PATH.
+        """
+        if not self._to_generate:
+            return ""
+        from avicenna.utils.software import find_phenix
+        try:
+            bin_dir, _version = find_phenix()
+            elbow = pathlib.Path(bin_dir) / "phenix.elbow"
+            if not elbow.is_file():
+                raise FileNotFoundError(str(elbow))
+        except (FileNotFoundError, KeyError) as exc:
+            print(f"WARNING: phenix.elbow not found ({exc}); "
+                  f"{len(self._to_generate)} ligand(s) will not be generated "
+                  f"and those datasets are analysed without one.")
+            return ""
+        todo = self.pandda_dir / "ligands_todo.json"
+        todo.write_text(json.dumps(
+            {"elbow": str(elbow), "ligands": list(self._to_generate.values())},
+            indent=1) + "\n")
+        import avicenna
+        src = str(pathlib.Path(avicenna.__file__).resolve().parents[1])
+        return _GENERATE_LIGANDS.format(python=sys.executable, src=src,
+                                        todo=str(todo), cpus=self.cpus)
+
+    def _record_dtags(self, mapping):
+        """Record each dataset's panDDA code in the analysed project's
+        info.json, and clear it from that project's datasets not in this run.
+
+        The completion sentinel traces panDDA's results back to datasets by
+        this code, so a code left from an earlier run must not survive.
+        """
+        from avicenna.utils.info import FILENAME, ProjectInfo
+
+        source = self.process_dirs[0]
+        if not (source / FILENAME).is_file():
+            print(f"WARNING: no {FILENAME} in {source}; analysis results will "
+                  f"not be recorded.")
+            return
+        info = ProjectInfo.load(str(source))
+        dtags = {job_dir.name: tag for _, job_dir, tag in mapping
+                 if job_dir.parent.parent == source}
+        for key, record in info.datasets.items():
+            if key in dtags:
+                record["pandda_dtag"] = dtags[key]
+            else:
+                record.pop("pandda_dtag", None)
+        info.write()
 
     def _pandda_args(self):
         data_dir = self.pandda_dir / "data"
@@ -207,7 +371,7 @@ class PanDDAPreparer:
 
     def _write_submit_script(self):
         pandda_sh = self.pandda_dir / "pandda.sh"
-        logs_dir  = self.pandda_dir.parent / "pandda_logs"
+        logs_dir  = self.project_dir / "pandda_logs"
         logs_dir.mkdir(exist_ok=True)
 
         args     = self._pandda_args()
@@ -225,6 +389,7 @@ class PanDDAPreparer:
             "source /programs/sbgrid.shrc\n"
             "CCP4_X=7.0\n\n"
             f"cd {self.pandda_dir}\n\n"
+            + self._generation_line()
             + pandda_cmd
         )
         pandda_sh.chmod(pandda_sh.stat().st_mode | stat.S_IXUSR | stat.S_IRUSR | stat.S_IWUSR)
@@ -253,12 +418,13 @@ class PanDDAPreparer:
 
         input_jobs = []
         for process_dir in self.process_dirs:
-            jobs = self._scan_qrefine(process_dir)
-            print(f"{process_dir}: {len(jobs)} completed jobs")
+            jobs = self._recorded_jobs(process_dir)
+            print(f"{process_dir}: {len(jobs)} refined datasets")
             input_jobs.extend(jobs)
+        input_jobs = self._filter_libraries(input_jobs)
 
         if not (gs_jobs or input_jobs):
-            print("No completed qrefine jobs found.")
+            print("No refined datasets found.")
             return
 
         n_gs = len(gs_jobs)
@@ -341,27 +507,34 @@ class PanDDAPreparer:
         print(f"\nPrepared {len(mapping)} datasets in {self.pandda_dir / 'data'} "
               f"({'copied' if self.copy_input else 'symlinked'}).")
 
-        self._write_info_csv(mapping)
+        self._record_dtags(mapping)
         pandda_sh = self._write_submit_script()
         print(f"Written: {pandda_sh}")
-        subprocess.run(["qsub", str(pandda_sh)])
-        self._tail_pandda_log()
+        job_id = qsub_terse([pandda_sh])
+        if not job_id:
+            print("WARNING: pandda.analyse was not submitted (qsub returned no job id).")
+            return None
+        print(f"Submitted pandda.analyse as job {job_id}")
+        return self._finish(job_id)
 
-    def _tail_pandda_log(self):
-        logs_dir = self.pandda_dir / "logs"
-        print(f"Waiting for pandda log in {logs_dir} ...")
-        start = time.time()
-        while True:
-            logs = sorted(logs_dir.glob("pandda-*.log"), key=lambda p: p.stat().st_mtime)
-            if logs:
-                log_path = logs[-1]
-                print(f"Tailing {log_path.name}")
-                try:
-                    subprocess.run(["tail", "-n", "+1", "-f", str(log_path)])
-                except KeyboardInterrupt:
-                    print("\nStopped tailing.")
-                return
-            if self.log_time_out > 0 and (time.time() - start) >= self.log_time_out * 60:
-                print("Timed out waiting for pandda log.")
-                return
-            time.sleep(5)
+    def _finish(self, job_id):
+        """Hold the completion sentinel on *job_id*, hand both ids to the run
+        lock, and follow the run; returns the sentinel's outcome, or None if
+        there is none to wait for.
+
+        The sentinel, not the pandda job, releases the lock: it is the last
+        thing to run and it reads this stage's output.
+        """
+        from avicenna.pipelines.sentinel import AnalysisSentinel
+        from avicenna.utils.utils import log_offset
+
+        sentinel = AnalysisSentinel(self.project_dir, self.process_dirs[0])
+        start = log_offset(sentinel.omnibus)
+        sentinel_id = sentinel.submit(job_id, logs_dir=self.project_dir / "pandda_logs")
+        if self.on_submit is not None:
+            self.on_submit(job_id, sentinel_id)
+        if not sentinel_id:
+            print("WARNING: the completion sentinel was not submitted; the "
+                  "results will not be recorded in info.json.")
+            return None
+        return sentinel.follow(start=start, log_time_out=self.log_time_out)

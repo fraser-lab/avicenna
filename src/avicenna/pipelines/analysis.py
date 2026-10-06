@@ -64,8 +64,10 @@ class AnalysisPipelineInterpreter(SubPipelineInterpreter):
     ----------
     params : dict
         Optional keys:
-          ``phil_string`` — PHIL text adopted on top of the default PHIL
+          ``phil_string`` -- PHIL text adopted on top of the default PHIL
                             before extracting the step list.
+          ``on_submit``   -- called with each cluster job id as it is
+                            submitted.
         All analysis configuration (sources, reference files, etc.) lives
         in the PHIL, not in this dict.
     """
@@ -100,7 +102,11 @@ class AnalysisPipelineInterpreter(SubPipelineInterpreter):
             "history_by_program": {},
             "completed_steps":    set(),
             "failed_steps":       set(),
+            "on_submit":          self.params.get("on_submit"),
+            "project_dir":        self._log_dir.resolve(),
         }
 
-        if not self._run_steps(steps, ctx):
+        failed = self._run_steps(steps, ctx)
+        if not failed:
             self._log("DONE", "analysis pipeline complete")
+        return failed

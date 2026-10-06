@@ -15,9 +15,9 @@ xds
     .type = bool
     .short_caption = Generate XDS.INP
     .help = If True, generate a fresh XDS.INP from the raw data and run the \
-            full XYCORR→IDXREF→INTEGRATE→CORRECT pipeline. If False, copy \
+            full XYCORR->IDXREF->INTEGRATE->CORRECT pipeline. If False, copy \
             XDS.INP and XPARM.XDS from the previous XDS step and run only \
-            DEFPIX→INTEGRATE→CORRECT.
+            DEFPIX->INTEGRATE->CORRECT.
     .expert_level = 0
   on_indexing_failure = *auto retry reject bypass
     .type = choice
@@ -115,19 +115,19 @@ xds
 def run_step(step, ctx, rp, pipeline_subdir, forced):
     """Execute one XDS step.
 
-    Selects the XDS scenario from PHIL booleans, checks for CC½ improvement
+    Selects the XDS scenario from PHIL booleans, checks for CC1/2 improvement
     when skip_if_no_improvement is set, and returns a status dict understood
     by ProcessingPipelineInterpreter.
 
     Context keys read:
-      last_by_program["xds"]      — step_id of the previous XDS step
-      last_by_program["aimless"]  — step_id of the previous Aimless step
-      last_by_program["pointless"]— step_id of the previous Pointless step
-      history_by_program["aimless"] — ordered list of completed Aimless step_ids
+      last_by_program["xds"]      -- step_id of the previous XDS step
+      last_by_program["aimless"]  -- step_id of the previous Aimless step
+      last_by_program["pointless"]-- step_id of the previous Pointless step
+      history_by_program["aimless"] -- ordered list of completed Aimless step_ids
 
     Context keys written (via ctx_updates):
-      _skip_n_steps — set to 2 when this step is intentionally skipped
-                      (no CC½ improvement), telling the interpreter to skip
+      _skip_n_steps -- set to 2 when this step is intentionally skipped
+                      (no CC1/2 improvement), telling the interpreter to skip
                       the next two steps (typically the paired pointless/aimless).
     """
     step_id  = step.id

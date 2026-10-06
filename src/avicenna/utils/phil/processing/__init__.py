@@ -23,7 +23,7 @@ from pathlib import Path
 from avicenna.utils.phil._base import PhilBase
 
 # ---------------------------------------------------------------------------
-# Fixed sub-pipeline header (input / output) — not backend-specific
+# Fixed sub-pipeline header (input / output) -- not backend-specific
 # ---------------------------------------------------------------------------
 
 _HEADER = """\
@@ -46,6 +46,15 @@ processing
       .short_caption = Pin list
       .help = Path to an existing pin_list.txt -- skips data discovery if provided.
       .expert_level = 0
+    crystal_list = None
+      .type = path
+      .short_caption = Crystal list
+      .help = Optional path to the crystal list spreadsheet (.xlsx, .csv or \
+              .tsv) recording which fragment was soaked into which crystal \
+              (the harvesting robot's picklist). Used to build info.json at \
+              the head of the run. Without it the run proceeds normally and \
+              info.json simply carries no ligand information.
+      .expert_level = 0
     reference_mtz = None
       .type = path
       .short_caption = Reference MTZ
@@ -66,6 +75,17 @@ processing
       .short_caption = Cell refinement mode
       .help = Refine the unit cell during integration (XDS REFINE(INTEGRATE) CELL term). true refines the cell during integration (default. on a 245-dataset HUWE1 analysis it never did worse than off and occasionally better). false holds the indexed cell fixed. both spawns two branches (cell-refined and not).
       .expert_level = 1
+    skip_prescans = True
+      .type = bool
+      .short_caption = Skip pre-scans
+      .help = Leave raster/grid pre-scans and snapshot images out of the sweeps \
+              a pin folder is split into. A pre-scan is not a dataset, and one \
+              counted as a sweep also shifts the sweep numbers of the real \
+              collections, which are part of the dataset key. Identified by \
+              trigger count for HDF5 and by frame count beside a full sweep \
+              for CBF. Set to False for a collection that deliberately uses \
+              more than one trigger.
+      .expert_level = 2
     no_symmetry = False
       .type = bool
       .short_caption = Also process without symmetry
@@ -184,7 +204,7 @@ processing
   }
 """
 
-# Steps scope opener — kept separate so program SETTINGS scopes can be inserted
+# Steps scope opener -- kept separate so program SETTINGS scopes can be inserted
 # between the fixed header and the step list in _build_processing_phil.
 _STEPS_OPEN = """\
   steps

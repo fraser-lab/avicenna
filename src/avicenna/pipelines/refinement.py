@@ -31,6 +31,7 @@ Context dict keys passed between handlers
 """
 
 import importlib
+import os
 import pathlib
 import pkgutil
 import shutil
@@ -38,8 +39,10 @@ import sys
 
 from avicenna.pipelines.jobbase import SubPipelineInterpreter
 from avicenna.pipelines.refinement_runner import QRefineWorker, RunQRefine
+from avicenna.utils.info import OUTCOME_COMPLETED, OUTCOME_FAILED
 from avicenna.utils.phil.refine import RefinePHIL
 from avicenna.utils.software import find_ccp4, find_phenix, suite_setup_sources
+from avicenna.utils.utils import refined_model_stats
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +115,30 @@ class RefinementPipelineInterpreter(SubPipelineInterpreter):
     def _stall_context(self):
         return self.params.get("job_id", self.params.get("pin", "?"))
 
+    # ------------------------------------------------------------------
+    # Per-process record (see avicenna.pipelines.jobbase)
+    # ------------------------------------------------------------------
+
+    def _record_directory(self):
+        return str(self._job_dir())
+
+    def _record_key(self):
+        return self.params.get("dataset_tag")
+
+    def _record_fields(self):
+        params = self.params
+        return {
+            # The dataset is a field, so the sentinel never has to recover it
+            # from the job folder's name.
+            "dataset_tag":   params.get("dataset_tag"),
+            "job_dir":       str(self._job_dir()),
+            "input_mtz":     params.get("mtz"),
+            "suffix":        params.get("suffix"),
+            "reference_pdb": params.get("mr_pdb"),
+            "job_id":        os.environ.get("JOB_ID"),
+            "task_id":       os.environ.get("SGE_TASK_ID"),
+        }
+
     def run(self):
         """Run the refinement step sequence under the stall watchdog."""
         with self._stall_watchdog():
@@ -132,6 +159,7 @@ class RefinementPipelineInterpreter(SubPipelineInterpreter):
         steps = phil._params.refine.steps.step
 
         self._log("START", f"suffix={suffix}")
+        self._open_record()
 
         ctx = {
             "last_by_program":    {},
@@ -145,6 +173,7 @@ class RefinementPipelineInterpreter(SubPipelineInterpreter):
             # produce it leaves the next stage with no input, so it must mark the
             # dataset FAILED (no DONE line) rather than report success.
             if not self._finalize(suffix):
+                self._close_record(OUTCOME_COMPLETED, **self._refined_fields())
                 # A backend (the final refmac step) may stash a resolution +
                 # R-stats summary for the completed job; append it when present.
                 summary = ctx.get("final_summary")
@@ -152,6 +181,15 @@ class RefinementPipelineInterpreter(SubPipelineInterpreter):
                 if summary:
                     message += f" — {summary}"
                 self._log("DONE", message)
+
+    def _refined_fields(self):
+        """What the next stage reads about the refined model."""
+        job_dir = self._job_dir()
+        pdb = job_dir / "final_refined.pdb"
+        rwork, rfree, resolution = refined_model_stats(pdb)
+        return {"rwork": rwork, "rfree": rfree, "refine_resolution": resolution,
+                "final_refined_pdb": str(pdb),
+                "final_refined_mtz": str(job_dir / "final_refined.mtz")}
 
     def _finalize(self, suffix):
         """Publish the refinement products under canonical fixed names so the
@@ -181,8 +219,10 @@ class RefinementPipelineInterpreter(SubPipelineInterpreter):
 
         missing = [p.name for p in (src_pdb, src_mtz) if not p.is_file()]
         if missing:
-            self._log("ERROR", "finalize: canonical output source(s) missing: "
-                               + ", ".join(missing))
+            reason = "canonical output source(s) missing: " + ", ".join(missing)
+            self._log("ERROR", f"finalize: {reason}")
+            self._close_record(OUTCOME_FAILED, failed_step="finalize",
+                               reason=reason)
             return True
 
         shutil.copy2(src_pdb, job_dir / "final_refined.pdb")
@@ -239,10 +279,11 @@ class RefinementOrchestrator(RunQRefine):
     settings come from refine.phil, NOT qrefine_input_parameters.txt.
     """
 
-    def __init__(self, process_dir, dataset_list, data=None,
-                 model=None, dry_run=False, fill=True, phil_string=None):
+    def __init__(self, process_dir, dataset_list=None, data=None,
+                 model=None, dry_run=False, fill=True, phil_string=None,
+                 resume=False):
         super().__init__(process_dir, dataset_list, data=data,
-                         model=model, dry_run=dry_run, fill=fill)
+                         model=model, dry_run=dry_run, fill=fill, resume=resume)
         self.phil_string = phil_string
         self.CCP4_BIN   = find_ccp4()[0]
         self.PHENIX_BIN = find_phenix()[0]
